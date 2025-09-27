@@ -15,17 +15,13 @@ It models PV cells, substrings, strings, and arrays, simulates MPPT algorithms, 
   - Incremental Conductance (IncCond)   
 
 - **Simulation Engine**
-  - Fixed timestep loop (default 100 Hz)  
+  - Fixed timestep loop
   - Real-time or fast-forward modes  
   - Thread-safe messaging between simulation and UI  
+  - Data is stored in data/runs
 
 - **Interactive UI**
   - Desktop (PyQt6 + Plotly) for live IV/PV curves, efficiency metrics, and controls  
-  - Web (Dash/Streamlit) for lightweight visualization  
-
-- **Reproducibility**
-  - Config-driven (`configs/default.yaml`)  
-  - Per-run logs, metrics, and plots auto-saved in `data/runs/`  
 
 ---
 
@@ -39,13 +35,6 @@ cd Power-Generation-Eclipse-SW
 
 ---
 
-## Usage
+## Documentation
 
-After cloning and installing dependencies (see `requirements.txt`), you can run the simulator from the `simulators` package or open the desktop UI.
-
-Example (run sim):
-```bash
-python -m simulators.mppt_sim
-```
-
-You can add additional sections after the closed code block. For example, add `## Configuration` or `## Development` as needed.
+The code architecture and design document is on the [Confluence](https://cloud.wikis.utexas.edu/wiki/spaces/LHRSOLAR/pages/486541418/2024+-+2026+Simulation+Software)
