@@ -19,7 +19,7 @@ class Bypass_Diode:
         self.reverse_saturation_current = None
         self.diode_voltage_curve_slope = None
         self.V_string = None
-        self.bypass_voltage = None
+        self.voltage = None
         self.sub_voltage = None
 
     def set_temperature(self, temp_celcius: int) :
@@ -29,10 +29,10 @@ class Bypass_Diode:
 
     def v_at_i(self, terminal_voltage_at_current) :
         if terminal_voltage_at_current > 0 :
-            bypass_voltage = -(self.ideality_factor * self.thermal_voltage * math.log(1 + (terminal_voltage_at_current / (self.reverse_saturation_current)) + terminal_voltage_at_current * self.series_resistance)) #The negative sign reflects the diode’s orientation (bypass is wired in reverse to the cell)
+            voltage = -(self.ideality_factor * self.thermal_voltage * math.log(1 + (terminal_voltage_at_current / (self.reverse_saturation_current)) + terminal_voltage_at_current * self.series_resistance)) #The negative sign reflects the diode’s orientation (bypass is wired in reverse to the cell)
         else :
-            bypass_voltage = float('-inf') # diode is off when current is negative or zero
-        return bypass_voltage
+            voltage = float('-inf') # diode is off when current is negative or zero
+        return voltage
     
     def dv_dI(self, terminal_voltage_at_current) :
         if terminal_voltage_at_current > 0 :
@@ -41,8 +41,8 @@ class Bypass_Diode:
     
     def activation_condition(self, terminal_voltage_at_current):
         self.V_string = sum(self.V_cells)
-        self.bypass_voltage = self.v_at_i(terminal_voltage_at_current)
-        return self.V_string <= self.bypass_voltage
+        self.voltage = self.v_at_i(terminal_voltage_at_current)
+        return self.V_string <= self.voltage
 
     def Clamp(self):
-        self.sub_voltage = max(self.V_string, self.bypass_voltage)
+        self.sub_voltage = max(self.V_string, self.voltage)
