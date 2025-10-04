@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .base import MPPTAlgorithm
-from .types import Measurement, Action
-from .common import clamp, SlewLimiter, compute_power
+from ..base import MPPTAlgorithm
+from ..types import Measurement, Action
+from ..common import clamp, SlewLimiter, compute_power
 
 
 class MEPO(MPPTAlgorithm):

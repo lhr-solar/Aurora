@@ -10,11 +10,11 @@ from .types import Measurement, Action
 from .base import MPPTAlgorithm
 
 # Algorithms
-from .mepo import MEPO
-from .ruca import RUCA
-from .pso import PSO
-from .nl_esc import NL_ESC
-from .pando import PANDO  # classic P&O
+from .local.mepo import MEPO
+from .local.ruca import RUCA
+from .global_search.pso import PSO
+from .hold.nl_esc import NL_ESC
+from .local.pando import PANDO  # classic P&O
 
 # Registry helpers
 from .registry import build, available, register, get_class
