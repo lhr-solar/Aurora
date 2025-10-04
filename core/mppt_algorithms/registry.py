@@ -1,5 +1,3 @@
-
-
 """
 Algorithm registry (lazy import)
 

@@ -1,5 +1,3 @@
-
-
 """
 NL-ESC — Newton‑Like Extremum Seeking Control (S4 Lock/Hold)
 

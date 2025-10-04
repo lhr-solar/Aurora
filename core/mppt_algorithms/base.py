@@ -1,5 +1,3 @@
-
-
 """
 Base MPPT interface
 - Defines the abstract contract that all MPPT algorithms must implement.

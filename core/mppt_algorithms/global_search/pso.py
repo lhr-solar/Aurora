@@ -1,5 +1,3 @@
-
-
 """
 PSO — Particle Swarm Optimization
 

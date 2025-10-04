@@ -1,5 +1,3 @@
-
-
 """
 RUCA — Robust Unified Control Algorithm (S1 Everyday Tracker)
 
