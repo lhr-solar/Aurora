@@ -16,13 +16,13 @@ from typing import Dict, Tuple, Type
 from .base import MPPTAlgorithm
 
 # name -> (module_path, class_name)
-_REGISTRY: Dict[str, Tuple[str, str]] = {
-    "mepo":   ("core.mppt_algorithms.mepo", "MEPO"),
-    "ruca":   ("core.mppt_algorithms.ruca", "RUCA"),
-    "pso":    ("core.mppt_algorithms.pso", "PSO"),
-    "nl_esc": ("core.mppt_algorithms.nl_esc", "NL_ESC"),
+_REGISTRY = {
+    "mepo":   ("core.mppt_algorithms.local.mepo", "MEPO"),
+    "ruca":   ("core.mppt_algorithms.local.ruca", "RUCA"),
+    "pando":  ("core.mppt_algorithms.local.pando", "PANDO"),
+    "pso":    ("core.mppt_algorithms.global_search.pso", "PSO"),
+    "nl_esc": ("core.mppt_algorithms.hold.nl_esc", "NL_ESC"),
 }
-
 
 def register(name: str, module_path: str, class_name: str) -> None:
     """Add or override a registry entry.
