@@ -5,7 +5,7 @@ Adaptive-step hill-climb for S1 (everyday) MPPT. The voltage step scales with
 recent power change magnitude (|change in P|), and the sign follows sign(change in P * change in V).
 This yields faster convergence when far from the MPP and smaller ripple near it.
 """
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from ..base import MPPTAlgorithm
 from ..types import Measurement, Action
@@ -54,14 +54,22 @@ class MEPO(MPPTAlgorithm):
         self.prev_p = None
         self.v_ref = None
         # re-create to keep configured max_step but clear internal state
-        self._slew = SlewLimiter(self._slew.max_step)
+        self._slew = SlewLimiter(max_step=self._slew.max_step)
     
     # Core step
     def step(self, m: Measurement) -> Action:
         p = compute_power(m.v, m.i)
 
+        # Debug vars (populated below)
+        cold_start = False
+        dV = 0.0
+        dP = 0.0
+        sgn = 0.0
+        step_mag = 0.0
+
         # Cold start: seed to the present operating point; next call will step.
         if self.v_ref is None or self.prev_v is None or self.prev_p is None:
+            cold_start = True
             self.v_ref = clamp(m.v, self.vmin, self.vmax)
         else:
             dV = m.v - self.prev_v
@@ -71,9 +79,9 @@ class MEPO(MPPTAlgorithm):
             sgn = 1.0 if dP * dV > 0.0 else -1.0
             # Magnitude: proportional to |change in P|, then clamped
             raw = abs(dP) * self.alpha
-            step = clamp(raw, self.step_min, self.step_max)
+            step_mag = clamp(raw, self.step_min, self.step_max)
 
-            self.v_ref = clamp(self.v_ref + sgn * step, self.vmin, self.vmax)
+            self.v_ref = clamp(self.v_ref + sgn * step_mag, self.vmin, self.vmax)
 
         # Update memory for next cycle
         self.prev_v, self.prev_p = m.v, p
@@ -84,8 +92,57 @@ class MEPO(MPPTAlgorithm):
         return Action(
             v_ref=v_cmd,
             debug={
-                "p": p,
+                "algo": "mepo",
+                "p": float(p),
                 "v_ref": float(self.v_ref if self.v_ref is not None else m.v),
                 "v_cmd": float(v_cmd),
+                "cold_start": bool(cold_start),
+                "dV": float(dV),
+                "dP": float(dP),
+                "sgn": float(sgn),
+                "step": float(step_mag),
             },
         )
+
+    # ---- Frontend helpers ----
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable parameters."""
+        return {
+            "key": self.name,
+            "label": "MEPO (adaptive P&O)",
+            "params": [
+                {"name": "alpha",     "type": "number",  "min": 0.01, "max": 5.0,  "step": 0.01, "default": float(self.alpha),     "help": "Gain mapping |dP| to step size"},
+                {"name": "step_min",  "type": "number",  "min": 1e-4, "max": 0.2,  "step": 1e-4, "unit": "V", "default": float(self.step_min), "help": "Minimum per-cycle voltage step"},
+                {"name": "step_max",  "type": "number",  "min": 1e-4, "max": 1.0,  "step": 1e-4, "unit": "V", "default": float(self.step_max), "help": "Maximum per-cycle voltage step"},
+                {"name": "slew",      "type": "number",  "min": 1e-3, "max": 2.0,  "step": 1e-3, "unit": "V/step", "default": float(self._slew.max_step), "help": "Max change allowed per control step"},
+                {"name": "vmin",      "type": "number",                                 "default": float(self.vmin), "unit": "V"},
+                {"name": "vmax",      "type": "number",                                 "default": float(self.vmax), "unit": "V"},
+            ],
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "alpha": float(self.alpha),
+            "step_min": float(self.step_min),
+            "step_max": float(self.step_max),
+            "slew": float(self._slew.max_step),
+            "vmin": float(self.vmin),
+            "vmax": float(self.vmax),
+        }
+
+    def update_params(self, **kw: Any) -> None:
+        if "alpha" in kw:
+            self.alpha = float(kw["alpha"])
+        if "step_min" in kw:
+            self.step_min = float(kw["step_min"])
+        if "step_max" in kw:
+            self.step_max = float(kw["step_max"])
+        # keep bounds sane
+        if self.step_min > self.step_max:
+            self.step_min, self.step_max = self.step_max, self.step_min
+        if "slew" in kw:
+            self._slew.max_step = float(kw["slew"])  # adjust limiter live
+        if "vmin" in kw:
+            self.vmin = float(kw["vmin"])
+        if "vmax" in kw:
+            self.vmax = float(kw["vmax"])

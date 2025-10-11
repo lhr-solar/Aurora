@@ -8,6 +8,7 @@ Design goals:
 - Allow the hybrid controller to introspect basic capabilities.
 """
 from abc import ABC, abstractmethod
+from typing import Dict, Any
 from .types import Measurement, Action
 
 
@@ -31,6 +32,31 @@ class MPPTAlgorithm(ABC):
     name: str = "base"
     supports_global_search: bool = False
     uses_dither: bool = False
+
+    # ---- Optional frontend/introspection helpers (safe defaults) ----
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable parameters.
+
+        Subclasses may override to enumerate tunables for auto‑rendered controls
+        in the frontend. The default returns an empty spec so UIs can
+        gracefully omit controls.
+        """
+        return {"key": self.name, "label": self.name.upper(), "params": []}
+
+    def get_config(self) -> Dict[str, Any]:
+        """Return the current tunable parameters (for snapshots/replay).
+
+        Subclasses may override. Default is an empty mapping.
+        """
+        return {}
+
+    def update_params(self, **kw: Any) -> None:
+        """Apply parameter updates from the frontend.
+
+        Subclasses may override. Default is a no‑op so callers can safely
+        attempt updates even if an algorithm has nothing to tune.
+        """
+        return None
 
     @abstractmethod
     def reset(self) -> None:

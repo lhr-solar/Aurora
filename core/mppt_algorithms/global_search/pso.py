@@ -20,7 +20,7 @@ Notes
 - The early‑stop criterion is intentionally simple; tune `early_eps` to your
   converter/plant.
 """
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import random
 
 from ..base import MPPTAlgorithm
@@ -69,7 +69,8 @@ class PSO(MPPTAlgorithm):
         self.iters = max(1, int(iters))
         self.early_eps = float(early_eps)
         self.vmin, self.vmax = float(vmin), float(vmax)
-        self.rng = random.Random(int(seed))
+        self._seed = int(seed)
+        self.rng = random.Random(self._seed)
         self._slew = SlewLimiter(max_step=float(slew))
         self.reset()
 
@@ -88,6 +89,56 @@ class PSO(MPPTAlgorithm):
         self._iter: int = 0
         self._streak_small: int = 0
         self.last_cmd: Optional[float] = None
+
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable parameters."""
+        return {
+            "key": self.name,
+            "label": "PSO (sequential)",
+            "params": [
+                {"name": "window_pct", "type": "number", "min": 0.05, "max": 0.6, "step": 0.01, "default": self.window_pct, "help": "± window as fraction of seed Vmp"},
+                {"name": "particles",  "type": "integer", "min": 3,   "max": 64,  "step": 1,   "default": self.np, "help": "swarm size"},
+                {"name": "iters",      "type": "integer", "min": 1,   "max": 100, "step": 1,   "default": self.iters, "help": "max sweeps"},
+                {"name": "early_eps",  "type": "number",  "min": 1e-5, "max": 1e-1, "step": 1e-5, "default": self.early_eps, "help": "early-stop sensitivity"},
+                {"name": "slew",       "type": "number",  "min": 0.01, "max": 2.0,  "step": 0.01, "unit": "V/step", "default": self._slew.max_step},
+                {"name": "vmin",       "type": "number",  "default": self.vmin, "unit": "V"},
+                {"name": "vmax",       "type": "number",  "default": self.vmax, "unit": "V"},
+                {"name": "seed",       "type": "integer", "default": self._seed},
+            ]
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "window_pct": self.window_pct,
+            "particles": self.np,
+            "iters": self.iters,
+            "early_eps": self.early_eps,
+            "vmin": self.vmin,
+            "vmax": self.vmax,
+            "seed": self._seed,
+            "slew": self._slew.max_step,
+        }
+
+    def update_params(self, **kw: Any) -> None:
+        if "window_pct" in kw:
+            self.window_pct = float(kw["window_pct"])
+            # keep within sane bounds
+            self.window_pct = max(0.01, min(self.window_pct, 0.99))
+        if "particles" in kw:
+            self.np = max(3, int(kw["particles"]))
+        if "iters" in kw:
+            self.iters = max(1, int(kw["iters"]))
+        if "early_eps" in kw:
+            self.early_eps = float(kw["early_eps"])
+        if "vmin" in kw:
+            self.vmin = float(kw["vmin"])
+        if "vmax" in kw:
+            self.vmax = float(kw["vmax"])
+        if "slew" in kw:
+            self._slew.max_step = float(kw["slew"])  # adjust slew limiter live
+        if "seed" in kw:
+            self._seed = int(kw["seed"])
+            self.rng = random.Random(self._seed)
 
     # Internals
     def _init_swarm(self, seed_v: float) -> None:
@@ -118,7 +169,7 @@ class PSO(MPPTAlgorithm):
             self._init_swarm(m.v)
             self.last_cmd = self.pos[0]
             v_cmd = self._slew.step(self.last_cmd)
-            return Action(v_ref=v_cmd, debug={"phase": 0, "p": p})
+            return Action(v_ref=v_cmd, debug={"algo": "pso", "phase": 0, "p": float(p), "center": float(self.center or m.v), "span": float(self.span or 0.0)})
 
         # Assign fitness to the previously commanded particle
         idx = self.k_eval % self.np
@@ -169,11 +220,14 @@ class PSO(MPPTAlgorithm):
         return Action(
             v_ref=v_cmd,
             debug={
+                "algo": "pso",
                 "phase": phase,
                 "iter": self._iter,
                 "idx": self.k_eval % self.np,
                 "gbest_v": float(self.gbest_v or 0.0),
                 "gbest_p": float(self.gbest_p),
                 "p": float(p),
+                "center": float(self.center or m.v),
+                "span": float(self.span or 0.0),
             },
         )

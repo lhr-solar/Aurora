@@ -10,8 +10,9 @@ Heuristics (votes):
 
 If the number of positive heuristics >= `votes`, we deem the condition PSC=true.
 """
+
 from dataclasses import dataclass
-from typing import Deque
+from typing import Deque, Dict, Any
 from collections import deque
 
 # Import Measurement from the algorithms package (sibling of controller)
@@ -45,6 +46,43 @@ class PSDDetector:
         self.cfg = PSDConfig(dp_frac=dp_frac, dv_frac=dv_frac, window=window, votes=votes)
         self.buf: Deque[Measurement] = deque(maxlen=self.cfg.window)
 
+    # ---- Tunable properties (proxy to cfg) ----
+    @property
+    def dp_frac(self) -> float:
+        return self.cfg.dp_frac
+
+    @dp_frac.setter
+    def dp_frac(self, v: float) -> None:
+        self.cfg.dp_frac = float(v)
+
+    @property
+    def dv_frac(self) -> float:
+        return self.cfg.dv_frac
+
+    @dv_frac.setter
+    def dv_frac(self, v: float) -> None:
+        self.cfg.dv_frac = float(v)
+
+    @property
+    def window(self) -> int:
+        return self.cfg.window
+
+    @window.setter
+    def window(self, w: int) -> None:
+        w = max(3, int(w))
+        if w != self.cfg.window:
+            self.cfg.window = w
+            # Rebuild deque with new maxlen, preserving recent samples
+            self.buf = deque(self.buf, maxlen=w)
+
+    @property
+    def votes(self) -> int:
+        return self.cfg.votes
+
+    @votes.setter
+    def votes(self, n: int) -> None:
+        self.cfg.votes = max(1, int(n))
+
     # Lifecycle
     def reset(self) -> None:
         self.buf.clear()
@@ -60,6 +98,37 @@ class PSDDetector:
         return self.is_psc()
 
     # Logic
+    # ---- Frontend helpers (optional) ----
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "key": "psd",
+            "label": "PSD Detector",
+            "params": [
+                {"name": "dp_frac", "type": "number",  "min": 0.001, "max": 0.2,  "step": 0.001, "default": float(self.cfg.dp_frac), "help": "|dP|/P threshold for H1"},
+                {"name": "dv_frac", "type": "number",  "min": 0.001, "max": 0.2,  "step": 0.001, "default": float(self.cfg.dv_frac), "help": "|dV|/V small-change threshold"},
+                {"name": "window",  "type": "integer", "min": 3,     "max": 100, "step": 1,     "default": int(self.cfg.window),  "help": "Samples kept for H2 slope consistency"},
+                {"name": "votes",   "type": "integer", "min": 1,     "max": 5,   "step": 1,     "default": int(self.cfg.votes),   "help": "Votes required (H1/H2) to flag PSC"},
+            ],
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "dp_frac": float(self.cfg.dp_frac),
+            "dv_frac": float(self.cfg.dv_frac),
+            "window": int(self.cfg.window),
+            "votes": int(self.cfg.votes),
+        }
+
+    def update_params(self, **kw: Any) -> None:
+        if "dp_frac" in kw:
+            self.dp_frac = float(kw["dp_frac"])  # via property
+        if "dv_frac" in kw:
+            self.dv_frac = float(kw["dv_frac"])  # via property
+        if "window" in kw:
+            self.window = int(kw["window"])      # resizes buffer
+        if "votes" in kw:
+            self.votes = int(kw["votes"])        # via property
+
     def is_psc(self) -> bool:
         """Return True if current window indicates partial shading.
 

@@ -7,8 +7,8 @@ faults and plausibility checks as needed.
 This module is intentionally dependency‑free and uses only the shared
 `Measurement` type from the algorithms package.
 """
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Any
 
 from ..mppt_algorithms.types import Measurement
 
@@ -40,6 +40,49 @@ class SafetyLimits:
     dvdt_max: Optional[float] = None
     didt_max: Optional[float] = None
 
+    # ---- Frontend helpers (optional) ----
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable safety parameters."""
+        return {
+            "key": "safety",
+            "label": "Safety Limits",
+            "params": [
+                {"name": "vmin",     "type": "number",  "unit": "V",  "default": float(self.vmin)},
+                {"name": "vmax",     "type": "number",  "unit": "V",  "default": float(self.vmax)},
+                {"name": "imax",     "type": "number",  "unit": "A",  "default": float(self.imax)},
+                {"name": "pmax",     "type": "number",  "unit": "W",  "default": float(self.pmax)},
+                {"name": "tmod_max", "type": "number",  "unit": "°C", "default": float(self.tmod_max)},
+                {"name": "dvdt_max", "type": "number",  "unit": "V/s", "default": (None if self.dvdt_max is None else float(self.dvdt_max))},
+                {"name": "didt_max", "type": "number",  "unit": "A/s", "default": (None if self.didt_max is None else float(self.didt_max))},
+            ],
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Dataclass → dict for JSON serialization."""
+        return asdict(self)
+
+    def update(self, **kw: Any) -> None:
+        """Apply updates with light validation and sane coercions.
+
+        - Ensures vmin ≤ vmax (swaps if inverted).
+        - Coerces dvdt_max/didt_max to float or None.
+        - Leaves unknown keys untouched (non‑breaking).
+        """
+        for k in ("vmin", "vmax", "imax", "pmax", "tmod_max"):
+            if k in kw and kw[k] is not None:
+                setattr(self, k, float(kw[k]))
+        # Optional rates can be None
+        for k in ("dvdt_max", "didt_max"):
+            if k in kw:
+                v = kw[k]
+                if v is None or (isinstance(v, str) and v.strip().lower() in {"none", "null", ""}):
+                    setattr(self, k, None)
+                else:
+                    setattr(self, k, float(v))
+        # Keep bounds sane
+        if self.vmin > self.vmax:
+            self.vmin, self.vmax = self.vmax, self.vmin
+
 
 # Fault codes (short strings for telemetry/logging)
 OK = "OK"
@@ -50,6 +93,18 @@ OPP = "OPP"    # Over‑power protection
 OTP = "OTP"    # Over‑temperature protection
 DVDT = "DVDT"  # Excessive |dV/dt|
 DIDT = "DIDT"  # Excessive |dI/dt|
+
+# Human‑readable labels for fault codes (optional FE use)
+FAULT_LABELS: Dict[str, str] = {
+    OK:   "OK",
+    UVP:  "Under‑voltage",
+    OVP:  "Over‑voltage",
+    OCP:  "Over‑current",
+    OPP:  "Over‑power",
+    OTP:  "Over‑temperature",
+    DVDT: "Excessive |dV/dt|",
+    DIDT: "Excessive |dI/dt|",
+}
 
 
 def _abs(x: float) -> float:
@@ -115,4 +170,5 @@ __all__ = [
     "check_limits",
     "safe_voltage",
     "OK", "UVP", "OVP", "OCP", "OPP", "OTP", "DVDT", "DIDT",
+    "FAULT_LABELS",
 ]

@@ -10,7 +10,7 @@ Notes
 - Consider switching to MEPO/RUCA for adaptive steps, or to global search
   (PSO/Firefly/GA/ACO) when partial shading is detected.
 """
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from ..base import MPPTAlgorithm
 from ..types import Measurement, Action
@@ -58,14 +58,16 @@ class PANDO(MPPTAlgorithm):
         self.prev_p = None
         self.prev_v = None
         self._dir = 1.0
-        self._slew = SlewLimiter(self._slew.max_step)
+        self._slew = SlewLimiter(max_step=self._slew.max_step)
 
     # Core step
     def step(self, m: Measurement) -> Action:
         p = compute_power(m.v, m.i)
+        cold_start = False
 
         if self.v_ref is None or self.prev_p is None or self.prev_v is None:
             # cold start: seed reference to current operating point
+            cold_start = True
             self.v_ref = clamp(m.v, self.vmin, self.vmax)
         else:
             dP = p - self.prev_p
@@ -89,10 +91,49 @@ class PANDO(MPPTAlgorithm):
         return Action(
             v_ref=v_cmd,
             debug={
-                "p": p,
-                "dP": p - (prev_p_old if prev_p_old is not None else p),
-                "dir": self._dir,
+                "algo": "pando",
+                "p": float(p),
+                "dP": float(p - (prev_p_old if prev_p_old is not None else p)),
+                "dir": float(self._dir),
+                "cold_start": bool(cold_start),
+                "step": float(self.step_size),
                 "v_ref": float(self.v_ref if self.v_ref is not None else m.v),
                 "v_cmd": float(v_cmd),
             },
         )
+
+    # ---- Frontend helpers ----
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable parameters."""
+        return {
+            "key": self.name,
+            "label": "P&O (fixed step)",
+            "params": [
+                {"name": "step", "type": "number", "min": 1e-4, "max": 1.0, "step": 1e-4, "unit": "V", "default": float(self.step_size), "help": "Fixed per‑cycle perturbation magnitude"},
+                {"name": "eps",  "type": "number", "min": 0.0,  "max": 5.0, "step": 1e-3,               "default": float(self.eps),       "help": "Power deadband to ignore noise (W)"},
+                {"name": "slew", "type": "number", "min": 1e-3, "max": 2.0, "step": 1e-3, "unit": "V/step", "default": float(self._slew.max_step), "help": "Max allowed change per control step"},
+                {"name": "vmin", "type": "number",                                  "default": float(self.vmin), "unit": "V"},
+                {"name": "vmax", "type": "number",                                  "default": float(self.vmax), "unit": "V"},
+            ],
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "step": float(self.step_size),
+            "eps": float(self.eps),
+            "slew": float(self._slew.max_step),
+            "vmin": float(self.vmin),
+            "vmax": float(self.vmax),
+        }
+
+    def update_params(self, **kw: Any) -> None:
+        if "step" in kw:
+            self.step_size = float(kw["step"])
+        if "eps" in kw:
+            self.eps = float(kw["eps"])
+        if "slew" in kw:
+            self._slew.max_step = float(kw["slew"])  # live adjust
+        if "vmin" in kw:
+            self.vmin = float(kw["vmin"]) 
+        if "vmax" in kw:
+            self.vmax = float(kw["vmax"]) 

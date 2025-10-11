@@ -5,7 +5,10 @@ Minimal, dependency-free dataclasses shared by all algorithms and controllers.
 Keep this file stable to avoid churn across the codebase.
 """
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, Union, List
+
+# JSON-friendly value type used by debug/meta payloads
+JSONValue = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
 
 @dataclass
@@ -27,7 +30,7 @@ class Measurement:
     dt : float, optional
         Loop period in seconds for algorithms that need a timestep.
     meta : Dict[str, float]
-        Free-form auxiliary signals (e.g., state_id, filtered signals, flags).
+        Free-form auxiliary signals (e.g., state_id, filtered signals, flags). JSON-friendly values only.
     """
 
     t: float
@@ -36,12 +39,24 @@ class Measurement:
     g: Optional[float] = None
     t_mod: Optional[float] = None
     dt: Optional[float] = None
-    meta: Dict[str, float] = field(default_factory=dict)
+    meta: Dict[str, JSONValue] = field(default_factory=dict)
 
     @property
     def p(self) -> float:
         """Instantaneous electrical power [W] (convenience property)."""
         return self.v * self.i
+
+    def to_dict(self) -> Dict[str, JSONValue]:
+        """Shallow dict conversion suitable for JSON serialization."""
+        return {
+            "t": self.t,
+            "v": self.v,
+            "i": self.i,
+            "g": self.g,
+            "t_mod": self.t_mod,
+            "dt": self.dt,
+            "meta": self.meta,
+        }
 
 
 @dataclass
@@ -57,12 +72,20 @@ class Action:
     duty_ref : float, optional
         Desired duty cycle reference (0..1).
     debug : Dict[str, float]
-        Arbitrary debug/telemetry entries to log with this action.
+        Arbitrary debug/telemetry entries to log with this action (JSON-friendly).
     """
 
     v_ref: Optional[float] = None
     duty_ref: Optional[float] = None
-    debug: Dict[str, float] = field(default_factory=dict)
+    debug: Dict[str, JSONValue] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, JSONValue]:
+        """Shallow dict conversion suitable for JSON serialization."""
+        return {
+            "v_ref": self.v_ref,
+            "duty_ref": self.duty_ref,
+            "debug": self.debug,
+        }
 
 
-__all__ = ["Measurement", "Action"]
+__all__ = ["Measurement", "Action", "JSONValue"]

@@ -11,7 +11,7 @@ meant to be used once you are already near the MPP (e.g., after S3 global
 search), not as a global optimizer by itself.
 """
 import math
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from ..base import MPPTAlgorithm
 from ..types import Measurement, Action
@@ -23,8 +23,7 @@ class NL_ESC(MPPTAlgorithm):
 
     Parameters
     dither_amp : float
-        Relative amplitude of the injected sinusoidal dither, in Volts (if
-        you drive V directly). Keep small (e.g., 0.1–0.3% of Vref).
+        Absolute amplitude of the injected sinusoidal dither in Volts. Keep small (e.g., ≈0.1–0.3% of Vref as a rule of thumb).
     dither_hz : float
         Dither frequency in Hz. Choose a value separated from PWM harmonics
         and within your sampling bandwidth.
@@ -109,10 +108,65 @@ class NL_ESC(MPPTAlgorithm):
         return Action(
             v_ref=v_cmd,
             debug={
-                "p": p,
-                "grad": grad_est,
+                "algo": "nl_esc",
+                "phase": "hold",
+                "p": float(p),
+                "grad": float(grad_est),
                 "v_base": float(self.v_ref),
                 "v_cmd": float(v_cmd),
-                "theta": theta,
+                "theta": float(theta % (2.0 * math.pi)),
+                "dither_amp": float(self.A),
+                "dither_hz": float(self.f),
             },
         )
+
+    # ---- Frontend helpers ----
+    def describe(self) -> Dict[str, Any]:
+        """Return UI metadata for tunable parameters."""
+        return {
+            "key": self.name,
+            "label": "NL-ESC (hold)",
+            "params": [
+                {"name": "dither_amp",  "type": "number",  "min": 0.0,  "max": 2.0,   "step": 1e-3, "unit": "V",      "default": self.A,       "help": "Sinusoidal dither amplitude (Volts)"},
+                {"name": "dither_hz",   "type": "number",  "min": 5.0,  "max": 2000.0, "step": 1.0,  "unit": "Hz",     "default": self.f,       "help": "Dither frequency"},
+                {"name": "k",           "type": "number",  "min": 0.01, "max": 2.0,    "step": 0.01,              "default": self.k,       "help": "Integrator gain (includes normalization)"},
+                {"name": "demod_alpha", "type": "number",  "min": 0.01, "max": 0.9,    "step": 0.01,              "default": self._grad.alpha, "help": "EMA smoothing for demodulated gradient"},
+                {"name": "leak",        "type": "number",  "min": 0.0,  "max": 0.05,   "step": 1e-3,              "default": self.leak,    "help": "Optional leak on base reference per step"},
+                {"name": "slew",        "type": "number",  "min": 0.001,"max": 2.0,    "step": 0.001, "unit": "V/step","default": self._slew.max_step, "help": "Max change allowed per control step"},
+                {"name": "vmin",        "type": "number",                                      "default": self.vmin,    "unit": "V"},
+                {"name": "vmax",        "type": "number",                                      "default": self.vmax,    "unit": "V"},
+            ],
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "dither_amp": self.A,
+            "dither_hz": self.f,
+            "k": self.k,
+            "demod_alpha": self._grad.alpha,
+            "leak": self.leak,
+            "slew": self._slew.max_step,
+            "vmin": self.vmin,
+            "vmax": self.vmax,
+        }
+
+    def update_params(self, **kw: Any) -> None:
+        if "dither_amp" in kw:
+            self.A = abs(float(kw["dither_amp"]))
+        if "dither_hz" in kw:
+            self.f = max(0.1, float(kw["dither_hz"]))
+        if "k" in kw:
+            self.k = float(kw["k"])  # caller responsible for stability tuning
+        if "demod_alpha" in kw:
+            alpha = float(kw["demod_alpha"])
+            alpha = max(1e-6, min(alpha, 0.999))
+            # Re-create EMA with new alpha; state is reset to avoid bias
+            self._grad = EMA(alpha=alpha)
+        if "leak" in kw:
+            self.leak = max(0.0, float(kw["leak"]))
+        if "slew" in kw:
+            self._slew.max_step = max(1e-6, float(kw["slew"]))
+        if "vmin" in kw:
+            self.vmin = float(kw["vmin"]) 
+        if "vmax" in kw:
+            self.vmax = float(kw["vmax"]) 
