@@ -13,8 +13,6 @@ Includes:
 - MovingAverage: fixed-window mean
 - SlewLimiter: per-step rate limiter for setpoints (e.g., v_ref)
 """
-from __future__ import annotations
-
 from typing import Optional, Deque
 from collections import deque
 

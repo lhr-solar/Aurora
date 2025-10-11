@@ -6,8 +6,6 @@ Central place to look up and construct MPPT algorithms by a short name.
 Why lazy? Importing heavy modules (future ANN, etc.) only when needed keeps
 startup light and avoids circular imports.
 """
-from __future__ import annotations
-
 from importlib import import_module
 from typing import Dict, Tuple, Type
 

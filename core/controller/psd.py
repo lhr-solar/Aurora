@@ -10,8 +10,6 @@ Heuristics (votes):
 
 If the number of positive heuristics >= `votes`, we deem the condition PSC=true.
 """
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Deque
 from collections import deque

@@ -7,8 +7,6 @@ Design goals:
 - Make algorithms pure w.r.t. hardware I/O: read Measurement → return Action.
 - Allow the hybrid controller to introspect basic capabilities.
 """
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from .types import Measurement, Action
 

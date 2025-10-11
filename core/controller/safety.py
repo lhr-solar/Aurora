@@ -7,8 +7,6 @@ faults and plausibility checks as needed.
 This module is intentionally dependency‑free and uses only the shared
 `Measurement` type from the algorithms package.
 """
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Optional
 

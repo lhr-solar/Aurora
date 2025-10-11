@@ -10,8 +10,6 @@ Notes
 - Consider switching to MEPO/RUCA for adaptive steps, or to global search
   (PSO/Firefly/GA/ACO) when partial shading is detected.
 """
-from __future__ import annotations
-
 from typing import Optional
 
 from ..base import MPPTAlgorithm

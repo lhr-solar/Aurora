@@ -4,8 +4,6 @@ Core types for MPPT algorithms
 Minimal, dependency-free dataclasses shared by all algorithms and controllers.
 Keep this file stable to avoid churn across the codebase.
 """
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 

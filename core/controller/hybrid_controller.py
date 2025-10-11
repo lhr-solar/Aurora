@@ -6,8 +6,6 @@ with a partial-shading detector (PSD) and basic safety checks.
 This is a minimal, dependency-free controller intended for simulation/bench bring-up.
 You can evolve it with richer PSD logic, limit handling, and telemetry.
 """
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional

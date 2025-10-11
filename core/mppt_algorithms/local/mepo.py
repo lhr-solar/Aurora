@@ -5,8 +5,6 @@ Adaptive-step hill-climb for S1 (everyday) MPPT. The voltage step scales with
 recent power change magnitude (|change in P|), and the sign follows sign(change in P * change in V).
 This yields faster convergence when far from the MPP and smaller ripple near it.
 """
-from __future__ import annotations
-
 from typing import Optional
 
 from ..base import MPPTAlgorithm

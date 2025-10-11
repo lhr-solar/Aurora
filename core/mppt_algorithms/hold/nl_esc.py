@@ -10,8 +10,6 @@ This implementation is intentionally lightweight and dependency‑free. It is
 meant to be used once you are already near the MPP (e.g., after S3 global
 search), not as a global optimizer by itself.
 """
-from __future__ import annotations
-
 import math
 from typing import Optional
 

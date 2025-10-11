@@ -17,8 +17,6 @@ This implementation includes:
   - Slew limiting to protect the converter (dv/dt)
   - Clean debug telemetry for logging/tuning
 """
-from __future__ import annotations
-
 from typing import Optional
 
 from ..base import MPPTAlgorithm

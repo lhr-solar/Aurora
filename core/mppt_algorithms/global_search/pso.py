@@ -20,8 +20,6 @@ Notes
 - The early‑stop criterion is intentionally simple; tune `early_eps` to your
   converter/plant.
 """
-from __future__ import annotations
-
 from typing import Optional, List
 import random
 
