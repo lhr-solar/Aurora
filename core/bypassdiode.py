@@ -27,21 +27,21 @@ class Bypass_Diode:
         self.thermal_voltage = boltzmann_const * self.temp_kelvin/charge_electron
         self.reverse_saturation_current = bandgap_energy_0 - (varshni_coefficient_alpha * self.temp_kelvin**2) / (self.temp_kelvin + varshni_coefficient_beta)
 
-    def v_at_i(self, terminal_voltage_at_current) :
-        if terminal_voltage_at_current > 0 :
-            voltage = -(self.ideality_factor * self.thermal_voltage * math.log(1 + (terminal_voltage_at_current / (self.reverse_saturation_current)) + terminal_voltage_at_current * self.series_resistance)) #The negative sign reflects the diode’s orientation (bypass is wired in reverse to the cell)
+    def v_at_i(self, current) :
+        if current > 0 :
+            voltage = -(self.ideality_factor * self.thermal_voltage * math.log(1 + (current / (self.reverse_saturation_current)) + current * self.series_resistance)) #The negative sign reflects the diode’s orientation (bypass is wired in reverse to the cell)
         else :
             voltage = float('-inf') # diode is off when current is negative or zero
         return voltage
     
-    def dv_dI(self, terminal_voltage_at_current) :
-        if terminal_voltage_at_current > 0 :
-            self.diode_voltage_curve_slope = -(self.ideality_factor * self.thermal_voltage) / (terminal_voltage_at_current + self.reverse_saturation_current) + self.series_resistance
+    def dv_dI(self, current) :
+        if current > 0 :
+            self.diode_voltage_curve_slope = -(self.ideality_factor * self.thermal_voltage) / (current + self.reverse_saturation_current) + self.series_resistance
             return self.diode_voltage_curve_slope
     
-    def activation_condition(self, terminal_voltage_at_current):
+    def activation_condition(self, current):
         self.V_string = sum(self.V_cells)
-        self.voltage = self.v_at_i(terminal_voltage_at_current)
+        self.voltage = self.v_at_i(current)
         return self.V_string <= self.voltage
 
     def Clamp(self):
