@@ -71,7 +71,7 @@ class FirstOrderPlant:
         return v, i, p
 
 
-# -------------------- Helpers --------------------
+# Helpers
 
 def numeric_pmax(power_of_v: Callable[[float], float], v_lo: float = 0.0, v_hi: float = 42.0, n: int = 2000) -> float:
     """Coarse numeric max P over [v_lo, v_hi] for acceptance thresholds."""
@@ -103,7 +103,7 @@ def run_closed_loop(
     last_v_ref = seed if seed is not None else v0
 
     while t < t_final:
-        # Plant under last command → measurement for this tick
+        # Plant under last command -> measurement for this tick
         v, i, p = plant.step(last_v_ref, power_of_v)
 
         # Controller decides next command
@@ -139,7 +139,7 @@ def summarize(trace: Iterable[tuple[float, str, float, float, float, float]], ta
     }
 
 
-# -------------------- Tests --------------------
+# Tests 
 
 def test_hybrid_enters_search_and_hold_under_psc():
     """Hybrid should detect PSC, enter GLOBAL_SEARCH, then LOCK_HOLD."""

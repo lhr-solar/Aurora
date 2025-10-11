@@ -42,7 +42,7 @@ class PANDO(MPPTAlgorithm):
         vmax: float = 100.0,
         slew: float = 0.05,
     ) -> None:
-        self.step = float(step)
+        self.step_size = float(step)
         self.eps = float(eps)
         self.vmin, self.vmax = float(vmin), float(vmax)
         self._slew = SlewLimiter(max_step=float(slew))
@@ -77,8 +77,9 @@ class PANDO(MPPTAlgorithm):
                 self._dir = -self._dir
             # else keep the same direction
 
-            self.v_ref = clamp(self.v_ref + self._dir * self.step, self.vmin, self.vmax)
+            self.v_ref = clamp(self.v_ref + self._dir * self.step_size, self.vmin, self.vmax)
 
+        prev_p_old = self.prev_p
         # memory for next cycle
         self.prev_p, self.prev_v = p, m.v
 
@@ -89,7 +90,7 @@ class PANDO(MPPTAlgorithm):
             v_ref=v_cmd,
             debug={
                 "p": p,
-                "dP": p - (self.prev_p if self.prev_p is not None else p),
+                "dP": p - (prev_p_old if prev_p_old is not None else p),
                 "dir": self._dir,
                 "v_ref": float(self.v_ref if self.v_ref is not None else m.v),
                 "v_cmd": float(v_cmd),

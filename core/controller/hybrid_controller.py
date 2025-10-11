@@ -66,9 +66,7 @@ class HybridMPPT:
         self._quiet = 0
         self._last_good_v: Optional[float] = None
 
-    # ---------------
     # Lifecycle
-    # ---------------
     def reset(self) -> None:
         """Reset controller state and underlying algorithms."""
         self.state = State.INIT
@@ -77,9 +75,7 @@ class HybridMPPT:
         self._quiet = 0
         self._last_good_v = None
 
-    # ---------------
     # Core step
-    # ---------------
     def step(self, m: Measurement) -> Action:
         """Advance the controller one cycle.
 
@@ -133,9 +129,7 @@ class HybridMPPT:
         # Fallback (should not happen):
         return Action(v_ref=m.v, debug={"state": str(self.state)})
 
-    # ---------------
     # Helpers
-    # ---------------
     def _with_state(self, a: Action, state: State) -> Action:
         dbg = dict(a.debug) if a.debug else {}
         dbg["state"] = state.value

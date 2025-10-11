@@ -48,6 +48,32 @@ def get_class(name: str) -> Type[MPPTAlgorithm]:
     return cls
 
 
+
+# --- Runtime guard to fix accidental method shadowing on algorithm instances ---
+
+def _fix_shadowed_methods(obj: MPPTAlgorithm) -> MPPTAlgorithm:
+    """If an instance defines a non‑callable attribute with the same name as a
+    method (e.g., `step`), move that attribute aside so the method is callable.
+
+    This makes the system resilient to algorithms that used `self.step` for a
+    step size, which would otherwise shadow the `step()` method.
+    """
+    for name in ("step", "reset"):
+        cls_attr = getattr(type(obj), name, None)
+        inst_attr = getattr(obj, name, None)
+        if callable(cls_attr) and not callable(inst_attr):
+            try:
+                # Preserve the value under a safer name for potential later use
+                if name == "step" and isinstance(inst_attr, (int, float)):
+                    setattr(obj, "step_size", float(inst_attr))
+                else:
+                    setattr(obj, f"_{name}_attr", inst_attr)
+                delattr(obj, name)
+            except Exception:
+                # Best-effort; if we cannot move/delete, leave as-is
+                pass
+    return obj
+
 def build(name: str, **kwargs) -> MPPTAlgorithm:
     """Instantiate an algorithm by name.
 
@@ -58,7 +84,10 @@ def build(name: str, **kwargs) -> MPPTAlgorithm:
         Constructor parameters forwarded to the algorithm class.
     """
     cls = get_class(name)
-    return cls(**kwargs)
+    obj = cls(**kwargs)
+    # Repair any accidental method shadowing (e.g., self.step = 0.01)
+    obj = _fix_shadowed_methods(obj)
+    return obj
 
 
 def available() -> Dict[str, str]:
