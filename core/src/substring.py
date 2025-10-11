@@ -1,7 +1,7 @@
-from core.cell import Cell
-from core.bypassdiode import Bypass_Diode
-import numpy as np
+from src.cell import Cell
+from src.bypassdiode import Bypass_Diode
 from typing import List, Tuple
+import numpy as np
 
 class Substring:
     def __init__(self, cell_list: List[Cell], bypass: Bypass_Diode):

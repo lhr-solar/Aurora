@@ -1,8 +1,8 @@
-from bypassdiode import Bypass_Diode
+from src.bypassdiode import Bypass_Diode
 import math
 import unittest
 
-class TestBypassDiode(unittest.TestCase):
+class Test_Bypass_Diode(unittest.TestCase):
     def setUp(self):
         self.bypass = Bypass_Diode(
             irradiance = 1000,
