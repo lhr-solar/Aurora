@@ -1,4 +1,4 @@
-from bypassdiode import Bypass_Diode
+from src.bypassdiode import Bypass_Diode
 import math
 import unittest
 

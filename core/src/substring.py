@@ -1,5 +1,5 @@
-from core.cell import Cell
-from core.bypassdiode import Bypass_Diode
+from src.cell import Cell
+from src.bypassdiode import Bypass_Diode
 import numpy as np
 from typing import List, Tuple
 
