@@ -8,7 +8,7 @@ Test:
 - under partial shading, hybrid tail's mean power is >= 95% RUCA's
 
 Run from the repo root:
-    python -m pytest -q
+    python -m pytest -q core/controller/tests/behavioral_tests.py
 """
 # Ensure project root is on sys.path (since this test lives under core/controller/tests)
 import sys

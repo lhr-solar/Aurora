@@ -2,7 +2,7 @@
 Targeted behavioral tests for MPPT algorithms using the Hybrid controller.
 
 Run from the repo root:
-    python -m pytest -q
+    python -m pytest -q core/controller/tests/targeted_tests.py
 """
 # Ensure project root is on sys.path (since this test lives under core/controller/tests)
 import sys
