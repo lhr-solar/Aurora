@@ -2,24 +2,8 @@
 Targeted behavioral tests for MPPT algorithms using the Hybrid controller.
 
 Run from the repo root:
-    python -m pytest -q core/controller/tests/targeted_tests.py
+    python -m pytest -q tests/controller/targeted_tests.py
 """
-# Ensure project root is on sys.path (since this test lives under core/controller/tests)
-import sys
-from pathlib import Path
-
-_THIS = Path(__file__).resolve()
-ROOT = None
-p = _THIS
-for _ in range(8):
-    if (p / "core").is_dir():
-        ROOT = p
-        break
-    p = p.parent
-if ROOT is None:
-    ROOT = _THIS.parents[4]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from dataclasses import dataclass
 from typing import Callable, Iterable
