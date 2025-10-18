@@ -6,9 +6,6 @@ deterministic without importing the full controller stack.
 Run tests from the repo root:
     python -m pytest -q tests/mppt_algorithms/conftest.py
 """
-
-from __future__ import annotations
-
 from typing import Callable
 import pytest
 

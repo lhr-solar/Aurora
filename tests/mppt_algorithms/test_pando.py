@@ -6,8 +6,6 @@ Run from repo root:
 Relies on fixtures provided by tests/mppt_algorithms/conftest.py
 """
 
-from __future__ import annotations
-
 import math
 import pytest
 
