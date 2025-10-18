@@ -27,7 +27,7 @@ dist/
 .coverage
 htmlcov/
 
-# --- Editors / OS noise (optional) ---
+# --- Editors / OS noise ---
 .DS_Store
 .idea/
 .vscode/
