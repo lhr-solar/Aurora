@@ -1,4 +1,4 @@
-# --- Virtual environments ---
+# Virtual environments
 .venv/
 venv/
 env/
@@ -7,7 +7,7 @@ ENV/
 **/venv/
 **/env/
 
-# --- Python build/bytecode ---
+# Python build/bytecode
 __pycache__/
 *.py[cod]
 *.pyo
@@ -15,19 +15,19 @@ __pycache__/
 *.so
 *.dll
 
-# --- Packaging / build artifacts ---
+# Packaging / build artifacts
 build/
 dist/
 *.egg-info/
 
-# --- Test & tooling caches ---
+# Test & tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# --- Editors / OS noise ---
+# Editors / OS noise
 .DS_Store
 .idea/
 .vscode/
