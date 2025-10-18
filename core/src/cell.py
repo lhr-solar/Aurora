@@ -7,7 +7,7 @@ EG_EV = 1.12 # silicon bandgap
 
 class Cell:
 
-    def __init__(self, isc_ref, voc_ref, diode_ideality, r_s=0, r_sh=0, voc_temp_coeff=-0.00174, isc_temp_coeff=0.0029, irradiance=1000.0, temperature_c=25.0, vmpp=0.621, impp=5.84, autofit=False):
+    def __init__(self, isc_ref, voc_ref, diode_ideality, r_s=0, r_sh=np.inf, voc_temp_coeff=-0.00174, isc_temp_coeff=0.0029, irradiance=1000.0, temperature_c=25.0, vmpp=0.621, impp=5.84, autofit=False):
         self.isc_ref = float(isc_ref)       # A (STC)
         self.voc_ref = float(voc_ref)       # V (STC)
         self.diode_ideality = float(diode_ideality)  # n
@@ -87,7 +87,7 @@ class Cell:
         self.set_conditions(irradiance=1000.0, temperature_c=25.0)
 
         # run your fitter (scipy version you implemented)
-        rs, rsh, info = self.fit_rs_rsh_scipy(start_from="grid", **fit_kwargs)
+        rs, rsh, info = self.fit_rs_rsh_scipy((1e-4, 0.05), (500.0, 5000.0), start_from="grid", **fit_kwargs)
 
         self._calibrated = True
 
@@ -98,11 +98,12 @@ class Cell:
 
 
     def solve_i_at_v(self, v, i0=None, iph=None, max_iter=80, tol=1e-10, i_init=None):
-        
-        if np.isinf(self.r_sh) or self.r_sh<=0:
+        # Cache attributes and functions locally to reduce attribute lookups
+        r_sh = self.r_sh
+        if np.isinf(r_sh) or r_sh <= 0:
             inv_r_sh = 0.0
         else:
-            inv_r_sh = 1/self.r_sh
+            inv_r_sh = 1.0 / r_sh
 
         if i0 is None:
             i0 = self.I0
@@ -110,20 +111,24 @@ class Cell:
             iph = self.Iph
 
         rs = self.r_s
-        denom_lin = 1.0 + rs * inv_r_sh
 
+        # initial linear approximation
+        denom_lin = 1.0 + rs * inv_r_sh
         if i_init is None:
-            denom_lin = 1.0 + rs * inv_r_sh
             i = (iph - v * inv_r_sh) / denom_lin if denom_lin > 0 else iph
         else:
             i = float(i_init)
 
+        # small helpers cached locally
+        clip = np.clip
+        exp = math.exp
+        isfinite = np.isfinite
+        abs_f = abs
 
         def clamp_I(x):
             # wide bounds to avoid boxing Newton too hard
-            # below zero can happen slightly under reverse bias; allow some slack
-            lo = -10.0 * abs(iph) - 1e-6
-            hi =  2.0  * abs(iph) + 1e-6
+            lo = -10.0 * abs_f(iph) - 1e-6
+            hi =  2.0  * abs_f(iph) + 1e-6
             return min(max(x, lo), hi)
 
         i = clamp_I(i)
@@ -131,42 +136,43 @@ class Cell:
         nVt = max(self.thermal_voltage, 1e-30)
 
         for _ in range(max_iter):
-            z = (v + i*rs) / nVt
-            z = float(np.clip(z, -100.0, 100.0))
-            e = math.exp(z)
+            z = (v + i * rs) / nVt
+            z = float(clip(z, -100.0, 100.0))
+            e = exp(z)
 
-            F  = i - iph + i0*(e - 1.0) + (v + i*rs) * inv_r_sh
-            dF = 1.0 + i0*e*(rs/nVt) + rs * inv_r_sh
-            if abs(dF) < 1e-30:
+            F = i - iph + i0 * (e - 1.0) + (v + i * rs) * inv_r_sh
+            dF = 1.0 + i0 * e * (rs / nVt) + rs * inv_r_sh
+            if abs_f(dF) < 1e-30:
                 dF = 1e-30 if dF >= 0 else -1e-30
-
-            step  = -F / dF
+            # calculate step from F and dF
+            step = -F / dF
             i_new = i + step
 
-            if not np.isfinite(i_new):
-                i_new = i + (-F / (abs(dF) + 1e-30)) * 0.5
+            if not isfinite(i_new):
+                i_new = i + (-F / (abs_f(dF) + 1e-30)) * 0.5
 
             # backtracking
+            # if the new step residual is worse than the old one, we halve the step size
             backtracked = 0
             while backtracked < 5:
-                z_try = (v + i_new*rs) / nVt
-                z_try = float(np.clip(z_try, -100.0, 100.0))
-                e_try = math.exp(z_try)
-                F_try = i_new - iph + i0*(e_try - 1.0) + (v + i_new*rs) * inv_r_sh
-                if abs(F_try) <= abs(F):
+                z_try = (v + i_new * rs) / nVt
+                z_try = float(clip(z_try, -100.0, 100.0))
+                e_try = exp(z_try)
+                F_try = i_new - iph + i0 * (e_try - 1.0) + (v + i_new * rs) * inv_r_sh
+                if abs_f(F_try) <= abs_f(F):
                     break
-                i_new = i + 0.5*(i_new - i)
+                i_new = i + 0.5 * (i_new - i)
                 backtracked += 1
 
             i_new = clamp_I(i_new)
 
             # step-size + residual convergence
-            if abs(i_new - i) <= tol * max(1.0, abs(i)):
-                z_fin = (v + i_new*rs) / nVt
-                z_fin = float(np.clip(z_fin, -100.0, 100.0))
-                e_fin = math.exp(z_fin)
-                F_fin = i_new - iph + i0*(e_fin - 1.0) + (v + i_new*rs) * inv_r_sh
-                if abs(F_fin) <= 1e-12:
+            if abs_f(i_new - i) <= tol * max(1.0, abs_f(i)):
+                z_fin = (v + i_new * rs) / nVt
+                z_fin = float(clip(z_fin, -100.0, 100.0))
+                e_fin = exp(z_fin)
+                F_fin = i_new - iph + i0 * (e_fin - 1.0) + (v + i_new * rs) * inv_r_sh
+                if abs_f(F_fin) <= 1e-12:
                     i = i_new
                     break
 
@@ -192,209 +198,236 @@ class Cell:
         iph = self.isc_ref + i0 * (exp_isc - 1.0) + self.isc_ref * self.r_s * inv_rsh
         return i0, iph
 
-    
-    def _mpp_error(self):
-        i0, iph = self._i0_iph_from_isc_voc()
-        if i0 is None:
-            return np.inf, None, None
+    # we are trying to fit rs and rsh based on known values
+    def fit_rs_rsh_scipy(
+        self,
+        rs_bounds=(1e-4, 0.05),
+        rsh_bounds=(500.0, 5000.0),
+        start_from="grid",
+        loss="huber",
+        f_scale=0.2,
+        max_nfev=600,
+        fit_n=True
+    ):
+        from scipy.optimize import least_squares
+        import numpy as np
 
-
-        i_at_vmpp = self.solve_i_at_v(self.vmpp, i0, iph)
-        real_power = self.vmpp * self.impp
-        simulated_power = self.vmpp * i_at_vmpp
-
-        error = abs(real_power-simulated_power)
-
-        return error, i0, iph
-
-
-    def fit_rs_rsh_scipy(self,
-                     rs_bounds=(1e-6, 0.2),
-                     rsh_bounds=(10.0, 20000.0),
-                     start_from="grid",        # "grid", "current", or (rs0,rsh0)
-                     use_slopes=False,
-                     weights=(1.0, 1.0, 3.0, 0.25, 0.25),
-                     loss="soft_l1",
-                     f_scale=0.2,
-                     max_nfev=200,
-                     grid_kwargs=None):
-        """
-        Robust SciPy least-squares fit for (Rs, Rsh), with normalized residuals.
-        - start_from: "grid" runs a quick grid refine first; "current" uses current Rs/Rsh; or pass a tuple (rs0,rsh0).
-        - use_slopes: include endpoint slope residuals to better shape the knee (optional).
-        - weights: (w_isc, w_voc, w_mpp[, w_slope_left, w_slope_right]) — MPP usually deserves more weight.
-        - loss: "linear" (plain LS), "soft_l1", or "huber".
-        - f_scale: scale at which residuals start getting down-weighted (since residuals are normalized, 0.1–0.5 works well).
-        """
-        try:
-            from scipy.optimize import least_squares
-        except Exception as e:
-            raise RuntimeError("SciPy not available: " + str(e))
-
-        # choose starting point
+        # for seeding
+        # user's settings
         if isinstance(start_from, (tuple, list)) and len(start_from) == 2:
             rs0, rsh0 = map(float, start_from)
+        # use whatever is in there right now
         elif start_from == "current":
             rs0, rsh0 = float(self.r_s), float(self.r_sh)
+        # uses a grid to find the best starting point, reuses residual that we use when fitting rs and rsh with scipy
+        elif start_from == "grid":
+            # tiny grid seed: try a few candidates and pick the lowest L2 residual norm
+            rs_cands = np.geomspace(max(1e-5, rs_bounds[0]), rs_bounds[1], 4)
+            rsh_cands = np.geomspace(max(50.0, rsh_bounds[0]), rsh_bounds[1], 4)
+            best = None
+            # temporarily stash operating point
+            G0, T0 = self.irradiance, self.temperature_c
+            for rs_c in rs_cands:
+                for rsh_c in rsh_cands:
+                    rvec = self._bundle_residuals(rs_c, rsh_c, n=self.diode_ideality, weights=None)
+                    if not np.all(np.isfinite(rvec)):
+                        continue
+                    val = float(np.linalg.norm(rvec))
+                    if (best is None) or (val < best[0]):
+                        best = (val, rs_c, rsh_c)
+            # restore state (bundle_residuals already guards, but this is explicit)
+            self.set_conditions(G0, T0)
+            rs0, rsh0 = (best[1], best[2]) if best is not None else (0.01, 1500.0)
         else:
-            # small, fast grid to get a decent seed
-            gk = grid_kwargs or {
-                "rs_range": (0.0, 0.08),
-                "rsh_range": (20.0, 6000.0),
-                "coarse_steps": (15, 15),
-                "refine_factor": 0.3,
-                "refine_steps": (17, 17),
-                "weights": (1.0, 1.0, 3.0),
-            }
-            # quick inline grid-refine using the normalized residuals
-            def grid_search(rs_lo, rs_hi, rsh_lo, rsh_hi, n_rs, n_rsh):
-                best = (float("inf"), None, None)
-                rs_vals  = np.linspace(rs_lo,  rs_hi,  int(max(2, n_rs)))
-                rsh_vals = np.linspace(rsh_lo, rsh_hi, int(max(2, n_rsh)))
-                for rs in rs_vals:
-                    for rsh in rsh_vals:
-                        r = self._fit_residuals_norm(rs, rsh, use_slopes=False, w=gk["weights"])
-                        err = float(np.linalg.norm(r))
-                        if err < best[0]:
-                            best = (err, float(rs), float(rsh))
-                return best
+            # simple midpoints if grid omitted or fails
+            rs0, rsh0 = 0.01, 1500.0
 
-            (rs_lo, rs_hi), (rsh_lo, rsh_hi) = gk["rs_range"], gk["rsh_range"]
-            n_rs, n_rsh = gk["coarse_steps"]
-            err1, rs1, rsh1 = grid_search(rs_lo, rs_hi, rsh_lo, rsh_hi, n_rs, n_rsh)
+        # ---- Optimize in log-space for positivity & conditioning ----
+        if fit_n:
+            x0 = np.array([np.log(rs0), np.log(rsh0), self.diode_ideality], float)
+            lb = np.array([np.log(max(1e-5, rs_bounds[0])), np.log(max(50.0, rsh_bounds[0])), 1.00])
+            ub = np.array([np.log(rs_bounds[1]),                np.log(rsh_bounds[1]),       1.70])
 
-            rs_span  = max(1e-6, gk["refine_factor"] * max(1e-6, rs1))
-            rsh_span = max(1.0,  gk["refine_factor"] * max(1.0,  rsh1))
-            err2, rs2, rsh2 = grid_search(max(0.0, rs1 - rs_span), rs1 + rs_span,
-                                        max(1.0,  rsh1 - rsh_span), rsh1 + rsh_span,
-                                        *gk["refine_steps"])
-            rs0, rsh0 = rs2, rsh2
+            def resid(x):
+                log_rs, log_rsh, n = map(float, x)
+                return self._bundle_residuals(np.exp(log_rs), np.exp(log_rsh), n=n)
+        else:
+            x0 = np.array([np.log(rs0), np.log(rsh0)], float)
+            lb = np.array([np.log(max(1e-5, rs_bounds[0])), np.log(max(50.0, rsh_bounds[0]))])
+            ub = np.array([np.log(rs_bounds[1]),                np.log(rsh_bounds[1])])
 
-        # residual callback for SciPy (normalized)
-        def resid(x):
-            rs, rsh = float(x[0]), float(x[1])
-            return self._fit_residuals_norm(rs, rsh, use_slopes=use_slopes, w=weights)
+            def resid(x):
+                log_rs, log_rsh = map(float, x)
+                return self._bundle_residuals(np.exp(log_rs), np.exp(log_rsh), n=None)
 
-        lb = np.array([rs_bounds[0],  rsh_bounds[0]], dtype=float)
-        ub = np.array([rs_bounds[1],  rsh_bounds[1]], dtype=float)
+        # keep x0 strictly inside bounds
+        x0 = np.minimum(np.maximum(x0, lb + 1e-12), ub - 1e-12)
 
         res = least_squares(
-            resid,
-            x0=np.array([rs0, rsh0], dtype=float),
-            bounds=(lb, ub),
-            method="trf",
-            loss=loss,         # "linear", "soft_l1", or "huber"
-            f_scale=f_scale,   # assumes residuals are normalized
-            max_nfev=max_nfev
+            resid, x0, bounds=(lb, ub),
+            method="trf", loss=loss, f_scale=f_scale, max_nfev=max_nfev,
+            jac="2-point"  # good default for smooth residuals
         )
 
-        best_rs, best_rsh = float(res.x[0]), float(res.x[1])
-        # apply and refresh
-        self.r_s, self.r_sh = best_rs, best_rsh
+        if fit_n:
+            rs, rsh, n = float(np.exp(res.x[0])), float(np.exp(res.x[1])), float(res.x[2])
+            self.diode_ideality = n
+        else:
+            rs, rsh = float(np.exp(res.x[0])), float(np.exp(res.x[1]))
+
+        self.r_s, self.r_sh = rs, rsh
         self._update_cache(init_reference=False)
 
         info = {
             "success": bool(res.success),
             "message": res.message,
             "nfev": int(res.nfev),
-            "cost": float(res.cost),                   # 0.5 * sum(residuals^2 after loss transform)
-            "final_residuals": res.fun.tolist(),       # raw residuals (pre-loss)
-            "x0": [rs0, rsh0],
-            "bounds": [rs_bounds, rsh_bounds],
-            "weights": list(weights),
-            "loss": loss,
-            "f_scale": f_scale
+            "cost": float(res.cost),
+            "rs": rs, "rsh": rsh, "n": float(self.diode_ideality)
         }
-        return best_rs, best_rsh, info
-
-
-
+        return rs, rsh, info
 
     # ---------- Utilities for residuals (normalized & stable) ----------
 
-    def _predict_io_given_rs_rsh(self, rs, rsh):
-        """Temporarily set (rs,rsh), refresh cache, and estimate (i0, iph)."""
-        rs_old, rsh_old = self.r_s, self.r_sh
+
+    def _bundle_residuals(self, rs, rsh, n=None, weights=None):
+        """
+        Bundle residuals that *anchor the physics*:
+        - r_isc = ( I(0) - Isc_ref ) / Isc_ref
+        - r_voc = I(Voc_ref) / Isc_ref
+        - r_mpp = ( Vmpp·I(Vmpp) - Vmpp·Impp ) / (Vmpp·Impp)
+        - r_tc_voc = ( β_model - β_spec ) / |β_spec|
+        - r_tc_isc = ( α_model - α_spec ) / |α_spec|
+        - r_irr = (I_0V_800 / I_0V_400) - 2
+        - reg_rs adds penalty for extreme values
+        - reg_rsh adds penalty for extreme values
+        Using these residuals we input to our scip py optimizer to find a good Rs and Rsh
+        """
+        W = weights or {
+            "isc": 1.0, "voc": 1.0, "mpp": 6.0,
+            "tc_voc": 1.2, "tc_isc": 1.0,
+            "irr_lin": 0.5,
+            "reg_rs": 1.0, "reg_rsh": 1.0
+        }
+
+        G0, T0 = self.irradiance, self.temperature_c
+
+        rs_old, rsh_old, n_old = self.r_s, self.r_sh, self.diode_ideality
         try:
             self.r_s, self.r_sh = float(rs), float(rsh)
+            if n is not None:
+                self.diode_ideality = float(n)
             self._update_cache(init_reference=False)
-            i0, iph = self._i0_iph_from_isc_voc()
-            return i0, iph
+
+            # --- STC (25C, 1000 W/m^2)
+            self.set_conditions(1000.0, 25.0)
+            i0_stc, iph_stc = self._i0_iph_from_isc_voc()
+            if i0_stc is None or not np.isfinite(i0_stc) or not np.isfinite(iph_stc) or i0_stc < 0:
+                return np.array([1e3, 1e3, 1e3, 1e3, 1e3, 1e3, 10.0, 10.0], float)
+
+            I0V   = self.solve_i_at_v(0.0,       i0=i0_stc, iph=iph_stc)
+            Ivoc  = self.solve_i_at_v(self.voc_ref, i0=i0_stc, iph=iph_stc)
+            Ivmpp = self.solve_i_at_v(self.vmpp, i0=i0_stc, iph=iph_stc)
+
+            Isc_ref = max(1e-12, abs(self.isc_ref))
+            Pmpp_ref = max(1e-12, abs(self.vmpp * self.impp))
+            r_isc = (I0V - self.isc_ref) / Isc_ref
+            r_voc = Ivoc / Isc_ref
+            r_mpp = (self.vmpp * Ivmpp - self.vmpp * self.impp) / Pmpp_ref
+
+            # --- Temperature coefficient constraints (finite difference around 25°C)
+            # basically we find the condition at 15 and 40 find the Voc so we can then compare voc temp coeff
+            dT = 15.0
+            self.set_conditions(1000.0, 25.0 + dT)
+            i0_hi, iph_hi = self._i0_iph_from_isc_voc()
+            Voc_hi = self._solve_voc(i0=i0_hi, iph=iph_hi)
+
+            self.set_conditions(1000.0, 25.0 - dT)
+            i0_lo, iph_lo = self._i0_iph_from_isc_voc()
+            Voc_lo = self._solve_voc(i0=i0_lo, iph=iph_lo)
+
+            beta_voc_model = (Voc_hi - Voc_lo) / (2 * dT)          # V/°C
+            beta_voc_spec  = self.voc_temp_coeff                   # V/°C
+            r_tc_voc = (beta_voc_model - beta_voc_spec) / max(1e-6, abs(beta_voc_spec))
+
+            # Isc(T) slope
+            # same thing here but with Isc
+            self.set_conditions(1000.0, 25.0 + dT); I_0V_hi = self.solve_i_at_v(0.0)
+            self.set_conditions(1000.0, 25.0 - dT); I_0V_lo = self.solve_i_at_v(0.0)
+            alpha_isc_model = (I_0V_hi - I_0V_lo) / (2 * dT)       # A/°C
+            alpha_isc_spec  = self.isc_temp_coeff                   # A/°C
+            r_tc_isc = (alpha_isc_model - alpha_isc_spec) / max(1e-6, abs(alpha_isc_spec))
+
+            # --- Irradiance linearity (near STC)
+            # set irradiance to 800 and 400 see if the increase is 2x
+            self.set_conditions(800.0, 25.0); I_0V_800 = self.solve_i_at_v(0.0)
+            self.set_conditions(400.0, 25.0); I_0V_400 = self.solve_i_at_v(0.0)
+            # Expect ~2× ratio; turn into a scalar residual
+            r_irr = (I_0V_800 / max(1e-9, I_0V_400)) - 2.0
+
+            # --- Tiny L2 regularization to avoid extremes that "match" but are non-physical
+            reg_rs  = 1e-3 * (rs  / 0.05)**2
+            reg_rsh = 1e-6 * (rsh / 1000.0)**2
+
+            return np.array([
+                W["isc"]*r_isc, W["voc"]*r_voc, W["mpp"]*r_mpp,
+                W["tc_voc"]*r_tc_voc, W["tc_isc"]*r_tc_isc,
+                W["irr_lin"]*r_irr,
+                W["reg_rs"]*reg_rs, W["reg_rsh"]*reg_rsh
+            ], dtype=float)
+
         finally:
             self.r_s, self.r_sh = rs_old, rsh_old
+            self.diode_ideality = n_old
+            self.set_conditions(G0, T0)
             self._update_cache(init_reference=False)
 
-    def _endpoint_slopes(self, i0, iph, dv=1e-4):
+
+    def _solve_voc(self, i0=None, iph=None):
         """
-        Approximate endpoint slopes:
-        near V=0:      dI/dV ≈ (I(dv)-I(0)) / dv   ~ -1/Rsh (if Rs small)
-        near V≈Voc:    dI/dV ≈ (I(Voc)-I(Voc-dv)) / dv  (Rs influences)
+        Numerically find Voc: the voltage where I(V)=~0.
+        Uses a coarse sweep + 1D refine that is robust even before good fitting.
         """
-        I0 = self.solve_i_at_v(0.0, i0=i0, iph=iph)
-        I_dv = self.solve_i_at_v(dv,  i0=i0, iph=iph, i_init=I0)
-        slope_left = (I_dv - I0) / dv
+        # Bracket around linear estimate; allow extra headroom
+        vmax_guess = max(self.voc_lin if self.voc_lin is not None else self.voc_ref, self.voc_ref)
+        v_lo = 0.0
+        v_hi = max(vmax_guess, 0.9 * self.voc_ref) + 0.05  # small pad
 
-        I_voc = self.solve_i_at_v(self.voc_ref, i0=i0, iph=iph)
-        I_voc_m = self.solve_i_at_v(max(0.0, self.voc_ref - dv), i0=i0, iph=iph, i_init=I_voc)
-        slope_right = (I_voc - I_voc_m) / dv
-        return slope_left, slope_right
+        # coarse scan to get close
+        i_guess = iph if iph is not None else self.Iph
+        best_v, best_absI = 0.0, 1e9
+        for v in np.linspace(v_lo, v_hi, 80):
+            i_guess = self.solve_i_at_v(v, i0=i0, iph=iph, i_init=i_guess)
+            ai = abs(i_guess)
+            if ai < best_absI:
+                best_absI, best_v = ai, v
 
-    def _fit_residuals_norm(self, rs, rsh, use_slopes=False, w=(1.0, 1.0, 3.0, 0.3, 0.3)):
-        """
-        Normalized residual vector for least-squares:
-        r1 = (I(0) - Isc)/Isc
-        r2 = I(Voc)/Isc
-        r3 = (P(Vmpp) - Vmpp*Impp) / (Vmpp*Impp)
-        r4 = (slope_left - target_left)/|target_left|         [optional]
-        r5 = (slope_right - target_right)/max(1e-6, |target_right|)  [optional]
-        Weights w = (w1,w2,w3[,w4,w5]).
-        """
-        # estimate i0, iph under these Rs/Rsh
-        i0, iph = self._predict_io_given_rs_rsh(rs, rsh)
-        if i0 is None or not np.isfinite(i0) or i0 < 0 or not np.isfinite(iph):
-            # invalid combo -> big penalty
-            return np.array([1e6, 1e6, 1e6], dtype=float)
+        # quick golden-section refine on |I(v)|
+        phi = (1 + 5**0.5) / 2
+        a, b = max(v_lo, best_v - 0.08), min(v_hi, best_v + 0.08)
+        x1 = b - (b - a) / phi
+        x2 = a + (b - a) / phi
+        f = lambda v, ig: (abs(self.solve_i_at_v(v, i0=i0, iph=iph, i_init=ig)), self.solve_i_at_v(v, i0=i0, iph=iph, i_init=ig))
+        f1, i_guess = f(x1, i_guess)
+        f2, i_guess = f(x2, i_guess)
+        for _ in range(30):
+            if (b - a) <= 1e-6 or min(f1, f2) <= 1e-9:
+                break
+            if f1 > f2:
+                a = x1
+                x1 = x2
+                f1 = f2
+                x2 = a + (b - a) / phi
+                f2, i_guess = f(x2, i_guess)
+            else:
+                b = x2
+                x2 = x1
+                f2 = f1
+                x1 = b - (b - a) / phi
+                f1, i_guess = f(x1, i_guess)
+        return 0.5 * (a + b)
 
-        # base residuals
-        Isc_ref = max(1e-12, abs(self.isc_ref))
-        Pmpp_ref = max(1e-12, abs(self.vmpp * self.impp))
-
-        I0V   = self.solve_i_at_v(0.0, i0=i0, iph=iph)
-        Ivoc  = self.solve_i_at_v(self.voc_ref, i0=i0, iph=iph)
-        Ivmpp = self.solve_i_at_v(self.vmpp,   i0=i0, iph=iph)
-
-        r1 = (I0V - self.isc_ref) / Isc_ref
-        r2 = Ivoc / Isc_ref
-        r3 = (self.vmpp * Ivmpp - self.vmpp * self.impp) / Pmpp_ref
-
-        res = [w[0]*r1, w[1]*r2, w[2]*r3]
-
-        # optional slope constraints (help pin Rs/Rsh shape)
-        if use_slopes:
-            # crude targets: near 0V, slope ~ -1/Rsh ; near Voc, slope magnitude grows with Rs
-            # Use current (rs,rsh) inferred targets for normalization to avoid over-constraining units.
-            # Here we “nudge” toward theoretical expectations:
-            slope_left, slope_right = self._endpoint_slopes(i0, iph, dv=1e-4)
-
-            # heuristic targets:
-            target_left  = -1.0 / max(1.0, rsh)          # amps/volt
-            target_right = -1.0 / max(1e-6, rs + 1e-3)   # larger magnitude for larger Rs (very rough)
-
-            # normalized slope residuals
-            r4 = (slope_left  - target_left)  / max(1e-6, abs(target_left))
-            r5 = (slope_right - target_right) / max(1e-6, abs(target_right))
-
-            res.extend([w[3]*r4, w[4]*r5])
-
-        bad = (i0 is None) or (not np.isfinite(i0)) or (i0 < 0) or (not np.isfinite(iph))
-        if bad:
-            base = [1e6, 1e6, 1e6]
-            if use_slopes:
-                base += [1e6, 1e6]
-            return np.array(base, dtype=float)
-
-        return np.array(res, dtype=float)
-
+    # ------IV CURVE GENERATION------
 
     def get_iv_curve(self, num_points, vmin=0.0, vmax=None):
 
