@@ -444,3 +444,36 @@ class Cell:
             i_guess = i  # warm start for next voltage initial guess
 
         return points
+    
+    def v_at_i(self, i_target: float, tol: float = 1e-7, max_iter: int = 80) -> float:
+        """
+        Find the voltage at which the cell current equals i_target (A).
+        Uses a robust bisection search over the monotonic I–V curve.
+        Works for forward-bias region (0..Isc).
+        """
+        # Bracket around Voc range
+        v_lo = -0.05
+        v_hi_guess = self.voc_lin if self.voc_lin is not None else self.voc_ref
+        v_hi = max(0.1, float(v_hi_guess)) * 1.10  # pad above Voc
+
+        i_lo = self.solve_i_at_v(v_lo)   # ~Isc
+        i_hi = self.solve_i_at_v(v_hi)   # ~0
+
+        # If target outside bounds, clamp
+        if i_target >= i_lo:
+            return v_lo
+        if i_target <= i_hi:
+            return v_hi
+
+        # Bisection
+        # keep getting the middle of v and solve for i
+        for _ in range(max_iter):
+            vm = 0.5 * (v_lo + v_hi)
+            im = self.solve_i_at_v(vm)
+            if abs(im - i_target) < tol:
+                return vm
+            if im > i_target:
+                v_lo = vm
+            else:
+                v_hi = vm
+        return 0.5 * (v_lo + v_hi)
