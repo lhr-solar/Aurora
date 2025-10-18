@@ -1,6 +1,6 @@
 # Aurora
 
-A modular solar array simulation software for Longhorn Racing Solar (2024–2026).  
+A modular solar array simulation software for Longhorn Racing Solar.  
 It models PV cells, substrings, strings, and arrays, simulates MPPT algorithms, and provides desktop UIs for interactive analysis.  
 
 ---
