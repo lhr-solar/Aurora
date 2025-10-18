@@ -7,8 +7,6 @@ last perturbation reduced power. Simple, lightweight, and deterministic.
 
 Notes
 - Use small steps for low ripple; larger steps for faster convergence.
-- Consider switching to MEPO/RUCA for adaptive steps, or to global search
-  (PSO/Firefly/GA/ACO) when partial shading is detected.
 """
 from typing import Optional, Dict, Any
 
@@ -102,7 +100,7 @@ class PANDO(MPPTAlgorithm):
             },
         )
 
-    # ---- Frontend helpers ----
+    # Frontend helpers 
     def describe(self) -> Dict[str, Any]:
         """Return UI metadata for tunable parameters."""
         return {

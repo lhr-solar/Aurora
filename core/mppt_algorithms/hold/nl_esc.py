@@ -11,11 +11,13 @@ meant to be used once you are already near the MPP (e.g., after S3 global
 search), not as a global optimizer by itself.
 """
 import math
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 
 from ..base import MPPTAlgorithm
-from ..types import Measurement, Action
 from ..common import clamp, EMA, SlewLimiter, compute_power
+
+if TYPE_CHECKING:  # import only for type checking
+    from ..types import Measurement, Action
 
 
 class NL_ESC(MPPTAlgorithm):
@@ -61,58 +63,72 @@ class NL_ESC(MPPTAlgorithm):
         self.k = float(k)
         self.vmin, self.vmax = float(vmin), float(vmax)
         self.leak = float(leak)
-        self._grad = EMA(alpha=demod_alpha)
+        self.demod_alpha = float(demod_alpha)
+        self._grad = EMA(self.demod_alpha)
         self._slew = SlewLimiter(max_step=slew)
-        self.v_ref: Optional[float] = None  # base (undithered) reference
+        self.v_base: Optional[float] = None  # undithered base near MPP
+        self.v_ref: Optional[float] = None   # last commanded, after slew
         self._theta: Optional[float] = None  # internal phase when m.t unavailable
 
     # Lifecycle
     def reset(self) -> None:
+        self.v_base = None
         self.v_ref = None
-        self._grad.reset()
+        self._grad = EMA(self.demod_alpha)
         self._slew = SlewLimiter(self._slew.max_step)
         self._theta = None
 
     # Core step
-    def step(self, m: Measurement) -> Action:
+    def step(self, m: "Measurement") -> "Action":
         # Seed base reference on first call
+        if self.v_base is None:
+            self.v_base = clamp(m.v, self.vmin, self.vmax)
         if self.v_ref is None:
-            self.v_ref = clamp(m.v, self.vmin, self.vmax)
+            self.v_ref = self.v_base
+
+        # Timestep (guard None)
+        dt = float(m.dt) if getattr(m, "dt", None) is not None else 1e-3
 
         # Compute dither phase (prefer absolute time; fall back to internal phase)
         omega = 2.0 * math.pi * self.f
         if m.t is not None:
             theta = omega * float(m.t)
         else:
-            # Maintain our own phase using dt if available; else assume a small dt
             if self._theta is None:
                 self._theta = 0.0
-            dt = m.dt if m.dt is not None else 1e-3
-            self._theta += omega * float(dt)
+            self._theta += omega * dt
             theta = self._theta
 
         s = math.sin(theta)
 
         # Measure power and estimate gradient via synchronous demodulation
         p = compute_power(m.v, m.i)
-        grad_est = self._grad.update(p * s)
+        demod = p * s
+        grad_lp = self._grad.update(demod)
 
-        # Integrate gradient toward the extremum (Newton‑like behavior folded in k)
-        base = (1.0 - self.leak) * self.v_ref + self.k * grad_est
-        self.v_ref = clamp(base, self.vmin, self.vmax)
+        # Normalize by dither amplitude and integrate toward extremum
+        A = max(1e-6, float(self.A))
+        grad = (2.0 / A) * grad_lp
+        self.v_base = clamp(
+            self.v_base + self.k * grad - self.leak * (self.v_base - 0.5 * (self.vmin + self.vmax)) * dt,
+            self.vmin,
+            self.vmax,
+        )
 
-        # Command includes dither; then rate‑limit to protect converter
-        v_target = self.v_ref + self.A * s
-        v_cmd = self._slew.step(v_target)
+        # Command = base + dither; apply slew against last output
+        v_target = clamp(self.v_base + self.A * s, self.vmin, self.vmax)
+        v_cmd = self._slew.limit(self.v_ref, v_target)
+        self.v_ref = v_cmd
 
+        from ..types import Action  # local import to avoid runtime NameError/cycles
         return Action(
             v_ref=v_cmd,
             debug={
                 "algo": "nl_esc",
                 "phase": "hold",
                 "p": float(p),
-                "grad": float(grad_est),
-                "v_base": float(self.v_ref),
+                "grad": float(grad),
+                "v_base": float(self.v_base),
                 "v_cmd": float(v_cmd),
                 "theta": float(theta % (2.0 * math.pi)),
                 "dither_amp": float(self.A),
@@ -130,7 +146,7 @@ class NL_ESC(MPPTAlgorithm):
                 {"name": "dither_amp",  "type": "number",  "min": 0.0,  "max": 2.0,   "step": 1e-3, "unit": "V",      "default": self.A,       "help": "Sinusoidal dither amplitude (Volts)"},
                 {"name": "dither_hz",   "type": "number",  "min": 5.0,  "max": 2000.0, "step": 1.0,  "unit": "Hz",     "default": self.f,       "help": "Dither frequency"},
                 {"name": "k",           "type": "number",  "min": 0.01, "max": 2.0,    "step": 0.01,              "default": self.k,       "help": "Integrator gain (includes normalization)"},
-                {"name": "demod_alpha", "type": "number",  "min": 0.01, "max": 0.9,    "step": 0.01,              "default": self._grad.alpha, "help": "EMA smoothing for demodulated gradient"},
+                {"name": "demod_alpha", "type": "number",  "min": 0.01, "max": 0.9,    "step": 0.01,              "default": float(getattr(self, "demod_alpha", 0.15)), "help": "EMA smoothing for demodulated gradient"},
                 {"name": "leak",        "type": "number",  "min": 0.0,  "max": 0.05,   "step": 1e-3,              "default": self.leak,    "help": "Optional leak on base reference per step"},
                 {"name": "slew",        "type": "number",  "min": 0.001,"max": 2.0,    "step": 0.001, "unit": "V/step","default": self._slew.max_step, "help": "Max change allowed per control step"},
                 {"name": "vmin",        "type": "number",                                      "default": self.vmin,    "unit": "V"},
@@ -143,7 +159,7 @@ class NL_ESC(MPPTAlgorithm):
             "dither_amp": self.A,
             "dither_hz": self.f,
             "k": self.k,
-            "demod_alpha": self._grad.alpha,
+            "demod_alpha": float(getattr(self, "demod_alpha", 0.15)),
             "leak": self.leak,
             "slew": self._slew.max_step,
             "vmin": self.vmin,
@@ -158,10 +174,16 @@ class NL_ESC(MPPTAlgorithm):
         if "k" in kw:
             self.k = float(kw["k"])  # caller responsible for stability tuning
         if "demod_alpha" in kw:
-            alpha = float(kw["demod_alpha"])
-            alpha = max(1e-6, min(alpha, 0.999))
-            # Re-create EMA with new alpha; state is reset to avoid bias
-            self._grad = EMA(alpha=alpha)
+            val = float(kw["demod_alpha"])
+            # clamp to sane range
+            val = max(1e-6, min(val, 0.999))
+            self.demod_alpha = val
+            # Try to update the EMA in place; if not supported, rebuild preserving state
+            try:
+                setattr(self._grad, "alpha", val)
+            except Exception:
+                y0 = getattr(self._grad, "y", 0.0)
+                self._grad = EMA(val, y0)
         if "leak" in kw:
             self.leak = max(0.0, float(kw["leak"]))
         if "slew" in kw:
@@ -169,4 +191,4 @@ class NL_ESC(MPPTAlgorithm):
         if "vmin" in kw:
             self.vmin = float(kw["vmin"]) 
         if "vmax" in kw:
-            self.vmax = float(kw["vmax"]) 
+            self.vmax = float(kw["vmax"])

@@ -9,8 +9,9 @@ You can evolve it with richer PSD logic, limit handling, and telemetry.
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Dict, Optional
-
-from ..mppt_algorithms.types import Measurement, Action
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..mppt_algorithms.types import Measurement, Action
 from ..mppt_algorithms.registry import build
 from .psd import PSDDetector
 from .safety import SafetyLimits, check_limits
@@ -78,7 +79,7 @@ class HybridMPPT:
         self._last_good_v = None
 
     # Core step
-    def step(self, m: Measurement) -> Action:
+    def step(self, m: "Measurement") -> "Action":
         """Advance the controller one cycle.
 
         Applies safety checks, runs the active state's algorithm, and performs
@@ -147,13 +148,13 @@ class HybridMPPT:
         return Action(v_ref=m.v, debug={"state": str(self.state)})
 
     # Helpers
-    def _with_state(self, a: Action, state: State) -> Action:
+    def _with_state(self, a: "Action", state: State) -> "Action":
         dbg = dict(a.debug) if a.debug else {}
         dbg["state"] = state.value
         a.debug = dbg
         return a
 
-    # ---- Frontend helpers (optional) ----
+    # Frontend helpers
     def get_state(self) -> str:
         """Return current state name for UI convenience."""
         return self.state.value

@@ -89,6 +89,26 @@ class PSO(MPPTAlgorithm):
         self._iter: int = 0
         self._streak_small: int = 0
         self.last_cmd: Optional[float] = None
+        self.v_ref: Optional[float] = None
+    def _apply_slew(self, prev: Optional[float], target: float) -> float:
+        """Apply slew limiting using whichever API the limiter exposes."""
+        s = self._slew
+        fn = getattr(s, "limit", None)
+        if callable(fn):
+            return fn(prev, target)
+        try:
+            return s(prev, target)  # callable SlewLimiter
+        except Exception:
+            # Manual fallback using max_step
+            step = float(getattr(s, "max_step", 0.0) or 0.0)
+            if prev is None:
+                return float(target)
+            dv = float(target) - float(prev)
+            if dv > step:
+                return float(prev) + step
+            if dv < -step:
+                return float(prev) - step
+            return float(target)
 
     def describe(self) -> Dict[str, Any]:
         """Return UI metadata for tunable parameters."""
@@ -168,8 +188,11 @@ class PSO(MPPTAlgorithm):
         if self.center is None:
             self._init_swarm(m.v)
             self.last_cmd = self.pos[0]
-            v_cmd = self._slew.step(self.last_cmd)
-            return Action(v_ref=v_cmd, debug={"algo": "pso", "phase": 0, "p": float(p), "center": float(self.center or m.v), "span": float(self.span or 0.0)})
+            raw = clamp(self.last_cmd, self.vmin, self.vmax)
+            prev = self.v_ref if self.v_ref is not None else m.v
+            v_out = self._apply_slew(prev, raw)
+            self.v_ref = v_out
+            return Action(v_ref=v_out, debug={"algo": "pso", "phase": 0, "p": float(p), "center": float(self.center or m.v), "span": float(self.span or 0.0)})
 
         # Assign fitness to the previously commanded particle
         idx = self.k_eval % self.np
@@ -215,10 +238,13 @@ class PSO(MPPTAlgorithm):
             phase = 1  # exploring
 
         self.last_cmd = target
-        v_cmd = self._slew.step(target)
+        raw = clamp(target, self.vmin, self.vmax)
+        prev = self.v_ref if self.v_ref is not None else m.v
+        v_out = self._apply_slew(prev, raw)
+        self.v_ref = v_out
 
         return Action(
-            v_ref=v_cmd,
+            v_ref=v_out,
             debug={
                 "algo": "pso",
                 "phase": phase,

@@ -13,10 +13,11 @@ If the number of positive heuristics >= `votes`, we deem the condition PSC=true.
 
 from dataclasses import dataclass
 from typing import Deque, Dict, Any
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..mppt_algorithms.types import Measurement  # type: ignore
 from collections import deque
 
-# Import Measurement from the algorithms package (sibling of controller)
-from ..mppt_algorithms.types import Measurement
 
 @dataclass
 class PSDConfig:
@@ -44,9 +45,9 @@ class PSDDetector:
         if window < 3:
             raise ValueError("window must be ≥ 3")
         self.cfg = PSDConfig(dp_frac=dp_frac, dv_frac=dv_frac, window=window, votes=votes)
-        self.buf: Deque[Measurement] = deque(maxlen=self.cfg.window)
+        self.buf: Deque["Measurement"] = deque(maxlen=self.cfg.window)
 
-    # ---- Tunable properties (proxy to cfg) ----
+    # Tunable properties (proxy to cfg)
     @property
     def dp_frac(self) -> float:
         return self.cfg.dp_frac
@@ -88,17 +89,17 @@ class PSDDetector:
         self.buf.clear()
 
     # Streaming API
-    def update(self, m: Measurement) -> None:
+    def update(self, m: "Measurement") -> None:
         """Append a new sample to the window (no decision)."""
         self.buf.append(m)
 
-    def update_and_check(self, m: Measurement) -> bool:
+    def update_and_check(self, m: "Measurement") -> bool:
         """Append and return PSC decision in one call."""
         self.update(m)
         return self.is_psc()
 
     # Logic
-    # ---- Frontend helpers (optional) ----
+    # Frontend helpers
     def describe(self) -> Dict[str, Any]:
         return {
             "key": "psd",
@@ -140,7 +141,7 @@ class PSDDetector:
 
         votes = 0
 
-        # --- H1: big |change P| while |change V| small over the last step ---
+        # H1: big |change P| while |change V| small over the last step
         a, b = self.buf[-2], self.buf[-1]
         p_a, p_b = a.v * a.i, b.v * b.i
         dP = abs(p_b - p_a)
@@ -149,7 +150,7 @@ class PSDDetector:
         if dV_small and dP >= self.cfg.dp_frac * max(abs(p_b), 1.0):
             votes += 1
 
-        # --- H2: conflicting local dP/dV signs within window ---
+        # H2: conflicting local dP/dV signs within window
         pos, neg = 0, 0
         for i in range(1, len(self.buf)):
             m0, m1 = self.buf[i - 1], self.buf[i]

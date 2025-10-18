@@ -80,6 +80,20 @@ class EMA:
             self.y = self.a * x + (1.0 - self.a) * self.y
         return self.y
 
+    # Compatibility helpers -------------------------------------------------
+    @property
+    def alpha(self) -> float:
+        """Expose smoothing factor with a conventional name."""
+        return self.a
+
+    @alpha.setter
+    def alpha(self, val: float) -> None:
+        self.a = clamp(val, 0.0, 1.0)
+
+    def filter(self, x: float) -> float:
+        """Alias for update(x) for callers that expect a filter() API."""
+        return self.update(x)
+
 
 class MovingAverage:
     """Fixed-size windowed average (simple FIR)."""
@@ -146,3 +160,22 @@ class SlewLimiter:
     @property
     def last(self) -> Optional[float]:
         return self._last
+
+    # Compatibility helpers -------------------------------------------------
+    def limit(self, prev: Optional[float], target: float) -> float:
+        """Clamp the change from prev to target to ±max_step and return the new value.
+
+        Does *not* mutate internal state; use step(target) if you want a stateful update.
+        """
+        if prev is None:
+            return float(target)
+        step = float(self.max_step)
+        dv = float(target) - float(prev)
+        if dv > step:
+            return float(prev) + step
+        if dv < -step:
+            return float(prev) - step
+        return float(target)
+
+    def __call__(self, prev: Optional[float], target: float) -> float:  # pragma: no cover
+        return self.limit(prev, target)
