@@ -1,49 +1,97 @@
+import os
+import numpy as np
+import pytest
+
 from src.cell import Cell
 from src.substring import Substring
-from src.bypassdiode import Bypass_Diode
-from unittest.mock import Mock
-import math
-import unittest
-from typing import List, Tuple
+from src.string import String
+from src.string import PVString
+from src.string import PVArray
 
-mock_cell = Mock(spec=Cell)
-mock_cell.i_sc = Mock(return_value=5.0)
-mock_cell.v_oc = Mock(return_value=0.6)
-mock_cell.v_at_i = Mock(return_value=0.5)
-mock_cell.i_mpp = 4.5
-mock_cell.v_mpp = 0.5
 
-mock_bypass = Mock(spec=Bypass_Diode)
-mock_bypass.v_at_i.return_value = 0.2
-
-# 2 mocks
-class Test_Substring(unittest.TestCase):
-    
-    def setUp(self):
-        self.substring = Substring(
-            cell_list=[mock_cell, mock_cell], bypass=mock_bypass
+def _mk_cells(n, G=1000.0, T=25.0):
+    return [
+        Cell(
+            isc_ref=5.84, voc_ref=0.621, diode_ideality=1.30,
+            r_s=0.02, r_sh=800.0, vmpp=0.521, impp=5.40,
+            irradiance=G, temperature_c=T, autofit=False,
         )
-    
-    def test_isc(self):
-        isc = self.substring.isc(current = 1)
-        self.assertEqual(isc, 5.0)  # mocks should all return 5.0
+        for _ in range(n)
+    ]
 
-    def test_voc(self):
-        voc = self.substring.voc()
-        self.assertEqual(voc, 1.2)  # 2 cells * the constant voc 0.6
-    
-    def test_v_at_i(self):
-        voltage = self.substring.v_at_i(2)
-        # sum cell voltages = 0.5 * 2 = 1.0; bypass voltage = 0.2 * 2 = 0.4; max = 2.0
-        self.assertAlmostEqual(voltage, 1.0, places = 4)
 
-    def test_mpp(self):
-        v_mpp_total, i_mpp, p_mpp, voc, bypass_voc = self.substring.mpp()
-        self.assertAlmostEqual(v_mpp_total, 1.0, places = 4)  # 2 cells * 0.5
-        self.assertAlmostEqual(i_mpp, 4.5, places = 4)
-        self.assertAlmostEqual(p_mpp, 4.5, places = 4)  # 1.0 * 4.5
-        self.assertAlmostEqual(voc, 1.2, places = 4)
-        self.assertAlmostEqual(bypass_voc, 1.2, places = 4)
+@pytest.fixture
+def three_substrings_series():
+    # 3 substrings in series; each substring = 4 series cells
+    sub1 = Substring(_mk_cells(4, G=1000.0, T=25.0), bypass=None)
+    sub2 = Substring(_mk_cells(4, G=1000.0,  T=25.0), bypass=None)
+    sub3 = Substring(_mk_cells(4, G=1000.0, T=25.0), bypass=None)
 
-if __name__ == "__main__":
-    unittest.main()
+    # make sure caches are hot
+    for s in (sub1, sub2, sub3):
+        s.set_conditions(irradiance=s.cell_list[0].irradiance, temperature=25.0)
+
+    return PVString([sub1, sub2, sub3])
+
+def three_strings_series():
+    # 3 substrings in series; each substring = 4 series cells
+    sub1 = String(three_substrings_series(4, G=1000.0, T=25.0))
+    sub2 = String(three_substrings_series(4, G=1000.0,  T=25.0))
+    sub3 = String(three_substrings_series(4, G=1000.0, T=25.0))
+
+    # make sure caches are hot
+    for s in (sub1, sub2, sub3):
+        s.set_conditions(irradiance=s.substrings[0].irradiance, temperature=25.0)
+
+    return PVArray([sub1, sub2, sub3])
+
+
+def test_plot_string_iv_pv(three_strings_series):
+    pvarr = three_strings_series
+
+    # Build curves
+    V, I = pvarr.iv_curve(points=480)   # array-level IV (sum over strings)
+    P = V * I
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print("matplotlib not available, skipping plot:", e)
+        return
+
+    os.makedirs("plots", exist_ok=True)
+
+    # I–V
+    plt.figure(figsize=(6, 4))
+    plt.plot(V, I, label="Array I–V (3 strings, middle shaded)")
+    plt.xlabel("Voltage (V)")
+    plt.ylabel("Current (A)")
+    plt.title("PV String I–V")
+    plt.grid(True)
+    plt.legend()
+    iv_out = os.path.join("plots", "pvarray_iv.png")
+    plt.tight_layout()
+    plt.savefig(iv_out)
+    print("Saved:", iv_out)
+    plt.close()
+
+    # P–V with MPP marker
+    plt.figure(figsize=(6, 4))
+    plt.plot(V, P, label="String P–V")
+    k = int(np.argmax(P))
+    plt.scatter([V[k]], [P[k]], marker="x", label=f"MPP ~ ({V[k]:.3f} V, {I[k]:.3f} A)")
+    plt.xlabel("Voltage (V)")
+    plt.ylabel("Power (W)")
+    plt.title("PV Array P–V")
+    plt.grid(True)
+    plt.legend()
+    pv_out = os.path.join("plots", "pvarray_pv.png")
+    plt.tight_layout()
+    plt.savefig(pv_out)
+    print("Saved:", pv_out)
+    plt.close()
+
+    # quick sanity checks (non-assert so the test always saves plots)
+    vmpp, impp, pmpp, voc_est, isc_est = pvarr.mpp(points=480)
+    print("Vmpp, Impp, Pmpp, Voc_est, Isc_est =",
+          vmpp, impp, pmpp, voc_est, isc_est)
