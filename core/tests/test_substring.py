@@ -1,9 +1,11 @@
-from src.cell import Cell
-from src.substring import Substring
-from src.bypassdiode import Bypass_Diode
+from core.src.cell import Cell
+from core.src.substring import Substring
+from core.src.bypassdiode import Bypass_Diode
 from unittest.mock import Mock
 import math
 import unittest
+import matplotlib.pyplot as plt
+import numpy as np
 from typing import List, Tuple
 
 mock_cell = Mock(spec=Cell)
@@ -44,6 +46,55 @@ class Test_Substring(unittest.TestCase):
         self.assertAlmostEqual(p_mpp, 4.5, places = 4)  # 1.0 * 4.5
         self.assertAlmostEqual(voc, 1.2, places = 4)
         self.assertAlmostEqual(bypass_voc, 1.2, places = 4)
+
+    def debug_plot_substring(self, name="debug_substring"):
+        import os
+
+        os.makedirs("plots", exist_ok=True)
+
+        try:
+            i_vals, v_vals = self.substring.iv_curve(points=100)
+
+            if np.any(np.isnan(v_vals)) or np.any(np.isnan(i_vals)):
+                print("NaNs found in IV data — check v_at_i or i_sc methods.")
+                return
+
+            if np.all(v_vals == 0):
+                print("All voltages are zero. Likely an issue with v_at_i() or bypass logic.")
+            
+            if np.all(i_vals == 0):
+                print("All currents are zero. Check i_sc() or cell initialization.")
+
+            p_vals = v_vals * i_vals
+
+            try:
+                v_mpp, i_mpp, p_mpp, _, _ = self.substring.mpp()
+                print(f"Vmpp: {v_mpp:.2f} V, Impp: {i_mpp:.2f} A, Pmpp: {p_mpp:.2f} W")
+            except Exception as e:
+                print("Error computing MPP:", e)
+                v_mpp = None
+
+            plt.figure(figsize=(8, 5))
+            plt.plot(v_vals, i_vals, label="I-V curve")
+            plt.plot(v_vals, p_vals, label="P-V curve", linestyle="--")
+
+            if v_mpp:
+                plt.axvline(v_mpp, color="r", linestyle=":", label=f"Vmpp ≈ {v_mpp:.2f} V")
+
+            plt.xlabel("Voltage (V)")
+            plt.ylabel("Current (A) / Power (W)")
+            plt.title(f"I-V and P-V Curve: {name}")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+            out = os.path.join("plots", f"{name}_iv_debug.png")
+            plt.savefig(out)
+            print(f"Saved debug plot to {out}")
+            plt.close()
+
+        except Exception as e:
+            print(f"Failed to plot substring '{name}':", e)
 
 if __name__ == "__main__":
     unittest.main()

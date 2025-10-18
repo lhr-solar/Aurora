@@ -1,9 +1,9 @@
-from string import String
+from .string import PVString
 from typing import List, Tuple
 import numpy as np
 
 class Array:
-    def __init__(self, string_list: List[String]):
+    def __init__(self, string_list: List[PVString]):
         self.string_list = string_list
         self.cached_iv = None
 
@@ -19,7 +19,7 @@ class Array:
         return sum(string.v_oc() for string in self.string_list)
 
     def voc(self) -> float:
-        return max(string.v_oc() for string in self.cell_list) 
+        return max(string.voc() for string in self.string_list) 
 
     def iv_curve(self, points: int) -> Tuple[np.ndarray, np.ndarray]: # fixed coordinates
         voc = self.voc()
@@ -29,9 +29,9 @@ class Array:
 
     def mpp(self) -> Tuple[float, float, float, float, float]:
         i_mpp_total = 0.0
-        v_mpp = max(string.v_mpp for string in self.string_list)
+        v_mpp = max(string.mpp()[0] for string in self.string_list)
         for string in self.string_list:
-            i_mpp_total += string.i_mpp
+            i_mpp_total += string.mpp()[1]
         p_mpp = v_mpp * i_mpp_total
         return v_mpp, i_mpp_total, p_mpp
 

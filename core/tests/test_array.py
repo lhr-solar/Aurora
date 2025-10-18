@@ -2,11 +2,10 @@ import os
 import numpy as np
 import pytest
 
-from src.cell import Cell
-from src.substring import Substring
-from src.string import String
-from src.string import PVString
-from src.string import PVArray
+from core.src.cell import Cell
+from core.src.substring import Substring
+from core.src.string import PVString
+from core.src.array import Array
 
 
 def _mk_cells(n, G=1000.0, T=25.0):
@@ -20,33 +19,31 @@ def _mk_cells(n, G=1000.0, T=25.0):
     ]
 
 
-@pytest.fixture
 def three_substrings_series():
     # 3 substrings in series; each substring = 4 series cells
     sub1 = Substring(_mk_cells(4, G=1000.0, T=25.0), bypass=None)
     sub2 = Substring(_mk_cells(4, G=1000.0,  T=25.0), bypass=None)
     sub3 = Substring(_mk_cells(4, G=1000.0, T=25.0), bypass=None)
 
-    # make sure caches are hot
     for s in (sub1, sub2, sub3):
         s.set_conditions(irradiance=s.cell_list[0].irradiance, temperature=25.0)
 
     return PVString([sub1, sub2, sub3])
 
+@pytest.fixture
 def three_strings_series():
     # 3 substrings in series; each substring = 4 series cells
-    sub1 = String(three_substrings_series(4, G=1000.0, T=25.0))
-    sub2 = String(three_substrings_series(4, G=1000.0,  T=25.0))
-    sub3 = String(three_substrings_series(4, G=1000.0, T=25.0))
+    sub1 = three_substrings_series()
+    sub2 = three_substrings_series()
+    sub3 = three_substrings_series()
 
-    # make sure caches are hot
     for s in (sub1, sub2, sub3):
-        s.set_conditions(irradiance=s.substrings[0].irradiance, temperature=25.0)
+        s.set_conditions(irradiance=s.substrings[0].cell_list[0].irradiance, temperature_c=25.0)
 
-    return PVArray([sub1, sub2, sub3])
+    return Array([sub1, sub2, sub3])
 
 
-def test_plot_string_iv_pv(three_strings_series):
+def test_plot_array_iv_pv(three_strings_series):
     pvarr = three_strings_series
 
     # Build curves
@@ -92,6 +89,6 @@ def test_plot_string_iv_pv(three_strings_series):
     plt.close()
 
     # quick sanity checks (non-assert so the test always saves plots)
-    vmpp, impp, pmpp, voc_est, isc_est = pvarr.mpp(points=480)
+    vmpp, impp, pmpp = pvarr.mpp()
     print("Vmpp, Impp, Pmpp, Voc_est, Isc_est =",
-          vmpp, impp, pmpp, voc_est, isc_est)
+          vmpp, impp, pmpp)
