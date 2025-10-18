@@ -4,7 +4,7 @@ These provide simple IV models and helpers so tests can be concise and
 deterministic without importing the full controller stack.
 
 Run tests from the repo root:
-    python -m pytest -q
+    python -m pytest -q tests/mppt_algorithms/conftest.py
 """
 
 from __future__ import annotations

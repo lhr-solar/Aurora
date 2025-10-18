@@ -3,7 +3,7 @@
 """Unit tests for PSO (sequential global search) MPPT algorithm.
 
 Run from repo root:
-    python -m pytest -q
+    python -m pytest -q tests/mppt_algorithms/test_pso.py
 
 Relies on fixtures provided by tests/mppt_algorithms/conftest.py
 """

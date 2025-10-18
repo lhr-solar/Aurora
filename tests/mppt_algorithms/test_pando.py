@@ -1,7 +1,7 @@
 """Unit tests for PANDO (classic P&O, fixed step) MPPT algorithm.
 
 Run from repo root:
-    python -m pytest -q
+    python -m pytest -q tests/mppt_algorithms/test_pando.py
 
 Relies on fixtures provided by tests/mppt_algorithms/conftest.py
 """

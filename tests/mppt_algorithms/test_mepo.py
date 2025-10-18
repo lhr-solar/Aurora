@@ -1,7 +1,7 @@
 """Unit tests for MEPO (adaptive P&O) MPPT algorithm.
 
 Run from repo root:
-    python -m pytest -q
+    python -m pytest -q tests/mppt_algorithms/test_mepo.py
 
 Relies on fixtures provided by tests/mppt_algorithms/conftest.py
 """
