@@ -1,0 +1,46 @@
+{
+  "title": "Demo Layout - Uniform",
+  "points": 480,
+  "live": false,
+  "live_interval_ms": 500,
+  "layout": {
+    "strings": [
+      {
+        "substrings": [
+          { "cells": [
+              { "isc_ref": 5.84, "voc_ref": 0.621, "irradiance": 1000.0, "temperature_c": 25.0 },
+              { "isc_ref": 5.84, "voc_ref": 0.621, "irradiance": 1000.0, "temperature_c": 25.0 },
+              { "isc_ref": 5.84, "voc_ref": 0.621, "irradiance": 1000.0, "temperature_c": 25.0 },
+              { "isc_ref": 5.84, "voc_ref": 0.621, "irradiance": 1000.0, "temperature_c": 25.0 }
+            ] },
+          { "cells": [
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 }
+            ] },
+          { "cells": [
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 },
+              { "isc_ref": 5.84, "voc_ref": 0.621 }
+            ] }
+        ]
+      },
+      {
+        "substrings": [
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] }
+        ]
+      },
+      {
+        "substrings": [
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] }
+        ]
+      }
+    ]
+  }
+}
