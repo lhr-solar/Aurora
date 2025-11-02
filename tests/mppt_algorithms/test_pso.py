@@ -1,5 +1,3 @@
-
-
 """Unit tests for PSO (sequential global search) MPPT algorithm.
 
 Run from repo root:
