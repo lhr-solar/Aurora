@@ -1,0 +1,31 @@
+{
+  "title": "Demo Layout - Middle Shaded",
+  "points": 480,
+  "live": false,
+  "live_interval_ms": 500,
+  "layout": {
+    "strings": [
+      {
+        "substrings": [
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] }
+        ]
+      },
+      {
+        "substrings": [
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 1.17, "irradiance": 200.0 }, { "isc_ref": 1.17, "irradiance": 200.0 }, { "isc_ref": 1.17, "irradiance": 200.0 }, { "isc_ref": 1.17, "irradiance": 200.0 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] }
+        ]
+      },
+      {
+        "substrings": [
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] },
+          { "cells": [ { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 }, { "isc_ref": 5.84 } ] }
+        ]
+      }
+    ]
+  }
+}
