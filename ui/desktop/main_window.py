@@ -73,7 +73,7 @@ class AuroraMainWindow(QMainWindow):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(10)
 
-        # --- Config file section -------------------------------------------------
+        # Config file section
         cfg_group = QGroupBox("Array / Simulation Configuration", self)
         cfg_layout = QVBoxLayout(cfg_group)
 
@@ -89,7 +89,7 @@ class AuroraMainWindow(QMainWindow):
 
         cfg_layout.addLayout(path_row)
 
-        # --- Plotting options ----------------------------------------------------
+        # Plotting options
         opts_row = QHBoxLayout()
 
         # Points
@@ -117,7 +117,7 @@ class AuroraMainWindow(QMainWindow):
 
         root_layout.addWidget(cfg_group)
 
-        # --- Actions / launchers -------------------------------------------------
+        # Actions / launchers
         actions_row = QHBoxLayout()
 
         self.launch_plotter_btn = QPushButton("Open IV / PV Plotter", self)
@@ -137,7 +137,7 @@ class AuroraMainWindow(QMainWindow):
 
         root_layout.addLayout(actions_row)
 
-        # --- Simulators panel ---------------------------------------------------
+        # Simulators panel
         sim_group = QGroupBox("MPPT / Source Simulators", self)
         sim_layout = QVBoxLayout(sim_group)
         sim_label = QLabel(
@@ -170,10 +170,7 @@ class AuroraMainWindow(QMainWindow):
         # Status bar
         self.statusBar().showMessage("Ready")
 
-    # -------------------------------------------------------------------------
     # UI Handlers
-    # -------------------------------------------------------------------------
-
     def _on_browse_config(self) -> None:
         """Open a file dialog to pick a JSON/YAML configuration."""
         dlg = QFileDialog(self, "Select layout/config file")
@@ -268,10 +265,7 @@ class AuroraMainWindow(QMainWindow):
                 f"Failed to reload config into plotter:\n{e}",
             )
 
-    # -------------------------------------------------------------------------
     # Helpers
-    # -------------------------------------------------------------------------
-
     def _apply_settings_to_plotter(self) -> None:
         """
         Push the current frontend settings (points, live, interval) into
@@ -305,11 +299,8 @@ class AuroraMainWindow(QMainWindow):
                 self._plotter._on_toggle_live(False)
         except Exception:
             pass
-
-    # -------------------------------------------------------------------------
+        
     # Simulation control
-    # -------------------------------------------------------------------------
-
     def _on_run_simulation(self) -> None:
         """
         Start a time-stepped simulation using SimulationEngine and drive
