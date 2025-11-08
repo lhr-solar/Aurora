@@ -324,6 +324,67 @@ class MPPTDashboardWindow(QMainWindow):
     # Public helpers for future integration
     # ------------------------------------------------------------------
 
+    def update_from_record(self, rec: Dict[str, Any]) -> None:
+        """Update the dashboard from a SimulationEngine record.
+
+        This is a convenience helper for live simulation.
+        A typical record is a dict with keys like::
+
+            {"t", "v", "i", "p", "g", "t_mod", "action", ...}
+
+        where ``action`` is itself a dict that may contain a ``state`` or
+        ``mode`` field. This method formats a human-readable line and
+        forwards it to :meth:`append_telemetry_line`.
+        """
+        # Extract core scalars, falling back safely when fields are missing.
+        try:
+            t = float(rec.get("t", 0.0))
+            v = float(rec.get("v", 0.0))
+            i = float(rec.get("i", 0.0))
+        except Exception:
+            # If we can't parse the basic numeric fields, just dump the dict.
+            self.append_telemetry_line(str(rec))
+            return
+
+        # Derive power if not explicitly given.
+        p_val = rec.get("p")
+        try:
+            p = float(p_val) if p_val is not None else v * i
+        except Exception:
+            p = v * i
+
+        g = rec.get("g")
+        t_mod = rec.get("t_mod")
+        action = rec.get("action") or {}
+        state = None
+        if isinstance(action, dict):
+            state = action.get("state") or action.get("mode")
+
+        parts = [
+            f"t={t:.4f}s",
+            f"V={v:.3f} V",
+            f"I={i:.3f} A",
+            f"P={p:.3f} W",
+        ]
+
+        if g is not None:
+            try:
+                parts.append(f"G={float(g):.1f} W/m²")
+            except Exception:
+                parts.append(f"G={g}")
+
+        if t_mod is not None:
+            try:
+                parts.append(f"T={float(t_mod):.1f} °C")
+            except Exception:
+                parts.append(f"T={t_mod}")
+
+        if state is not None:
+            parts.append(f"state={state}")
+
+        line = " | ".join(parts)
+        self.append_telemetry_line(line)
+
     def append_telemetry_line(self, text: str) -> None:
         """Append a line of text to the telemetry panel.
 

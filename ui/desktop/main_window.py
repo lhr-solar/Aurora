@@ -20,7 +20,7 @@ try:
         QFileDialog,
         QGroupBox,
     )
-    from PyQt6.QtCore import Qt
+    from PyQt6.QtCore import Qt, QTimer
 except Exception as e:
     raise RuntimeError(
         "PyQt6 must be installed to use the Aurora desktop front end. "
@@ -35,6 +35,15 @@ except ImportError:
     # (e.g. `python ui/desktop/main_window.py`)
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from ui.desktop.array_plotter import ArrayPlotterWindow  # type: ignore
+
+# Simulation engine (core + simulators)
+try:
+    from simulators.engine import SimulationConfig, SimulationEngine
+except Exception as e:
+    raise RuntimeError(
+        "Failed to import simulators.engine. Make sure you are running from the "
+        "Aurora repository root or that the package is installed."
+    ) from e
 
 
 class AuroraMainWindow(QMainWindow):
@@ -54,6 +63,9 @@ class AuroraMainWindow(QMainWindow):
 
         self._plotter: Optional[ArrayPlotterWindow] = None
         self._config_path: Optional[Path] = None
+        self._sim_engine: Optional[SimulationEngine] = None
+        self._sim_timer: QTimer = QTimer(self)
+        self._sim_timer.timeout.connect(self._on_sim_tick)
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -125,21 +137,34 @@ class AuroraMainWindow(QMainWindow):
 
         root_layout.addLayout(actions_row)
 
-        # --- Placeholder: simulators panel --------------------------------------
-        sim_group = QGroupBox("MPPT / Source Simulators (coming soon)", self)
+        # --- Simulators panel ---------------------------------------------------
+        sim_group = QGroupBox("MPPT / Source Simulators", self)
         sim_layout = QVBoxLayout(sim_group)
         sim_label = QLabel(
-            "This panel is reserved for tying in `simulators/mppt_sim.py`, "
-            "`engine.py`, and `source_sim.py`.\n\n"
-            "- You can expose controls here (irradiance, temperature, profiles, etc.).\n"
-            "- The simulators should update the underlying Array instance used by "
-            "ArrayPlotterWindow.\n"
-            "- With Live mode enabled, the plotter will continuously re-fetch "
-            "IV curves and show the evolving state.",
+            "Controls for tying in `simulators/engine.py`.\n\n"
+            "- Use 'Run Simulation' to start a time-stepped MPPT simulation.\n"
+            "- The simulation updates the underlying Array used by the plotter.\n"
+            "- With Live mode enabled in the plotter, IV/PV curves will refresh as "
+            "conditions change.\n"
+            "- You can stop the simulation from here or by pressing Esc/Space.",
             self,
         )
         sim_label.setWordWrap(True)
         sim_layout.addWidget(sim_label)
+
+        sim_btn_row = QHBoxLayout()
+        self.run_sim_btn = QPushButton("Run Simulation", self)
+        self.run_sim_btn.clicked.connect(self._on_run_simulation)
+        sim_btn_row.addWidget(self.run_sim_btn)
+
+        self.stop_sim_btn = QPushButton("Stop Simulation", self)
+        self.stop_sim_btn.clicked.connect(self._on_stop_simulation)
+        self.stop_sim_btn.setEnabled(False)
+        sim_btn_row.addWidget(self.stop_sim_btn)
+
+        sim_btn_row.addStretch(1)
+        sim_layout.addLayout(sim_btn_row)
+
         root_layout.addWidget(sim_group)
 
         # Status bar
@@ -280,6 +305,118 @@ class AuroraMainWindow(QMainWindow):
                 self._plotter._on_toggle_live(False)
         except Exception:
             pass
+
+    # -------------------------------------------------------------------------
+    # Simulation control
+    # -------------------------------------------------------------------------
+
+    def _on_run_simulation(self) -> None:
+        """
+        Start a time-stepped simulation using SimulationEngine and drive
+        the front-end from a QTimer.
+        """
+        # Ensure the plotter exists and has an Array to work with
+        if self._plotter is None:
+            self._on_open_plotter()
+            if self._plotter is None:
+                return
+
+        # (Re)create a fresh simulation engine
+        try:
+            # Simple defaults; you can later expose these via the UI
+            cfg = SimulationConfig(total_time=1.0, dt=1e-3)
+            self._sim_engine = SimulationEngine(cfg)
+            self._sim_engine.start()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Simulation error",
+                f"Failed to start simulation:\n{e}",
+            )
+            self._sim_engine = None
+            return
+
+        # Start GUI timer to step the simulation
+        if not self._sim_timer.isActive():
+            # 10 ms UI tick; actual simulation dt is controlled by SimulationConfig
+            self._sim_timer.start(10)
+
+        self.run_sim_btn.setEnabled(False)
+        self.stop_sim_btn.setEnabled(True)
+        self.statusBar().showMessage(
+            "Simulation running… (press Stop or Esc/Space to halt)."
+        )
+
+    def _on_stop_simulation(self) -> None:
+        """Stop the simulation and reset controls."""
+        if self._sim_timer.isActive():
+            self._sim_timer.stop()
+
+        self._sim_engine = None
+        self.run_sim_btn.setEnabled(True)
+        self.stop_sim_btn.setEnabled(False)
+        self.statusBar().showMessage("Simulation stopped.")
+
+    def _on_sim_tick(self) -> None:
+        """Advance the simulation by one step and update the front-end."""
+        if self._sim_engine is None:
+            if self._sim_timer.isActive():
+                self._sim_timer.stop()
+            self.run_sim_btn.setEnabled(True)
+            self.stop_sim_btn.setEnabled(False)
+            return
+
+        try:
+            rec = self._sim_engine.step()
+        except Exception as e:
+            # Any unexpected error stops the simulation
+            if self._sim_timer.isActive():
+                self._sim_timer.stop()
+            self._sim_engine = None
+            self.run_sim_btn.setEnabled(True)
+            self.stop_sim_btn.setEnabled(False)
+            QMessageBox.critical(
+                self,
+                "Simulation error",
+                f"Simulation step failed:\n{e}",
+            )
+            return
+
+        # None indicates the generator is exhausted (simulation finished)
+        if rec is None:
+            if self._sim_timer.isActive():
+                self._sim_timer.stop()
+            self._sim_engine = None
+            self.run_sim_btn.setEnabled(True)
+            self.stop_sim_btn.setEnabled(False)
+            self.statusBar().showMessage("Simulation finished.")
+            return
+
+        # Update the IV/PV plot with the current operating point
+        try:
+            if self._plotter is not None:
+                v = rec.get("v")
+                i = rec.get("i")
+                if v is not None and i is not None:
+                    self._plotter.set_operating_point(v, i)
+        except Exception:
+            # Ignore UI update errors so they don't break the simulation loop
+            pass
+
+    # -------------------------------------------------------------------------
+    # Key handling: allow Esc/Space to stop the simulation
+    # -------------------------------------------------------------------------
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            key = event.key()
+        except Exception:
+            return super().keyPressEvent(event)
+
+        if key in (Qt.Key.Key_Escape, Qt.Key.Key_Space):
+            self._on_stop_simulation()
+        else:
+            super().keyPressEvent(event)
 
 
 def main() -> int:

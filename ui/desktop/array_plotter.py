@@ -429,6 +429,34 @@ class ArrayPlotterWindow(QMainWindow):
         except Exception as e:
             self.status.setText(f"Error plotting: {e}")
 
+    def set_operating_point(self, v: float, i: float) -> None:
+        """Update the IV marker to reflect the current operating point.
+
+        This is intended to be called from a simulation loop (e.g. from
+        SimulationEngine.on_sample) so that the front-end can show where
+        the controller is operating on the IV curve in real time.
+        """
+        # If we haven't plotted yet, the marker might not exist; it's created
+        # the first time _plot() runs, so we just no-op here instead of
+        # forcing a plot on every call.
+        if self._iv_marker is None:
+            return
+
+        try:
+            v_f = float(v)
+            i_f = float(i)
+        except Exception:
+            return
+
+        try:
+            # Update marker position
+            self._iv_marker.setData([v_f], [i_f])
+            # Also update status with a small SIM readout
+            self.status.setText(f"[SIM] V={v_f:.4f} V, I={i_f:.4f} A, P={v_f * i_f:.4f} W")
+        except Exception:
+            # Swallow any drawing errors to avoid breaking the simulation loop
+            pass
+
     def _on_refresh(self):
         self._plot()
 

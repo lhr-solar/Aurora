@@ -392,6 +392,57 @@ class SourceDashboardWindow(QMainWindow):
     # Public helper for simulators
     # ------------------------------------------------------------------
 
+    def update_from_record(self, rec: Dict[str, Any]) -> None:
+        """Update the telemetry panel from a SimulationEngine record.
+
+        This helper is intended for live simulations where `rec` is a dict
+        with keys such as::
+
+            {"t", "g", "t_mod", ...}
+
+        It focuses on environment / configuration context (irradiance,
+        temperature, etc.) rather than controller internals.
+        """
+        parts = []
+
+        # Time
+        t = rec.get("t")
+        if t is not None:
+            try:
+                parts.append(f"t={float(t):.4f}s")
+            except Exception:
+                parts.append(f"t={t}")
+
+        # Irradiance / temperature
+        g = rec.get("g")
+        if g is not None:
+            try:
+                parts.append(f"G={float(g):.1f} W/m²")
+            except Exception:
+                parts.append(f"G={g}")
+
+        t_mod = rec.get("t_mod")
+        if t_mod is not None:
+            try:
+                parts.append(f"T={float(t_mod):.1f} °C")
+            except Exception:
+                parts.append(f"T={t_mod}")
+
+        # Optional extra fields (e.g. shading pattern, config name)
+        cfg_name = None
+        if self._config_path is not None:
+            cfg_name = self._config_path.name
+        if cfg_name:
+            parts.append(f"config={cfg_name}")
+
+        # Fallback: if we gathered nothing, just dump the dict.
+        if not parts:
+            self.append_telemetry_line(str(rec))
+            return
+
+        line = " | ".join(parts)
+        self.append_telemetry_line(line)
+
     def append_telemetry_line(self, text: str) -> None:
         """Append a line of text to the telemetry panel.
 

@@ -158,8 +158,18 @@ class SimulationEngine:
     Usage:
         cfg = SimulationConfig(total_time=0.5, dt=1e-3)
         eng = SimulationEngine(cfg)
+
+        # Simple blocking loop (CLI / scripts):
         for sample in eng.run():
             print(sample)
+
+        # Or step-wise (GUI-friendly):
+        eng.start()
+        while True:
+            rec = eng.step()
+            if rec is None:
+                break
+            print(rec)
     """
 
     def __init__(self, cfg: SimulationConfig):
@@ -168,9 +178,34 @@ class SimulationEngine:
         self.plant = PVPlant(self.array)
         self.ctrl = cfg.build_controller()
         self.on_sample = cfg.on_sample
+        self._iter = None  # type: Optional[Generator[Dict[str, Any], None, None]]
 
         # environment
         self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
+
+    def start(self) -> None:
+        """Initialize internal state for step-wise simulation.
+
+        This prepares an internal generator from :meth:`run` so that
+        :meth:`step` can be called repeatedly from a GUI timer or other
+        event loop without blocking.
+        """
+        self._iter = self.run()
+
+    def step(self) -> Optional[Dict[str, Any]]:
+        """Advance the simulation by one time step.
+
+        Returns the record dict for this step, or ``None`` when the
+        simulation has finished (i.e. the underlying generator is
+        exhausted).
+        """
+        if self._iter is None:
+            self.start()
+
+        try:
+            return next(self._iter)
+        except StopIteration:
+            return None
 
     def run(self) -> Generator[Dict[str, Any], None, None]:
         """
