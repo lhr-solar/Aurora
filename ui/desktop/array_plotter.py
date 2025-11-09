@@ -4,7 +4,20 @@ import numpy as np
 try:
     # Prefer PyQt6
     from PyQt6 import QtWidgets
-    from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QPushButton, QSpinBox, QLabel, QFileDialog
+    from PyQt6.QtWidgets import (
+        QMainWindow,
+        QWidget,
+        QVBoxLayout,
+        QHBoxLayout,
+        QPushButton,
+        QSpinBox,
+        QLabel,
+        QFileDialog,
+        QGroupBox,
+        QSlider,
+        QTextEdit,
+        QCheckBox,
+    )
     from PyQt6.QtCore import Qt, QTimer
     PYQT_AVAILABLE = True
 except Exception:
@@ -55,18 +68,31 @@ class ArrayPlotterWindow(QMainWindow):
       win.show()
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, env_state=None, env_func=None):
         """Create the window. This plotter uses pyqtgraph for rendering.
+
+        ``env_state`` is an optional shared environment object (e.g.
+        simulators.engine.EnvironmentState) that the UI can mutate via
+        sliders / checkboxes, while ``env_func`` is an optional callable
+        with signature ``env_func(array, t)`` that applies that state to
+        the attached Array. Both are optional for backward compatibility.
         """
         if not PYQT_AVAILABLE or not PG_AVAILABLE:
             raise RuntimeError("PyQt6 and pyqtgraph must be installed to use the GUI")
         super().__init__(parent)
         self.setWindowTitle("Array IV / PV Plotter")
         self.array = None
+        # Shared environment hooks (may be None)
+        self._env_state = env_state
+        self._env_func = env_func
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        root = QVBoxLayout(central)
+
+        # Top row: left telemetry, center plot, right MPPT log
+        top_row = QHBoxLayout()
+        root.addLayout(top_row, 1)
 
         # Plot area: default to pyqtgraph. Force pyqtgraph backend to keep
         # native desktop interactivity and avoid webengine-related issues.
@@ -77,7 +103,6 @@ class ArrayPlotterWindow(QMainWindow):
         if not self._plotly_mode:
             # PyQtGraph layout with a single plot and a right-side axis for Power
             self.plot_layout = GraphicsLayoutWidget()
-            layout.addWidget(self.plot_layout)
 
             # Main plot shows I-V on left y-axis
             self.plot = self.plot_layout.addPlot(row=0, col=0, title="I-V / P-V")
@@ -119,6 +144,30 @@ class ArrayPlotterWindow(QMainWindow):
             except Exception:
                 pass
 
+            # Build side panels: telemetry (left) and MPPT log (right)
+            self.telemetry_group = QGroupBox("Operating Point", self)
+            telemetry_layout = QVBoxLayout(self.telemetry_group)
+            self.v_label = QLabel("V: -- V", self)
+            self.i_label = QLabel("I: -- A", self)
+            self.p_label = QLabel("P: -- W", self)
+            self.g_label = QLabel("G: -- W/m²", self)
+            self.t_label = QLabel("T: -- °C", self)
+            for w in (self.v_label, self.i_label, self.p_label, self.g_label, self.t_label):
+                telemetry_layout.addWidget(w)
+            telemetry_layout.addStretch(1)
+
+            self.mppt_group = QGroupBox("MPPT Status", self)
+            mppt_layout = QVBoxLayout(self.mppt_group)
+            self.mppt_log = QTextEdit(self)
+            self.mppt_log.setReadOnly(True)
+            self.mppt_log.setPlaceholderText("MPPT state transitions will appear here...")
+            mppt_layout.addWidget(self.mppt_log)
+
+            # Assemble top row: telemetry | plot | MPPT log
+            top_row.addWidget(self.telemetry_group)
+            top_row.addWidget(self.plot_layout, 1)
+            top_row.addWidget(self.mppt_group)
+
         # Last-seen arrays for hover lookup (always present)
         self._last_V = None
         self._last_I = None
@@ -136,9 +185,9 @@ class ArrayPlotterWindow(QMainWindow):
         if not hasattr(self, '_iv_marker'):
             self._iv_marker = None
 
-        # Controls
-        ctrl_layout = QtWidgets.QHBoxLayout()
-        layout.addLayout(ctrl_layout)
+        # Controls row: existing buttons
+        ctrl_layout = QHBoxLayout()
+        root.addLayout(ctrl_layout)
 
         ctrl_layout.addWidget(QLabel("Points:"))
         self.points_spin = QSpinBox()
@@ -163,8 +212,44 @@ class ArrayPlotterWindow(QMainWindow):
         self.load_cfg_btn.clicked.connect(self._on_load_config)
         ctrl_layout.addWidget(self.load_cfg_btn)
 
+        # Environment & shading controls
+        self.env_group = QGroupBox("Environment & Shading", self)
+        env_layout = QHBoxLayout(self.env_group)
+
+        self.partial_check = QCheckBox("Enable partial shading", self)
+        env_layout.addWidget(self.partial_check)
+
+        # Global irradiance slider + value readout
+        env_layout.addWidget(QLabel("G (W/m²):", self))
+        self.g_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.g_slider.setRange(0, 1500)
+        self.g_slider.setValue(1000)
+        self.g_slider.setTracking(True)
+        env_layout.addWidget(self.g_slider)
+        self.g_value_label = QLabel(f"{self.g_slider.value()}", self)
+        env_layout.addWidget(self.g_value_label)
+
+        # Global temperature slider + value readout
+        env_layout.addWidget(QLabel("T (°C):", self))
+        self.t_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.t_slider.setRange(-20, 80)
+        self.t_slider.setValue(25)
+        self.t_slider.setTracking(True)
+        env_layout.addWidget(self.t_slider)
+        self.t_value_label = QLabel(f"{self.t_slider.value()}", self)
+        env_layout.addWidget(self.t_value_label)
+
+        env_layout.addStretch(1)
+        root.addWidget(self.env_group)
+
+        # Status label
         self.status = QLabel("")
-        layout.addWidget(self.status)
+        root.addWidget(self.status)
+
+        # Connect env controls
+        self.partial_check.toggled.connect(self._on_partial_toggled)
+        self.g_slider.valueChanged.connect(self._on_env_changed)
+        self.t_slider.valueChanged.connect(self._on_env_changed)
 
         # Timer for live updates
         self._timer = QTimer(self)
@@ -456,6 +541,203 @@ class ArrayPlotterWindow(QMainWindow):
         except Exception:
             # Swallow any drawing errors to avoid breaking the simulation loop
             pass
+
+    def update_telemetry(self, rec: dict) -> None:
+        """Update the left-hand telemetry panel from a simulation record.
+
+        Expected keys in ``rec`` (all optional):
+        - ``v``: operating voltage (V)
+        - ``i``: operating current (A)
+        - ``g``: irradiance (W/m²)
+        - ``t_mod``: module temperature (°C)
+        """
+        if not hasattr(self, "v_label"):
+            return
+        if not isinstance(rec, dict):
+            return
+
+        try:
+            v = rec.get("v")
+            i = rec.get("i")
+            g = rec.get("g")
+            t_mod = rec.get("t_mod")
+
+            v_f = float(v) if v is not None else None
+            i_f = float(i) if i is not None else None
+
+            if v_f is not None:
+                self.v_label.setText(f"V: {v_f:.4f} V")
+            if i_f is not None:
+                self.i_label.setText(f"I: {i_f:.44f} A")
+            if v_f is not None and i_f is not None:
+                self.p_label.setText(f"P: {v_f * i_f:.4f} W")
+
+            if g is not None:
+                g_f = float(g)
+                self.g_label.setText(f"G: {g_f:.1f} W/m²")
+
+            if t_mod is not None:
+                t_f = float(t_mod)
+                self.t_label.setText(f"T: {t_f:.1f} °C")
+        except Exception:
+            # avoid breaking the sim loop on bad records
+            pass
+
+    def append_mppt_log(self, rec: dict) -> None:
+        """Append a single MPPT state line to the right-hand log.
+
+        Expects ``rec`` to contain:
+        - ``t``: time (s)
+        - ``mppt_state`` or ``state``: current controller state name
+        - optional ``mppt_detail``: extra info to display
+        """
+        if not hasattr(self, "mppt_log"):
+            return
+        if not isinstance(rec, dict):
+            return
+
+        t = rec.get("t")
+        state = rec.get("mppt_state") or rec.get("state")
+        detail = rec.get("mppt_detail")
+
+        if t is None or state is None:
+            return
+
+        try:
+            t_f = float(t)
+            line = f"[t = {t_f:.4f} s] state = {state}"
+        except Exception:
+            line = f"[t = {t}] state = {state}"
+
+        if detail:
+            line += f" | {detail}"
+
+        try:
+            self.mppt_log.append(line)
+        except Exception:
+            pass
+
+    def _set_cell_conditions(self, cell: Any, irradiance: float, temperature_c: float) -> None:
+        """Helper to set per-cell irradiance/temperature in a robust way."""
+        try:
+            if hasattr(cell, "set_conditions"):
+                cell.set_conditions(irradiance, temperature_c)
+                return
+            if hasattr(cell, "irradiance"):
+                cell.irradiance = irradiance
+            if hasattr(cell, "temperature_c"):
+                cell.temperature_c = temperature_c
+        except Exception:
+            pass
+
+    def _on_env_changed(self) -> None:
+        """Handle changes to the global irradiance/temperature sliders.
+
+        When a shared EnvironmentState is attached, we update that state and
+        optionally invoke the shared env_func to apply the new conditions to
+        the Array. If no env_state is present, we fall back to directly
+        broadcasting conditions to the cells as before.
+        """
+        g = float(self.g_slider.value())
+        t_c = float(self.t_slider.value())
+
+        # Update slider value readouts, if present
+        try:
+            if hasattr(self, "g_value_label"):
+                self.g_value_label.setText(f"{g:.0f}")
+            if hasattr(self, "t_value_label"):
+                self.t_value_label.setText(f"{t_c:.0f}")
+        except Exception:
+            pass
+
+        # If no array is attached yet, we stop after updating the labels.
+        if self.array is None:
+            return
+
+        # Preferred path: update shared env_state and apply via env_func
+        if self._env_state is not None:
+            try:
+                self._env_state.global_g = g
+                self._env_state.global_t = t_c
+            except Exception:
+                pass
+
+            # If we have an env_func, apply it once at t=0 for static curves.
+            if self._env_func is not None:
+                try:
+                    self._env_func(self.array, 0.0)
+                except Exception:
+                    pass
+
+            self._plot()
+            return
+
+        # Fallback: direct broadcast to the Array (legacy behavior)
+        # Prefer a simple broadcast if the Array exposes set_conditions,
+        # unless partial shading is currently enabled.
+        if hasattr(self.array, "set_conditions") and not self.partial_check.isChecked():
+            try:
+                self.array.set_conditions(g, t_c)
+            except Exception:
+                pass
+        else:
+            strings = getattr(self.array, "strings", [])
+            for string in strings:
+                substrings = getattr(string, "substrings", [])
+                for substring in substrings:
+                    cells = getattr(substring, "cells", [])
+                    for cell in cells:
+                        self._set_cell_conditions(cell, g, t_c)
+
+        self._plot()
+
+    def _on_partial_toggled(self, enabled: bool) -> None:
+        """Enable/disable a simple partial shading pattern.
+
+        When a shared EnvironmentState is present, this simply flips its
+        ``partial_enabled`` flag and optionally invokes env_func to apply the
+        new pattern. Otherwise, it falls back to directly shading cells.
+        """
+        if self.array is None:
+            return
+
+        # Preferred path: shared env_state drives shading
+        if self._env_state is not None:
+            try:
+                self._env_state.partial_enabled = bool(enabled)
+            except Exception:
+                pass
+
+            # Apply via env_func if available, then replot
+            if self._env_func is not None:
+                try:
+                    self._env_func(self.array, 0.0)
+                except Exception:
+                    pass
+
+            self._plot()
+            return
+
+        # Fallback: legacy behavior that directly shades the first substring
+        if not enabled:
+            # Reset to uniform conditions from the sliders
+            self._on_env_changed()
+            return
+
+        g_base = float(self.g_slider.value())
+        t_c = float(self.t_slider.value())
+        g_shaded = g_base * 0.4  # 40% of base as an example
+
+        strings = getattr(self.array, "strings", [])
+        for s_idx, string in enumerate(strings):
+            substrings = getattr(string, "substrings", [])
+            for sub_idx, substring in enumerate(substrings):
+                cells = getattr(substring, "cells", [])
+                for cell in cells:
+                    g_use = g_shaded if (s_idx == 0 and sub_idx == 0) else g_base
+                    self._set_cell_conditions(cell, g_use, t_c)
+
+        self._plot()
 
     def _on_refresh(self):
         self._plot()

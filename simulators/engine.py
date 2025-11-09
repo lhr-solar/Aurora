@@ -106,6 +106,19 @@ class PVPlant:
         i = self.array.i_at_v(v)
         return float(v), float(i)
 
+@dataclass
+class EnvironmentState:
+    """Shared environment knobs for irradiance/temperature/shading.
+
+    This can be owned by the UI so that sliders / checkboxes update
+    these fields, while the simulation engine's env_func reads them
+    each step to mutate the Array.
+    """
+    global_g: float = 1000.0       # base irradiance (W/m^2)
+    global_t: float = 25.0         # base module temperature (°C)
+    partial_enabled: bool = False  # whether partial shading is on
+    shade_factor: float = 0.4      # shaded region gets global_g * shade_factor
+
 # Simulation config / result types
 @dataclass
 class SimulationConfig:
@@ -121,6 +134,8 @@ class SimulationConfig:
     env_profile: Optional[List[Tuple[float, float, float]]] = None
     # Optional: per-sample callback for UIs/loggers
     on_sample: Optional[Callable[[Dict[str, Any]], None]] = None
+    # Optional: fully flexible environment hook: env_func(array, t)
+    env_func: Optional[Callable[[Array, float], None]] = None
 
     def build_array(self) -> Array:
         kwargs = self.array_kwargs or {}
@@ -181,7 +196,11 @@ class SimulationEngine:
         self._iter = None  # type: Optional[Generator[Dict[str, Any], None, None]]
 
         # environment
-        self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
+        # If a fully custom env_func or an env_profile is provided, we let
+        # the run() loop drive conditions over time. Otherwise, broadcast
+        # the simple constant (irradiance, temperature_c) once here.
+        if self.cfg.env_func is None and not self.cfg.env_profile:
+            self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
 
     def start(self) -> None:
         """Initialize internal state for step-wise simulation.
@@ -215,8 +234,15 @@ class SimulationEngine:
         v = self.cfg.start_v
 
         # resolve environment at t=0
-        g0, t0 = self.cfg.env_at(t)
-        self.plant.set_conditions(g0, t0)
+        if self.cfg.env_func is not None:
+            # fully variable env: let the user mutate the array directly
+            self.cfg.env_func(self.array, t)
+            # For logging/telemetry, we still provide a scalar summary
+            # using env_at (typically the baseline profile or constants).
+            g0, t0 = self.cfg.env_at(t)
+        else:
+            g0, t0 = self.cfg.env_at(t)
+            self.plant.set_conditions(g0, t0)
 
         # Prime the controller with an INIT measurement
         i = self.array.i_at_v(v)
@@ -237,9 +263,17 @@ class SimulationEngine:
             else:
                 v_cmd = v
 
+            # environment update
+            if self.cfg.env_func is not None:
+                # fully variable env: user mutates array based on time
+                self.cfg.env_func(self.array, t)
+                # Keep providing a scalar summary for logging/telemetry.
+                g_now, t_now = self.cfg.env_at(t)
+            else:
+                g_now, t_now = self.cfg.env_at(t)
+                self.plant.set_conditions(g_now, t_now)
+
             # measure plant at that voltage
-            g_now, t_now = self.cfg.env_at(t)
-            self.plant.set_conditions(g_now, t_now)
             v, i = self.plant.step(v_cmd)
 
             m = Measurement(
@@ -274,20 +308,66 @@ class SimulationEngine:
         }
         return rec
 
+#
+# Example environment wiring for partial shading driven by EnvironmentState
+def make_partial_shading_env(env_state: EnvironmentState):
+    """Return an env_func(array, t) that uses a shared EnvironmentState.
+
+    The returned callable matches the SimulationConfig.env_func signature
+    and will be invoked by SimulationEngine.run() at each time step.
+
+    Layout assumption (matching ``build_default_array``)::
+
+        Array
+          |- String 0
+          │     |- Substring 0 (module 0)
+          │     |- Substring 1 (module 1)
+          │     |_ Substring 2 (module 2)
+          |_ String 1
+                |- Substring 0
+                |- Substring 1
+                |_ Substring 2
+    """
+    def env_func(array: Array, t: float) -> None:
+        base_g = float(env_state.global_g)
+        t_c = float(env_state.global_t)
+
+        # If partial shading is enabled, shaded regions get reduced irradiance.
+        shade_g = base_g * float(env_state.shade_factor)
+
+        for s_idx, string in enumerate(array.strings):
+            for sub_idx, substring in enumerate(string.substrings):
+                if env_state.partial_enabled and s_idx == 0 and sub_idx == 0:
+                    g_use = shade_g
+                else:
+                    g_use = base_g
+
+                for cell in substring.cells:
+                    # Prefer a Cell.set_conditions API if available
+                    try:
+                        if hasattr(cell, "set_conditions"):
+                            cell.set_conditions(g_use, t_c)
+                            continue
+                    except TypeError:
+                        # Fallback to direct attributes if signature mismatch
+                        pass
+
+                    if hasattr(cell, "irradiance"):
+                        cell.irradiance = g_use
+                    if hasattr(cell, "temperature_c"):
+                        cell.temperature_c = t_c
+
+    return env_func
+
 # CLI demo
 def _demo() -> None:
-    # stepwise irradiance drop at 0.05s and 0.12s to emulate clouds
-    profile = [
-        (0.0, 1000.0, 25.0),
-        (0.05, 650.0, 25.0),
-        (0.12, 400.0, 27.0),
-    ]
+    env_state = EnvironmentState()
     cfg = SimulationConfig(
         total_time=0.2,
         dt=1e-3,
         start_v=18.0,
         array_kwargs={"n_strings": 2, "substrings_per_string": 3, "cells_per_substring": 18},
-        env_profile=profile,
+        env_func=make_partial_shading_env(env_state),
         on_sample=lambda rec: print(rec),
     )
     eng = SimulationEngine(cfg)

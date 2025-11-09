@@ -38,7 +38,12 @@ except ImportError:
 
 # Simulation engine (core + simulators)
 try:
-    from simulators.engine import SimulationConfig, SimulationEngine
+    from simulators.engine import (
+        SimulationConfig,
+        SimulationEngine,
+        EnvironmentState,
+        make_partial_shading_env,
+    )
 except Exception as e:
     raise RuntimeError(
         "Failed to import simulators.engine. Make sure you are running from the "
@@ -66,6 +71,8 @@ class AuroraMainWindow(QMainWindow):
         self._sim_engine: Optional[SimulationEngine] = None
         self._sim_timer: QTimer = QTimer(self)
         self._sim_timer.timeout.connect(self._on_sim_tick)
+        # Shared environment state (used by the simulation engine and, later, the plotter)
+        self._env_state: EnvironmentState = EnvironmentState()
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -200,7 +207,15 @@ class AuroraMainWindow(QMainWindow):
         """
         if self._plotter is None:
             try:
-                self._plotter = ArrayPlotterWindow(self)
+                # Build an env_func bound to the shared EnvironmentState so that
+                # the plotter's sliders/checkboxes and the simulation engine
+                # both drive the same environment model.
+                env_func = make_partial_shading_env(self._env_state)
+                self._plotter = ArrayPlotterWindow(
+                    self,
+                    env_state=self._env_state,
+                    env_func=env_func,
+                )
             except RuntimeError as e:
                 QMessageBox.critical(self, "Plotter error", str(e))
                 return
@@ -302,9 +317,11 @@ class AuroraMainWindow(QMainWindow):
         
     # Simulation control
     def _on_run_simulation(self) -> None:
-        """
-        Start a time-stepped simulation using SimulationEngine and drive
-        the front-end from a QTimer.
+        """Start a time-stepped simulation and drive the front-end from a QTimer.
+
+        This wires the simulation engine to use the same layout as the
+        currently-selected config file (when available) and enables a
+        fully variable environment via EnvironmentState + make_partial_shading_env.
         """
         # Ensure the plotter exists and has an Array to work with
         if self._plotter is None:
@@ -312,10 +329,33 @@ class AuroraMainWindow(QMainWindow):
             if self._plotter is None:
                 return
 
+        # Try to derive array_kwargs from the currently-selected config
+        array_kwargs = None
+        if self._config_path is not None and self._config_path.exists():
+            try:
+                with self._config_path.open("r", encoding="utf-8") as f:
+                    cfg_data = json.load(f)
+                layout = cfg_data.get("layout")
+                if layout is not None:
+                    array_kwargs = {"layout": layout}
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Config parse warning",
+                    f"Failed to parse config for simulation:\n{e}\n"
+                    "Falling back to engine's default demo array.",
+                )
+
         # (Re)create a fresh simulation engine
         try:
-            # Simple defaults; you can later expose these via the UI
-            cfg = SimulationConfig(total_time=1.0, dt=1e-3)
+            env_func = make_partial_shading_env(self._env_state)
+            cfg = SimulationConfig(
+                total_time=1.0,
+                dt=1e-3,
+                array_kwargs=array_kwargs,
+                # Use a fully variable environment driven by EnvironmentState
+                env_func=env_func,
+            )
             self._sim_engine = SimulationEngine(cfg)
             self._sim_engine.start()
         except Exception as e:
@@ -383,13 +423,25 @@ class AuroraMainWindow(QMainWindow):
             self.statusBar().showMessage("Simulation finished.")
             return
 
-        # Update the IV/PV plot with the current operating point
+        # Update the IV/PV plot and side panels with the current operating point
         try:
             if self._plotter is not None:
                 v = rec.get("v")
                 i = rec.get("i")
                 if v is not None and i is not None:
                     self._plotter.set_operating_point(v, i)
+
+                # Update telemetry (V, I, P, G, T) if supported
+                try:
+                    self._plotter.update_telemetry(rec)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                # Append MPPT status log line, if data is present and supported
+                try:
+                    self._plotter.append_mppt_log(rec)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
         except Exception:
             # Ignore UI update errors so they don't break the simulation loop
             pass
