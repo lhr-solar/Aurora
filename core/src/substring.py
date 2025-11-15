@@ -7,7 +7,9 @@ class Substring:
     def __init__(self, cell_list: List[Cell], bypass: Bypass_Diode = None):
         self.cell_list = cell_list
         self.bypass = bypass  # Only one bypass diode per substring?
-        self.cached_iv = None
+        # cache per-cell IV info to avoid repeated expensive solves
+        # maps a resolution key (int points) -> { 'i_values': np.ndarray, 'per_cell_v': [np.ndarray,...] }
+        self.cached_iv = {}
 
         self.voltage = None
         self.short_circuit_current = None
@@ -19,7 +21,8 @@ class Substring:
             cell.set_conditions(irradiance, temperature)
         if self.bypass:
             self.bypass.set_temperature(temperature)
-        self.cached_iv = None
+        # clear cached IV curves when conditions change
+        self.cached_iv.clear()
     
     def isc(self) -> float:
         """Short-circuit current estimate for this substring (A)."""
@@ -60,7 +63,8 @@ class Substring:
         """
         isc_val = float(self.isc())
         i_values = np.linspace(0.0, isc_val, int(points))
-        v_values = np.array([self.v_at_i(float(i)) for i in i_values], dtype=float)
+        # compute voltages for the requested currents using vectorized path
+        v_values = self.v_at_i_vector(i_values, cache_points=max(128, int(points)))
         I = np.asarray(i_values, dtype=float)
         V = np.asarray(v_values, dtype=float)
         # Ensure V is sorted ascending for callers: sort by V and reorder I accordingly
@@ -70,6 +74,64 @@ class Substring:
             Is = I[order]
             return Vs, Is
         return V, I
+
+    def v_at_i_vector(self, i_values, cache_points: int = 256):
+        """Return an array of substring voltages for each current in i_values.
+
+        This builds per-cell IV curves once (using Cell.get_iv_curve) and
+        interpolates each cell's voltage at the requested currents, then sums
+        across cells. Results are cached keyed by cache_points to amortize
+        the expensive per-cell solves.
+        """
+        i_values = np.asarray(i_values, dtype=float)
+        if i_values.size == 0:
+            return np.array([], dtype=float)
+
+        key = int(cache_points)
+        cache = self.cached_iv.get(key)
+        if cache is None:
+            # build per-cell interpolants at this resolution
+            per_cell_v = []
+            i_grid = None
+            for cell in self.cell_list:
+                pts = cell.get_iv_curve(key)
+                v_arr = np.array([p[0] for p in pts], dtype=float)
+                i_arr = np.array([p[1] for p in pts], dtype=float)
+                # Ensure i_arr is ascending for interpolation
+                order = np.argsort(i_arr)
+                i_sorted = i_arr[order]
+                v_sorted = v_arr[order]
+                if i_grid is None:
+                    i_grid = i_sorted
+                # interpolate cell V at i_grid (clamped)
+                v_at_i = np.interp(i_grid, i_sorted, v_sorted)
+                per_cell_v.append(v_at_i)
+
+            if i_grid is None:
+                # no cells
+                i_grid = np.array([], dtype=float)
+
+            cache = {"i_values": i_grid, "per_cell_v": per_cell_v}
+            self.cached_iv[key] = cache
+
+        # Now interpolate per-cell cached voltages to requested i_values and sum
+        i_grid = cache["i_values"]
+        per_cell_v = cache["per_cell_v"]
+        if i_grid.size == 0 or not per_cell_v:
+            # fallback: compute scalar v_at_i for each value
+            out = np.array([sum(cell.v_at_i(float(i)) for cell in self.cell_list) for i in i_values], dtype=float)
+        else:
+            # stack per-cell arrays (cells x len(i_grid)) then sum and interpolate to i_values
+            stacked = np.vstack(per_cell_v)
+            v_sum_grid = np.sum(stacked, axis=0)
+            # apply bypass diode if present by computing its voltage at requested currents
+            if self.bypass:
+                bypass_v = np.array([self.bypass.v_at_i(float(i)) for i in i_grid], dtype=float)
+                v_sum_grid = np.maximum(v_sum_grid, bypass_v)
+            # interpolate summed voltage onto requested i_values
+            out = np.interp(i_values, i_grid, v_sum_grid)
+
+        return out
 
     def mpp(self) -> Tuple[float, float, float, float, float]:
         # Use per-cell vmpp/impp attributes when available (Cell stores vmpp, impp)
@@ -84,8 +146,14 @@ class Substring:
 
     # pre: current > 0
     def v_at_i(self, current: float) -> float:
-        cell_voltages = sum(cell.v_at_i(current) for cell in self.cell_list)
-        if self.bypass:
-            bypass_voltage = self.bypass.v_at_i(current)
-            return max(cell_voltages, bypass_voltage)
-        return cell_voltages
+        # Try fast path via cached per-cell IVs
+        try:
+            v = float(self.v_at_i_vector(np.array([current]), cache_points=1024)[0])
+            return v
+        except Exception:
+            # fallback to original slow per-cell calls
+            cell_voltages = sum(cell.v_at_i(current) for cell in self.cell_list)
+            if self.bypass:
+                bypass_voltage = self.bypass.v_at_i(current)
+                return max(cell_voltages, bypass_voltage)
+            return cell_voltages

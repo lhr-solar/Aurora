@@ -1,0 +1,590 @@
+{
+  "title": "Demo Layout - 3 Strings Parallel (Mixed Substrings)",
+  "points": 480,
+  "live": false,
+  "live_interval_ms": 500,
+  "layout": {
+    "strings": [
+      {
+        "substrings": [
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          },
+          {
+            "cells": [
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              },
+              {
+                "isc_ref": 5.84,
+                "voc_ref": 0.621
+              }
+            ]
+          }
+        ]
+      }
+    ]
+}
+}

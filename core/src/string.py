@@ -31,52 +31,61 @@ class PVString:
             v_sum += sub.v_at_i(current)
         return float(v_sum)
 
-    def i_at_v(self, v_target: float, tol: float = 1e-7, max_iter: int = 80) -> float:
+    def _i_bracket_for_v(self, v_target: float) -> tuple[float, float]:
         """
-        String current given voltage.
+        Find a conservative [lo, hi] current bracket such that V(lo) <= v_target <= V(hi).
+        lo starts at 0, hi at Isc estimate; we expand hi a bit if needed.
         """
         lo = 0.0
-        hi = max(self._estimate_imax(), 0.1)
+        hi = float(max(1e-12, self.isc()))  # start with Isc estimate
+        Vlo = self.v_at_i(lo)
+        Vhi = self.v_at_i(hi)
+        # If v_target above Vhi a hair due to rounding, expand hi slightly
+        k = 0
+        while v_target > Vhi and k < 3:
+            hi *= 1.2
+            Vhi = self.v_at_i(hi)
+            k += 1
+        return lo, hi
 
-        def f(i: float) -> float:
-            # positive when V(I) is above the target, negative when below
-            return self.v_at_i(i) - v_target
-
-        # essentially the IV curve is current at 0 is the max V
-        # if the voltage at current=0 is less than our target voltage, return 0 since that is the max possible
-        flo = f(lo)
-        if flo<=0:
+    def i_at_v(self, v_target: float, tol_v: float = 1e-6, maxit: int = 60) -> float:
+        """
+        Return string current i such that V(i) ≈ v_target using bisection.
+        Clamps to [0, Isc] when target is outside achievable range.
+        """
+        # quick clamps
+        V0 = self.v_at_i(0.0)          # ~Voc_string
+        if v_target >= V0 - 1e-12:
             return 0.0
+        Isc_est = float(max(1e-12, self.isc()))
+        Visc = self.v_at_i(Isc_est)
+        if v_target <= Visc + 1e-12:
+            return Isc_est
 
-        tries = 0
-        fhi = f(hi)
-        # while the v at hi current is greater than the v target, increase current to decrease voltage
-        # this shifts the current range to capture more values of V
-        while fhi > 0.0 and tries<8:
-            hi *= 1.5
-            fhi = f(hi)
-            tries+=1
+        lo, hi = self._i_bracket_for_v(v_target)
+        Vlo = self.v_at_i(lo)
+        Vhi = self.v_at_i(hi)
 
-        # if we can't include the voltage from increasing current
-        # we just return which ever current was higher
-
-        if fhi > 0.0:
-            return hi if abs(fhi) < abs(flo) else lo
-
-        # bisection search to find the correct current
-        # get the middle i and solve for v and determine how far off from target
-        # if its greater than target, change low to the midpoint
-        for _ in range(max_iter):
+        # Bisection on monotone V(i)
+        for _ in range(maxit):
             mid = 0.5 * (lo + hi)
-            fmid = f(mid)
-            if abs(fmid) < tol or abs(hi - lo) < 1e-9:
+            Vmid = self.v_at_i(mid)
+            if abs(Vmid - v_target) <= tol_v:
                 return float(mid)
-            if fmid > 0.0:
-                lo, flo = mid, fmid
+            if Vmid < v_target:
+                lo, Vlo = mid, Vmid
             else:
-                hi, fhi = mid, fmid
-
+                hi, Vhi = mid, Vmid
         return float(0.5 * (lo + hi))
+
+    def i_at_v_vector(self, V: np.ndarray, tol_v: float = 1e-6) -> np.ndarray:
+        V = np.asarray(V, dtype=float)
+        out = np.empty_like(V)
+        # Vectorized loop (bisection is fast; caching in v_at_i_vector already helps)
+        for k, v in enumerate(V):
+            out[k] = self.i_at_v(float(v), tol_v=tol_v)
+        # numerical hygiene
+        return np.maximum(out, 0.0)
 
     def _estimate_imax(self) -> float:
         """
@@ -108,8 +117,16 @@ class PVString:
 
         I = np.linspace(0.0, float(i_max), int(points))
         V = np.zeros_like(I, dtype=float)
-        for k, i in enumerate(I):
-            V[k] = self.v_at_i(float(i))
+
+        # Fast path: ask each substring for vectorized voltages at the same I grid
+        for sub in self.substrings:
+            try:
+                V += sub.v_at_i_vector(I, cache_points=max(128, int(points)))
+            except Exception:
+                # fallback to scalar evaluation per point for this substring
+                for k, i in enumerate(I):
+                    V[k] += sub.v_at_i(float(i))
+
         return V, I
 
     def pv_curve(self, points: int = 400, i_max: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

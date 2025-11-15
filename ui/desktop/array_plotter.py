@@ -1,5 +1,8 @@
 from typing import Any, Tuple
 import numpy as np
+from pathlib import Path
+from datetime import datetime
+import os
 
 try:
     # Prefer PyQt6
@@ -143,7 +146,7 @@ class ArrayPlotterWindow(QMainWindow):
         ctrl_layout.addWidget(QLabel("Points:"))
         self.points_spin = QSpinBox()
         self.points_spin.setRange(10, 2000)
-        self.points_spin.setValue(400)
+        self.points_spin.setValue(800)
         ctrl_layout.addWidget(self.points_spin)
 
         self.refresh_btn = QPushButton("Refresh")
@@ -296,7 +299,7 @@ class ArrayPlotterWindow(QMainWindow):
             pvstring = core_string.PVString(substrings)
             strings.append(pvstring)
 
-        arr = core_array.Array(strings)
+        arr = core_array.Array(strings, topology="parallel")
         return arr
 
     def set_array(self, arr: Any) -> None:
@@ -316,8 +319,7 @@ class ArrayPlotterWindow(QMainWindow):
         # Prefer iv_curve
         if hasattr(self.array, "iv_curve"):
             try:
-                a, b = self.array.iv_curve(points)
-                V, I = _normalize_iv_arrays(a, b)
+                V, I = self.array.iv_curve(points)
                 # Resample onto a uniform voltage grid to avoid clustering when
                 # underlying implementations sweep current non-linearly.
                 try:
@@ -555,6 +557,27 @@ class ArrayPlotterWindow(QMainWindow):
                 self.status.setText(f"Saved figure to {fname}")
             except Exception as e:
                 self.status.setText(f"Save failed: {e}")
+        # Also export the current IV/PV arrays to CSV in data/runs as iv_YYYYMMDD_HHMMSS.csv
+        try:
+            if self._last_V is not None and self._last_I is not None:
+                repo_root = Path(__file__).resolve().parents[2]
+                out_dir = repo_root / "data" / "runs"
+                os.makedirs(out_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = out_dir / f"iv_{ts}.csv"
+                V = np.asarray(self._last_V, dtype=float)
+                I = np.asarray(self._last_I, dtype=float)
+                P = V * I
+                # write CSV header V,I,P
+                with open(out_path, "w") as fh:
+                    fh.write("V,I,P\n")
+                    for v, i, p in zip(V.tolist(), I.tolist(), P.tolist()):
+                        fh.write(f"{v},{i},{p}\n")
+                # update status to reflect CSV save as well
+                self.status.setText(self.status.text() + f"; exported IV to {out_path}")
+        except Exception:
+            # don't crash the UI on save errors; just ignore
+            pass
 
 
 if __name__ == "__main__":
