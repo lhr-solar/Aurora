@@ -24,6 +24,7 @@ python -m simulators.mppt_sim --profile cloud
 
 import argparse
 from typing import Any, Dict, List, Tuple, Optional, Callable
+from pathlib import Path
 
 from simulators.engine import (
     SimulationConfig,
@@ -32,6 +33,7 @@ from simulators.engine import (
 
 from core.controller.hybrid_controller import HybridConfig
 from core.mppt_algorithms import registry as mppt_registry
+import csv
 
 # Profiles
 def get_profile(name: str) -> List[Tuple[float, float, float]]:
@@ -68,7 +70,7 @@ def build_hybrid_with(algo_name: Optional[str]) -> HybridConfig:
             f"Available: {', '.join(sorted(cat.keys()))}"
         )
     # HybridConfig takes a mapping of phase -> algo name; we at least set the local one
-    return HybridConfig(local_algo=algo_name)
+    return HybridConfig(normal_name=algo_name)
 
 # Runner
 def run_mppt_sim(
@@ -77,6 +79,7 @@ def run_mppt_sim(
     total_time: float = 0.25,
     dt: float = 1e-3,
     verbose: bool = True,
+    csv_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run a single MPPT scenario and return the list of records.
@@ -103,6 +106,33 @@ def run_mppt_sim(
     eng = SimulationEngine(cfg)
     for _ in eng.run():
         pass
+
+    if csv_path and records:
+        # Ensure output directory exists: Aurora/data/runs
+        out_dir = Path("data") / "runs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = out_dir / csv_path
+
+        # Flatten records (including nested action dict if present)
+        rows = []
+        for rec in records:
+            row = dict(rec)
+            action = row.pop("action", None)
+            if isinstance(action, dict):
+                for k, v in action.items():
+                    row[f"action_{k}"] = v
+            rows.append(row)
+
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        with out_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        if verbose:
+            print(f"[mppt_sim] CSV written to {out_path}")
+
     return records
 
 # CLI
@@ -113,6 +143,7 @@ def main() -> None:
     parser.add_argument("--dt", type=float, default=1e-3, help="Simulation step (s)")
     parser.add_argument("--time", type=float, default=0.25, help="Total simulation time (s)")
     parser.add_argument("--quiet", action="store_true", help="Do not print each sample")
+    parser.add_argument("--csv", type=str, default=None, help="Path to write CSV results")
     args = parser.parse_args()
 
     run_mppt_sim(
@@ -121,6 +152,7 @@ def main() -> None:
         total_time=args.time,
         dt=args.dt,
         verbose=not args.quiet,
+        csv_path=args.csv,
     )
 
 

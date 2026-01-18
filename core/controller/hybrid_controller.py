@@ -12,6 +12,9 @@ from typing import Any, Dict, Optional
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..mppt_algorithms.types import Measurement, Action
+ 
+# Runtime import (Action is instantiated in this module)
+from ..mppt_algorithms.types import Action, Measurement
 from ..mppt_algorithms.registry import build
 from .psd import PSDDetector
 from .safety import SafetyLimits, check_limits
@@ -50,6 +53,12 @@ class HybridConfig:
     # Hysteresis / quiet cycles before S4→S1
     quiet_cycles: int = 3
 
+    # LOCK_HOLD robustness (Option B): exit on drift + periodic revalidation
+    hold_exit_dp_frac: float = 0.06   # exit HOLD if power drops >6% vs lock reference
+    hold_exit_dv_frac: float = 0.03   # exit HOLD if voltage drifts >3% vs lock reference
+    hold_revalidate_period_s: float = 0.10  # every 0.10s, run a few local steps to re-check slope
+    hold_revalidate_cycles: int = 5         # number of NORMAL (S1) steps during revalidation
+
 
 class HybridMPPT:
     """Condition-aware hybrid MPPT controller with a simple state machine."""
@@ -66,6 +75,13 @@ class HybridMPPT:
         self.state = State.INIT
         self._quiet = 0
         self._last_good_v: Optional[float] = None
+
+        # LOCK_HOLD reference + revalidation bookkeeping
+        self._hold_p_ref: Optional[float] = None
+        self._hold_v_ref: Optional[float] = None
+        self._hold_elapsed_s: float = 0.0
+        self._reval_remaining: int = 0
+
         # Event log for frontend (state changes, PSD triggers, safety trips)
         self.events: list[dict] = []
 
@@ -77,6 +93,11 @@ class HybridMPPT:
         self.psd.reset()
         self._quiet = 0
         self._last_good_v = None
+
+        self._hold_p_ref = None
+        self._hold_v_ref = None
+        self._hold_elapsed_s = 0.0
+        self._reval_remaining = 0
 
     # Core step
     def step(self, m: "Measurement") -> "Action":
@@ -114,6 +135,11 @@ class HybridMPPT:
                 self.events.append({"t": m.t, "type": "state_change", "from": State.NORMAL.value, "to": State.GLOBAL_SEARCH.value})
                 self.state = State.GLOBAL_SEARCH
                 self.s3.reset()
+                # Mark the transition on the Action for UI/telemetry
+                dbg = dict(a.debug) if a.debug else {}
+                dbg.update({"state": State.NORMAL.value, "next_state": State.GLOBAL_SEARCH.value, "reason": "psd_trigger"})
+                a.debug = dbg
+                return a
             return self._with_state(a, State.NORMAL)
 
         if self.state == State.GLOBAL_SEARCH:
@@ -124,24 +150,98 @@ class HybridMPPT:
                 self.events.append({"t": m.t, "type": "state_change", "from": State.GLOBAL_SEARCH.value, "to": State.LOCK_HOLD.value})
                 self.state = State.LOCK_HOLD
                 self.s4.reset()
+                # Establish lock references for drift detection + periodic revalidation
+                self._hold_p_ref = float(m.p)
+                self._hold_v_ref = float(m.v)
+                self._hold_elapsed_s = 0.0
+                self._reval_remaining = 0
+                # Mark the transition on the Action
+                dbg = dict(a.debug) if a.debug else {}
+                dbg.update({"state": State.GLOBAL_SEARCH.value, "next_state": State.LOCK_HOLD.value, "reason": "phase_lock"})
+                a.debug = dbg
+                return a
             return self._with_state(a, State.GLOBAL_SEARCH)
 
         if self.state == State.LOCK_HOLD:
+            # Accumulate time spent in HOLD
+            self._hold_elapsed_s += float(getattr(m, "dt", 0.0) or 0.0)
+
+            # Exit HOLD if we drift materially away from the lock reference
+            if self._hold_p_ref is not None and self._hold_p_ref > 1e-12:
+                dp_frac = (float(self._hold_p_ref) - float(m.p)) / float(self._hold_p_ref)
+                if dp_frac > float(self.cfg.hold_exit_dp_frac):
+                    self.events.append({"t": m.t, "type": "hold_exit", "reason": "power_drop", "dp_frac": float(dp_frac)})
+                    self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
+                    self.state = State.GLOBAL_SEARCH
+                    self.s3.reset()
+                    return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "power_drop", "dp_frac": float(dp_frac)})
+
+            if self._hold_v_ref is not None and abs(float(self._hold_v_ref)) > 1e-12:
+                dv_frac = abs(float(m.v) - float(self._hold_v_ref)) / abs(float(self._hold_v_ref))
+                if dv_frac > float(self.cfg.hold_exit_dv_frac):
+                    self.events.append({"t": m.t, "type": "hold_exit", "reason": "voltage_drift", "dv_frac": float(dv_frac)})
+                    self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
+                    self.state = State.GLOBAL_SEARCH
+                    self.s3.reset()
+                    return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "voltage_drift", "dv_frac": float(dv_frac)})
+
+            # Periodic revalidation: occasionally run a few local (S1) steps to re-check slope
+            if self.cfg.hold_revalidate_period_s > 0 and self._hold_elapsed_s >= float(self.cfg.hold_revalidate_period_s) and self._reval_remaining == 0:
+                self._reval_remaining = int(self.cfg.hold_revalidate_cycles)
+                self._hold_elapsed_s = 0.0
+                self.s1.reset()
+                self.events.append({"t": m.t, "type": "hold_revalidate_start", "cycles": int(self.cfg.hold_revalidate_cycles)})
+
+            if self._reval_remaining > 0:
+                a = self.s1.step(m)
+                self._reval_remaining -= 1
+                # If PSD fires during revalidation, immediately jump to global search
+                if self.psd.update_and_check(m):
+                    self.events.append({"t": m.t, "type": "psd_trigger"})
+                    self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
+                    self.state = State.GLOBAL_SEARCH
+                    self.s3.reset()
+                    return self._with_state(a, State.GLOBAL_SEARCH)
+                # When revalidation completes, refresh lock references
+                if self._reval_remaining == 0:
+                    self._hold_p_ref = float(m.p)
+                    self._hold_v_ref = float(m.v)
+                    self.events.append({"t": m.t, "type": "hold_revalidate_done"})
+                return self._with_state(a, State.LOCK_HOLD)
+
+            # Default HOLD behavior
             a = self.s4.step(m)
             self._last_good_v = a.v_ref if a.v_ref is not None else m.v
-            # Quiet-hold detection using ESC gradient magnitude
+
+            # Quiet-hold detection using ESC gradient magnitude (allows S4→S1 in stable conditions)
             grad = abs(float(a.debug.get("grad", 0.0))) if a.debug else 0.0
             self._quiet = self._quiet + 1 if grad < 1e-3 else 0
             if self._quiet >= self.cfg.quiet_cycles:
                 self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.NORMAL.value})
                 self.state = State.NORMAL
                 self.s1.reset(); self._quiet = 0
+                # Also refresh lock refs so next HOLD entry uses current point
+                self._hold_p_ref = None
+                self._hold_v_ref = None
+                self._hold_elapsed_s = 0.0
+                self._reval_remaining = 0
+                # Mark the transition on the Action
+                dbg = dict(a.debug) if a.debug else {}
+                dbg.update({"state": State.LOCK_HOLD.value, "next_state": State.NORMAL.value, "reason": "quiet_hold"})
+                a.debug = dbg
+
             # Re-check PSC in case conditions changed again
             if self.psd.update_and_check(m):
                 self.events.append({"t": m.t, "type": "psd_trigger"})
                 self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
                 self.state = State.GLOBAL_SEARCH
                 self.s3.reset()
+                # Mark the transition on the Action
+                dbg = dict(a.debug) if a.debug else {}
+                dbg.update({"state": State.LOCK_HOLD.value, "next_state": State.GLOBAL_SEARCH.value, "reason": "psd_trigger"})
+                a.debug = dbg
+                return a
+
             return self._with_state(a, State.LOCK_HOLD)
 
         # Fallback (should not happen):

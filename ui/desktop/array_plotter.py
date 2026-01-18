@@ -320,6 +320,7 @@ class ArrayPlotterWindow(QMainWindow):
         if hasattr(self.array, "iv_curve"):
             try:
                 V, I = self.array.iv_curve(points)
+                V, I = _normalize_iv_arrays(V, I)
                 # Resample onto a uniform voltage grid to avoid clustering when
                 # underlying implementations sweep current non-linearly.
                 try:
@@ -465,19 +466,20 @@ class ArrayPlotterWindow(QMainWindow):
             try:
                 Vv = np.asarray(V, dtype=float)
                 Iv = np.asarray(I, dtype=float)
-                Pv = Vv * Iv
+
+                # Ensure arrays are sorted by voltage for interpolation
+                order = np.argsort(Vv)
+                Vv = Vv[order]
+                Iv = Iv[order]
+
                 # clamp mx to available voltage range
                 vmin = float(np.nanmin(Vv))
                 vmax = float(np.nanmax(Vv))
                 v_val = float(np.clip(mx, vmin, vmax))
-                # interpolate power at this voltage
-                p_val = float(np.interp(v_val, Vv, Pv))
-                if abs(v_val) > 1e-12:
-                    i_val = float(p_val / v_val)
-                else:
-                    # fallback to nearest sample
-                    idx = int(np.nanargmin((Vv - v_val)**2 + (Pv - p_val)**2))
-                    i_val = float(Iv[idx])
+
+                # interpolate current at this voltage, then compute power
+                i_val = float(np.interp(v_val, Vv, Iv))
+                p_val = float(v_val * i_val)
             except Exception:
                 return
 

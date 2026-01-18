@@ -89,3 +89,50 @@ class Array:
         P = V * I
         idx = int(np.nanargmax(P))
         return float(V[idx]), float(I[idx]), float(P[idx])
+    
+    def v_at_i(self, current: float) -> float:
+        """
+        Array voltage at a given current (only meaningful for series topology).
+        For series topology: array voltage is sum of string voltages at that current.
+        """
+        if self.topology != "series":
+            raise ValueError("v_at_i is only valid for series topology")
+        return float(sum(s.v_at_i(current) for s in self.string_list))
+
+    def i_at_v(self, v_target: float, tol_v: float = 1e-6, maxit: int = 60) -> float:
+        """
+        Array current at a given terminal voltage.
+
+        - parallel topology: I(V) = sum_i string_i_at_v(V)
+        - series topology:   V(I) = sum_i string_v_at_i(I) -> invert with bisection
+        """
+        v_target = float(v_target)
+
+        if self.topology == "parallel":
+            # Same terminal voltage across strings, currents add
+            return float(sum(s.i_at_v(v_target, tol_v=tol_v, maxit=maxit) for s in self.string_list))
+
+        # series topology: same current through strings, voltages add; invert V(I)
+        V0 = self.v_at_i(0.0)  # ~ Voc_total
+        if v_target >= V0 - 1e-12:
+            return 0.0
+
+        Isc_est = float(max(1e-12, self.isc()))
+        Visc = self.v_at_i(Isc_est)
+        if v_target <= Visc + 1e-12:
+            return Isc_est
+
+        lo, hi = 0.0, Isc_est
+
+        for _ in range(maxit):
+            mid = 0.5 * (lo + hi)
+            Vmid = self.v_at_i(mid)
+            if abs(Vmid - v_target) <= tol_v:
+                return float(mid)
+            # V(I) is decreasing in I
+            if Vmid < v_target:
+                hi = mid
+            else:
+                lo = mid
+
+        return float(0.5 * (lo + hi))

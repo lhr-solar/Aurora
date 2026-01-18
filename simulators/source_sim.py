@@ -16,6 +16,7 @@ Under the hood it uses the same SimulationEngine you already have.
 """
 
 import argparse
+import csv
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Callable
 
@@ -138,6 +139,7 @@ def run_source_sim(
     total_time: float = 0.3,
     dt: float = 1e-3,
     verbose: bool = True,
+    out_csv: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run a simulation where the SOURCE is the main changing variable.
@@ -169,6 +171,32 @@ def run_source_sim(
     for _ in eng.run():
         pass
 
+    if out_csv and records:
+        # Ensure output directory exists: Aurora/data/runs
+        out_dir = Path("data") / "runs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = out_dir / out_csv
+
+        # Flatten records (including nested action dict if present)
+        rows = []
+        for rec in records:
+            row = dict(rec)
+            action = row.pop("action", None)
+            if isinstance(action, dict):
+                for k, v in action.items():
+                    row[f"action_{k}"] = v
+            rows.append(row)
+
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        with out_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        if verbose:
+            print(f"[source_sim] CSV written to {out_path}")
+
     return records
 
 # CLI
@@ -180,6 +208,8 @@ def main() -> None:
                         help="Built-in profile: stc, cloud, ramp, hot, csv")
     parser.add_argument("--csv-path", type=str, default=None,
                         help="If --profile=csv, path to CSV with time_s,irradiance,temp_c")
+    parser.add_argument("--out-csv", type=str, default=None,
+                        help="Path to write CSV results")
     parser.add_argument("--dt", type=float, default=1e-3,
                         help="Simulation step (s)")
     parser.add_argument("--time", type=float, default=0.3,
@@ -196,6 +226,7 @@ def main() -> None:
         total_time=args.time,
         dt=args.dt,
         verbose=not args.quiet,
+        out_csv=args.out_csv,
     )
 
 

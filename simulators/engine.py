@@ -103,8 +103,34 @@ class PVPlant:
         """
         Given a terminal voltage, return (v, i) as seen by the controller.
         """
-        i = self.array.i_at_v(v)
+        # Array API compatibility: different versions may expose different method names
+        i_fn = None
+        for _name in ("i_at_v", "solve_i_at_v", "current_at_v", "i_of_v", "i_from_v"):
+            _cand = getattr(self.array, _name, None)
+            if callable(_cand):
+                i_fn = _cand
+                break
+        if i_fn is None:
+            raise AttributeError(
+                "Array object has no callable method to compute current at a voltage. "
+                "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
+            )
+        i = i_fn(v)
         return float(v), float(i)
+
+# Live environment overrides dataclass
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class LiveOverrides:
+    """Live environment overrides that can be mutated while a simulation runs.
+
+    If a field is not None, it takes precedence over the configured constant
+    values and any env_profile-derived values.
+    """
+    irradiance: Optional[float] = None      # W/m^2
+    temperature_c: Optional[float] = None   # °C
 
 # Simulation config / result types
 @dataclass
@@ -121,6 +147,8 @@ class SimulationConfig:
     env_profile: Optional[List[Tuple[float, float, float]]] = None
     # Optional: per-sample callback for UIs/loggers
     on_sample: Optional[Callable[[Dict[str, Any]], None]] = None
+    # Optional: live overrides (shared object mutated by UI)
+    overrides: Optional[LiveOverrides] = None
 
     def build_array(self) -> Array:
         kwargs = self.array_kwargs or {}
@@ -132,23 +160,35 @@ class SimulationConfig:
         return HybridMPPT(self.controller_cfg)
 
     def env_at(self, t: float) -> Tuple[float, float]:
+        """Return (irradiance, temperature_c) for time t.
+
+        Priority (highest first):
+          1) live overrides (if provided and the specific field is not None)
+          2) env_profile stepwise values
+          3) constant irradiance/temperature_c from config
         """
-        Return (irradiance, temperature_c) for time t.
-        If no profile is provided, fall back to constant values.
-        If profile is provided as a list of (t, G, T), we pick the last
-        entry whose time <= t (stepwise hold).
-        """
-        if not self.env_profile:
-            return self.irradiance, self.temperature_c
+
+        # Base values from config
         latest_g = self.irradiance
         latest_t = self.temperature_c
-        for tt, g, tc in self.env_profile:
-            if tt <= t:
-                latest_g = g
-                latest_t = tc
-            else:
-                break
-        return latest_g, latest_t
+
+        # Stepwise-hold profile values (if provided)
+        if self.env_profile:
+            for tt, g, tc in self.env_profile:
+                if tt <= t:
+                    latest_g = g
+                    latest_t = tc
+                else:
+                    break
+
+        # Live overrides win
+        if self.overrides is not None:
+            if self.overrides.irradiance is not None:
+                latest_g = float(self.overrides.irradiance)
+            if self.overrides.temperature_c is not None:
+                latest_t = float(self.overrides.temperature_c)
+
+        return float(latest_g), float(latest_t)
 
 # Engine
 class SimulationEngine:
@@ -184,7 +224,19 @@ class SimulationEngine:
         self.plant.set_conditions(g0, t0)
 
         # Prime the controller with an INIT measurement
-        i = self.array.i_at_v(v)
+        # Array API compatibility (same logic as PVPlant.step)
+        i_fn = None
+        for _name in ("i_at_v", "solve_i_at_v", "current_at_v", "i_of_v", "i_from_v"):
+            _cand = getattr(self.array, _name, None)
+            if callable(_cand):
+                i_fn = _cand
+                break
+        if i_fn is None:
+            raise AttributeError(
+                "Array object has no callable method to compute current at a voltage. "
+                "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
+            )
+        i = i_fn(v)
         m = Measurement(t=t, v=v, i=i, g=g0, t_mod=t0, dt=self.cfg.dt)
         a = self.ctrl.step(m)
         rec = self._to_record(m, a)
