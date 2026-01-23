@@ -216,9 +216,25 @@ class _MPPTWorker(QThread):
             if self.use_csv_profile:
                 if self.csv_profile_path is None:
                     raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
-                profile = load_env_profile_csv(self.csv_profile_path)
+                base_profile = load_env_profile_csv(self.csv_profile_path)
             else:
-                profile = get_profile(self.profile_name)
+                base_profile = get_profile(self.profile_name)
+
+            # Build an *iterable* environment profile (list of samples) because SimulationEngine
+            # expects env_profile to be iterable in this codebase.
+            # Each element is (t, g, t_c). Sliders apply as offsets relative to STC.
+            n_steps = int(round(self.total_time / self.dt)) + 1
+            env_samples: List[Tuple[float, float, float]] = []
+            for k in range(n_steps):
+                tt = k * float(self.dt)
+                g, tc = base_profile(float(tt))
+                if self.overrides is not None:
+                    if self.overrides.irradiance is not None:
+                        g += float(self.overrides.irradiance) - 1000.0
+                    if self.overrides.temperature_c is not None:
+                        tc += float(self.overrides.temperature_c) - 25.0
+                env_samples.append((float(tt), float(g), float(tc)))
+
             hcfg = HybridConfig(normal_name=self.algo)
 
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,9 +277,9 @@ class _MPPTWorker(QThread):
                 cfg = SimulationConfig(
                     total_time=self.total_time,
                     dt=self.dt,
-                    env_profile=profile,
+                    env_profile=env_samples,
                     controller_cfg=hcfg,
-                    overrides=self.overrides,
+                    overrides=None,
                     on_sample=_on_sample,
                 )
 
@@ -543,15 +559,7 @@ class LabDashboard(QWidget):
         try:
             rd = load_run_csv(path)
             self._rd = rd
-            # Seed sliders from first sample if present
-            if rd.g and rd.g[0] == rd.g[0]:
-                self.g_slider.blockSignals(True)
-                self.g_slider.setValue(int(round(rd.g[0])))
-                self.g_slider.blockSignals(False)
-            if rd.t_mod and rd.t_mod[0] == rd.t_mod[0]:
-                self.t_slider.blockSignals(True)
-                self.t_slider.setValue(int(round(rd.t_mod[0])))
-                self.t_slider.blockSignals(False)
+            # Removed: do NOT seed sliders from first sample, keep UI at baseline.
             self._on_override_changed()
             self._plot(rd)
         except Exception as e:
@@ -739,21 +747,20 @@ class LabDashboard(QWidget):
         if not hasattr(self, "g_plot"):
             return
 
-        # If live overrides are set, show them as flat lines for G and T.
-        # But if the user is running a CSV profile, preserve the profile shape in the plot.
+        # Always plot the recorded/profile-shaped series; sliders influence the simulation via the wrapped profile.
         g_series = rd.g
         t_series = rd.t_mod
-        use_csv = hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked()
-        if (not use_csv) and self.overrides is not None:
-            if self.overrides.irradiance is not None:
-                g_series = [float(self.overrides.irradiance)] * len(rd.t)
-            if self.overrides.temperature_c is not None:
-                t_series = [float(self.overrides.temperature_c)] * len(rd.t)
 
         self.g_plot.clear()
         self.t_plot.clear()
         self.v_plot.clear()
         self.p_plot.clear()
+        # Prevent axes from auto-rescaling when data changes (slider moves)
+        try:
+            self.g_plot.getViewBox().enableAutoRange(axis='y', enable=False)
+            self.t_plot.getViewBox().enableAutoRange(axis='y', enable=False)
+        except Exception:
+            pass
         self._clear_regions()
 
         segs = build_state_segments(rd.t, rd.state)
@@ -777,6 +784,45 @@ class LabDashboard(QWidget):
         self.t_plot.plot(rd.t, t_series)
         self.v_plot.plot(rd.t, rd.v)
         self.p_plot.plot(rd.t, rd.p)
+
+        # Baseline-anchored Y ranges (stable frame):
+        #   - Irradiance: 1000 ± 200 W/m²
+        #   - Temperature: 25 ± 10 °C
+        # Axis only expands if the shifted curve would clip outside the window by a margin.
+        def _finite(vals: List[float]) -> List[float]:
+            return [float(x) for x in vals if x == x]
+
+        g0 = 1000.0
+        t0 = 25.0
+        g_window = 200.0
+        t_window = 10.0
+        g_base_min, g_base_max = g0 - g_window, g0 + g_window
+        t_base_min, t_base_max = t0 - t_window, t0 + t_window
+
+        g_f = _finite(g_series)
+        t_f = _finite(t_series)
+
+        if g_f:
+            g_smin, g_smax = min(g_f), max(g_f)
+            g_margin = 0.25 * g_window
+            y0, y1 = g_base_min, g_base_max
+            if g_smin < (g_base_min - g_margin) or g_smax > (g_base_max + g_margin):
+                y0 = min(g_base_min, g_smin)
+                y1 = max(g_base_max, g_smax)
+            self.g_plot.setYRange(y0, y1, padding=0.0)
+        else:
+            self.g_plot.setYRange(g_base_min, g_base_max, padding=0.0)
+
+        if t_f:
+            t_smin, t_smax = min(t_f), max(t_f)
+            t_margin = 0.25 * t_window
+            y0, y1 = t_base_min, t_base_max
+            if t_smin < (t_base_min - t_margin) or t_smax > (t_base_max + t_margin):
+                y0 = min(t_base_min, t_smin)
+                y1 = max(t_base_max, t_smax)
+            self.t_plot.setYRange(y0, y1, padding=0.0)
+        else:
+            self.t_plot.setYRange(t_base_min, t_base_max, padding=0.0)
 
         if rd.t:
             self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
