@@ -1,5 +1,3 @@
-
-
 """ui.desktop.lab_dashboard
 
 Single-page 'lab bench' dashboard that combines:
@@ -10,8 +8,6 @@ Single-page 'lab bench' dashboard that combines:
 This is intentionally a focused MVP: it prioritizes live interaction.
 Saved runs are written to Aurora/data/runs and can be reopened.
 """
-
-from __future__ import annotations
 
 import ast
 import csv

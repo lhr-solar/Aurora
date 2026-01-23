@@ -13,8 +13,6 @@ For now it provides:
 Plots/state shading will be added next.
 """
 
-from __future__ import annotations
-
 import ast
 import csv
 from dataclasses import dataclass

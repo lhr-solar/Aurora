@@ -10,8 +10,6 @@ Run:
     python -m ui.desktop.main_window
 """
 
-from __future__ import annotations
-
 import sys
 import importlib
 from typing import Optional

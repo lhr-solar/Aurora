@@ -243,6 +243,8 @@ class SourceDashboard(QWidget):
         super().__init__()
         self.overrides: Optional[LiveOverrides] = overrides
         self._current_rd: Optional[RunData] = None
+        self._g_baseline: float = 1000.0
+        self._t_baseline: float = 25.0
 
         root = QVBoxLayout(self)
 
@@ -471,16 +473,16 @@ class SourceDashboard(QWidget):
         try:
             rd = load_run_csv(path)
             self._current_rd = rd
+            # No longer overwrite baselines from the run; use fixed defaults.
 
-            # Seed slider values from the first sample if available
-            if rd.g and rd.g[0] == rd.g[0]:
-                self.g_slider.blockSignals(True)
-                self.g_slider.setValue(int(round(rd.g[0])))
-                self.g_slider.blockSignals(False)
-            if rd.t_mod and rd.t_mod[0] == rd.t_mod[0]:
-                self.t_slider.blockSignals(True)
-                self.t_slider.setValue(int(round(rd.t_mod[0])))
-                self.t_slider.blockSignals(False)
+            # Seed sliders from fixed "normal" baselines
+            self.g_slider.blockSignals(True)
+            self.g_slider.setValue(int(round(self._g_baseline)))
+            self.g_slider.blockSignals(False)
+
+            self.t_slider.blockSignals(True)
+            self.t_slider.setValue(int(round(self._t_baseline)))
+            self.t_slider.blockSignals(False)
 
             self._on_override_changed()
         except Exception:
@@ -505,6 +507,10 @@ class SourceDashboard(QWidget):
 
         self.g_plot.clear()
         self.t_plot.clear()
+
+        # Force-disable autorange before adding items
+        self.g_plot.getViewBox().enableAutoRange(axis='y', enable=False)
+        self.t_plot.getViewBox().enableAutoRange(axis='y', enable=False)
 
         # Remove existing regions
         for r in getattr(self, "_state_regions", []):
@@ -558,19 +564,41 @@ class SourceDashboard(QWidget):
             self._plot_run_with_overrides(self._current_rd)
 
     def _plot_run_with_overrides(self, rd: RunData) -> None:
-        """Plot using slider override values (constant G and T across time)."""
+        """Plot with slider overrides as *deltas* relative to the run's baseline.
+
+        Instead of plotting a constant line (which makes the Y axis rescale and hides movement),
+        we shift the original run series by the slider delta so the curve visibly moves up/down.
+
+        The Y axis stays anchored to the baseline range unless the delta is dramatic.
+        """
         if pg is None or self.g_plot is None or self.t_plot is None:
             return
 
         g_override = float(self.g_slider.value())
         t_override = float(self.t_slider.value())
 
-        # Apply constant overrides for visualization
-        g_series = [g_override] * len(rd.t)
-        t_series = [t_override] * len(rd.t)
+        def _finite(vals: list[float]) -> list[float]:
+            return [float(x) for x in vals if x == x]  # filter NaNs
+
+        # Baselines: use fixed defaults
+        g_base = self._g_baseline
+        t_base = self._t_baseline
+
+        dg = g_override - g_base
+        dt = t_override - t_base
+
+        # Shift the original series so the curve moves up/down relative to the baseline.
+        g_series = [(float(x) + dg) if (x == x) else float("nan") for x in rd.g]
+        t_series = [(float(x) + dt) if (x == x) else float("nan") for x in rd.t_mod]
 
         self.g_plot.clear()
         self.t_plot.clear()
+        # Force-disable autorange before adding items (prevents axis "chasing" on some pyqtgraph versions)
+        try:
+            self.g_plot.getViewBox().enableAutoRange(axis='y', enable=False)
+            self.t_plot.getViewBox().enableAutoRange(axis='y', enable=False)
+        except Exception:
+            pass
 
         # Remove existing regions
         for r in getattr(self, "_state_regions", []):
@@ -600,10 +628,61 @@ class SourceDashboard(QWidget):
             self.t_plot.addItem(region)
             self._state_regions.append(region)
 
-        # Plot overridden lines
+        # Plot shifted lines
         self.g_plot.plot(rd.t, g_series)
         self.t_plot.plot(rd.t, t_series)
 
+        # X range follows the run.
         if rd.t:
             self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
             self.t_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
+
+        # Disable Y auto-range so the axis doesn't constantly chase the line.
+        try:
+            self.g_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+            self.t_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        except Exception:
+            try:
+                self.g_plot.enableAutoRange('y', False)
+                self.t_plot.enableAutoRange('y', False)
+            except Exception:
+                pass
+
+        # Baseline-anchored Y ranges (do NOT follow CSV min/max).
+        # Default windows:
+        #   - Irradiance: 1000 ± 200 W/m²
+        #   - Temperature: 25 ± 10 °C
+        # The axis only expands if the shifted curve would clip outside the window by a meaningful amount.
+        g_window = 200.0
+        t_window = 10.0
+
+        g_base_min = g_base - g_window
+        g_base_max = g_base + g_window
+        t_base_min = t_base - t_window
+        t_base_max = t_base + t_window
+
+        g_shifted = _finite(g_series)
+        t_shifted = _finite(t_series)
+
+        if g_shifted:
+            g_smin, g_smax = min(g_shifted), max(g_shifted)
+            # Allow some headroom before expanding (prevents frequent axis changes).
+            g_margin = 0.25 * g_window
+            y0, y1 = g_base_min, g_base_max
+            if g_smin < (g_base_min - g_margin) or g_smax > (g_base_max + g_margin):
+                y0 = min(g_base_min, g_smin)
+                y1 = max(g_base_max, g_smax)
+            self.g_plot.setYRange(y0, y1, padding=0.0)
+        else:
+            self.g_plot.setYRange(g_base_min, g_base_max, padding=0.0)
+
+        if t_shifted:
+            t_smin, t_smax = min(t_shifted), max(t_shifted)
+            t_margin = 0.25 * t_window
+            y0, y1 = t_base_min, t_base_max
+            if t_smin < (t_base_min - t_margin) or t_smax > (t_base_max + t_margin):
+                y0 = min(t_base_min, t_smin)
+                y1 = max(t_base_max, t_smax)
+            self.t_plot.setYRange(y0, y1, padding=0.0)
+        else:
+            self.t_plot.setYRange(t_base_min, t_base_max, padding=0.0)
