@@ -219,6 +219,39 @@ class _MPPTWorker(QThread):
                 base_profile = load_env_profile_csv(self.csv_profile_path)
             else:
                 base_profile = get_profile(self.profile_name)
+                            # Normalize base_profile into a callable:
+            # - If get_profile() returns a callable, use it directly.
+            # - If it returns an iterable of (t, g, t_c), wrap it as a last-value-hold step function.
+            if callable(base_profile):
+                base_profile_fn = base_profile
+            else:
+                rows: List[Tuple[float, float, float]] = []
+                for item in base_profile:
+                    if isinstance(item, (list, tuple)) and len(item) >= 3:
+                        try:
+                            rows.append((float(item[0]), float(item[1]), float(item[2])))
+                        except Exception:
+                            continue
+                rows.sort(key=lambda x: x[0])
+                if not rows:
+                    raise ValueError(
+                        f"Profile '{self.profile_name}' is not callable and has no valid (t,g,t_c) rows"
+                    )
+
+                times = [r0 for (r0, _, _) in rows]
+                gs = [g0 for (_, g0, _) in rows]
+                tcs = [tc0 for (_, _, tc0) in rows]
+
+                def _step_profile(t: float) -> Tuple[float, float]:
+                    idx = 0
+                    for k in range(len(times)):
+                        if times[k] <= t:
+                            idx = k
+                        else:
+                            break
+                    return float(gs[idx]), float(tcs[idx])
+
+                base_profile_fn = _step_profile
 
             # Build an *iterable* environment profile (list of samples) because SimulationEngine
             # expects env_profile to be iterable in this codebase.
@@ -227,7 +260,7 @@ class _MPPTWorker(QThread):
             env_samples: List[Tuple[float, float, float]] = []
             for k in range(n_steps):
                 tt = k * float(self.dt)
-                g, tc = base_profile(float(tt))
+                g, tc = base_profile_fn(float(tt))
                 if self.overrides is not None:
                     if self.overrides.irradiance is not None:
                         g += float(self.overrides.irradiance) - 1000.0
