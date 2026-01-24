@@ -62,7 +62,7 @@ class PSO(MPPTAlgorithm):
         vmin: float = 0.0,
         vmax: float = 100.0,
         seed: int = 7,
-        slew: float = 0.1,
+        slew: float = 0.5,
     ) -> None:
         self.window_pct = float(window_pct)
         self.np = max(3, int(particles))
@@ -164,7 +164,7 @@ class PSO(MPPTAlgorithm):
     def _init_swarm(self, seed_v: float) -> None:
         self.center = clamp(seed_v, self.vmin, self.vmax)
         # Enforce a small absolute span to avoid a degenerate window
-        abs_min = 0.05 * (self.vmax - self.vmin)
+        abs_min = 0.1 * (self.vmax - self.vmin)
         span = max(self.window_pct * max(abs(self.center), 1e-6), abs_min)
         v_lo = clamp(self.center - span, self.vmin, self.vmax)
         v_hi = clamp(self.center + span, self.vmin, self.vmax)
@@ -192,7 +192,7 @@ class PSO(MPPTAlgorithm):
             prev = self.v_ref if self.v_ref is not None else m.v
             v_out = self._apply_slew(prev, raw)
             self.v_ref = v_out
-            return Action(v_ref=v_out, debug={"algo": "pso", "phase": 0, "p": float(p), "center": float(self.center or m.v), "span": float(self.span or 0.0)})
+            return Action(v_ref=v_out, debug={"algo": "pso", "phase": 0, "done": False, "p": float(p), "center": float(self.center or m.v), "span": float(self.span or 0.0)})
 
         # Assign fitness to the previously commanded particle
         idx = self.k_eval % self.np
@@ -248,6 +248,7 @@ class PSO(MPPTAlgorithm):
             debug={
                 "algo": "pso",
                 "phase": phase,
+                "done": bool(done),
                 "iter": self._iter,
                 "idx": self.k_eval % self.np,
                 "gbest_v": float(self.gbest_v or 0.0),

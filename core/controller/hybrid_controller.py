@@ -58,7 +58,10 @@ class HybridConfig:
     hold_exit_dv_frac: float = 0.03   # exit HOLD if voltage drifts >3% vs lock reference
     hold_revalidate_period_s: float = 0.10  # every 0.10s, run a few local steps to re-check slope
     hold_revalidate_cycles: int = 5         # number of NORMAL (S1) steps during revalidation
-
+    # Periodic GMPP re-check (forces occasional GLOBAL_SEARCH even without PSD)
+    global_recheck_period_s: float = 0.75   # 0 disables periodic recheck
+    global_recheck_cooldown_s: float = 0.50 # minimum spacing between global searches
+    global_recheck_min_gain_frac: float = 0.01  # 1% power improvement to count as "found better peak"
 
 class HybridMPPT:
     """Condition-aware hybrid MPPT controller with a simple state machine."""
@@ -81,6 +84,16 @@ class HybridMPPT:
         self._hold_v_ref: Optional[float] = None
         self._hold_elapsed_s: float = 0.0
         self._reval_remaining: int = 0
+        
+        # Periodic global re-check timers (GMPP robustness)
+        self._since_global_s: float = 0.0
+        self._global_cooldown_s: float = 0.0
+
+        # GLOBAL_SEARCH bookkeeping (measure whether we actually improved)
+        self._global_entry_reason: Optional[str] = None
+        self._global_p_before: Optional[float] = None
+        self._global_best_p: Optional[float] = None
+        self._global_best_v: Optional[float] = None
 
         # Event log for frontend (state changes, PSD triggers, safety trips)
         self.events: list[dict] = []
@@ -98,6 +111,13 @@ class HybridMPPT:
         self._hold_v_ref = None
         self._hold_elapsed_s = 0.0
         self._reval_remaining = 0
+        
+        self._since_global_s = 0.0
+        self._global_cooldown_s = 0.0
+        self._global_entry_reason = None
+        self._global_p_before = None
+        self._global_best_p = None
+        self._global_best_v = None
 
     # Core step
     def step(self, m: "Measurement") -> "Action":
@@ -120,7 +140,14 @@ class HybridMPPT:
                 "i": m.i,
             })
             return Action(v_ref=safe_v, debug={"state": "SAFETY", "fault": status})
+        
+        # Time bookkeeping (dt may be missing in some sims; treat as 0)
+        dt = float(getattr(m, "dt", 0.0) or 0.0)
 
+        # Update periodic search timers (don’t run these in INIT)
+        if self.state != State.INIT:
+            self._since_global_s += dt
+            self._global_cooldown_s = max(0.0, self._global_cooldown_s - dt)
         if self.state == State.INIT:
             self.s1.reset(); self.s3.reset(); self.s4.reset(); self.psd.reset()
             self.state = State.NORMAL
@@ -128,6 +155,28 @@ class HybridMPPT:
         if self.state == State.NORMAL:
             a = self.s1.step(m)
             self._last_good_v = a.v_ref if a.v_ref is not None else m.v
+            
+            # Periodic global re-check (helps escape stable local maxima under partial shading)
+            if (
+                self.cfg.global_recheck_period_s > 0
+                and self._since_global_s >= float(self.cfg.global_recheck_period_s)
+                and self._global_cooldown_s <= 0.0
+            ):
+                self.events.append({"t": m.t, "type": "state_change", "from": State.NORMAL.value, "to": State.GLOBAL_SEARCH.value})
+                self.state = State.GLOBAL_SEARCH
+                self.s3.reset()
+                # Bookkeeping for whether the search actually improved power
+                self._since_global_s = 0.0
+                self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                self._global_entry_reason = "periodic_recheck"
+                self._global_p_before = float(m.p)
+                self._global_best_p = float(m.p)
+                self._global_best_v = float(m.v)
+                dbg = dict(a.debug) if a.debug else {}
+                dbg.update({"state": State.NORMAL.value, "next_state": State.GLOBAL_SEARCH.value, "reason": "periodic_recheck"})
+                a.debug = dbg
+                return Action(v_ref=m.v, debug=dbg)
+            
             # Decide if we need a global search burst
             if self.psd.update_and_check(m):
                 # Events: PSD trigger and state change NORMAL -> GLOBAL_SEARCH
@@ -135,33 +184,56 @@ class HybridMPPT:
                 self.events.append({"t": m.t, "type": "state_change", "from": State.NORMAL.value, "to": State.GLOBAL_SEARCH.value})
                 self.state = State.GLOBAL_SEARCH
                 self.s3.reset()
+                
+                self._since_global_s = 0.0
+                self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                self._global_entry_reason = "psd_trigger"
+                self._global_p_before = float(m.p)
+                self._global_best_p = float(m.p)
+                self._global_best_v = float(m.v)
+                
                 # Mark the transition on the Action for UI/telemetry
                 dbg = dict(a.debug) if a.debug else {}
                 dbg.update({"state": State.NORMAL.value, "next_state": State.GLOBAL_SEARCH.value, "reason": "psd_trigger"})
                 a.debug = dbg
-                return a
+                return Action(v_ref=m.v, debug=dbg)
             return self._with_state(a, State.NORMAL)
 
         if self.state == State.GLOBAL_SEARCH:
             a = self.s3.step(m)
+            
+            # Track best power seen during global search
+            if self._global_best_p is None or float(m.p) > float(self._global_best_p):
+                self._global_best_p = float(m.p)
+                self._global_best_v = float(m.v)
+            
             # Heuristic: PSO implementation sets debug["phase"] = 2 when locking to gbest
             phase = int(a.debug.get("phase", 1)) if a.debug else 1
-            if phase == 2:
+            done = bool(a.debug.get("done", False)) if a.debug else False
+            if phase == 2 or done:
+                # If periodic check didn’t find a meaningfully better peak, log it (useful for validation)
+                if self._global_p_before is not None and self._global_best_p is not None and self._global_p_before > 1e-12:
+                    gain_frac = (float(self._global_best_p) - float(self._global_p_before)) / float(self._global_p_before)
+                    if self._global_entry_reason == "periodic_recheck" and gain_frac < float(self.cfg.global_recheck_min_gain_frac):
+                        self.events.append({"t": m.t, "type": "global_search_no_improve", "gain_frac": float(gain_frac)})
+                
                 self.events.append({"t": m.t, "type": "state_change", "from": State.GLOBAL_SEARCH.value, "to": State.LOCK_HOLD.value})
                 self.state = State.LOCK_HOLD
                 self.s4.reset()
+                
                 # Establish lock references for drift detection + periodic revalidation
                 self._hold_p_ref = float(m.p)
                 self._hold_v_ref = float(m.v)
                 self._hold_elapsed_s = 0.0
                 self._reval_remaining = 0
+                
                 # Mark the transition on the Action
                 dbg = dict(a.debug) if a.debug else {}
                 dbg.update({"state": State.GLOBAL_SEARCH.value, "next_state": State.LOCK_HOLD.value, "reason": "phase_lock"})
                 a.debug = dbg
                 return a
             return self._with_state(a, State.GLOBAL_SEARCH)
-
+        
         if self.state == State.LOCK_HOLD:
             # Accumulate time spent in HOLD
             self._hold_elapsed_s += float(getattr(m, "dt", 0.0) or 0.0)
@@ -174,8 +246,16 @@ class HybridMPPT:
                     self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
                     self.state = State.GLOBAL_SEARCH
                     self.s3.reset()
-                    return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "power_drop", "dp_frac": float(dp_frac)})
 
+                    self._since_global_s = 0.0
+                    self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                    self._global_entry_reason = "power_drop"
+                    self._global_p_before = float(m.p)
+                    self._global_best_p = float(m.p)
+                    self._global_best_v = float(m.v)
+
+                    return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "power_drop", "dp_frac": float(dp_frac)})
+                    
             if self._hold_v_ref is not None and abs(float(self._hold_v_ref)) > 1e-12:
                 dv_frac = abs(float(m.v) - float(self._hold_v_ref)) / abs(float(self._hold_v_ref))
                 if dv_frac > float(self.cfg.hold_exit_dv_frac):
@@ -183,8 +263,39 @@ class HybridMPPT:
                     self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
                     self.state = State.GLOBAL_SEARCH
                     self.s3.reset()
-                    return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "voltage_drift", "dv_frac": float(dv_frac)})
 
+                    # --- GLOBAL_SEARCH bookkeeping (missing before) ---
+                    self._since_global_s = 0.0
+                    self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                    self._global_entry_reason = "voltage_drift"
+                    self._global_p_before = float(m.p)
+                    self._global_best_p = float(m.p)
+                    self._global_best_v = float(m.v)
+                    # -----------------------------------------------
+
+                    return Action(
+                        v_ref=m.v,
+                        debug={"state": State.GLOBAL_SEARCH.value, "reason": "voltage_drift", "dv_frac": float(dv_frac)}
+                    )
+            
+            # Periodic global re-check even while holding (prevents “stuck on local peak”)
+            if (
+                self.cfg.global_recheck_period_s > 0
+                and self._since_global_s >= float(self.cfg.global_recheck_period_s)
+                and self._global_cooldown_s <= 0.0
+                and self._reval_remaining == 0
+            ):
+                self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
+                self.state = State.GLOBAL_SEARCH
+                self.s3.reset()
+                self._since_global_s = 0.0
+                self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                self._global_entry_reason = "periodic_recheck"
+                self._global_p_before = float(m.p)
+                self._global_best_p = float(m.p)
+                self._global_best_v = float(m.v)
+                return Action(v_ref=m.v, debug={"state": State.GLOBAL_SEARCH.value, "reason": "periodic_recheck"})
+            
             # Periodic revalidation: occasionally run a few local (S1) steps to re-check slope
             if self.cfg.hold_revalidate_period_s > 0 and self._hold_elapsed_s >= float(self.cfg.hold_revalidate_period_s) and self._reval_remaining == 0:
                 self._reval_remaining = int(self.cfg.hold_revalidate_cycles)
@@ -201,6 +312,12 @@ class HybridMPPT:
                     self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
                     self.state = State.GLOBAL_SEARCH
                     self.s3.reset()
+                    self._since_global_s = 0.0
+                    self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                    self._global_entry_reason = "psd_reval"
+                    self._global_p_before = float(m.p)
+                    self._global_best_p = float(m.p)
+                    self._global_best_v = float(m.v)
                     return self._with_state(a, State.GLOBAL_SEARCH)
                 # When revalidation completes, refresh lock references
                 if self._reval_remaining == 0:
@@ -229,6 +346,7 @@ class HybridMPPT:
                 dbg = dict(a.debug) if a.debug else {}
                 dbg.update({"state": State.LOCK_HOLD.value, "next_state": State.NORMAL.value, "reason": "quiet_hold"})
                 a.debug = dbg
+                return self._with_state(a, State.NORMAL)
 
             # Re-check PSC in case conditions changed again
             if self.psd.update_and_check(m):
@@ -236,11 +354,16 @@ class HybridMPPT:
                 self.events.append({"t": m.t, "type": "state_change", "from": State.LOCK_HOLD.value, "to": State.GLOBAL_SEARCH.value})
                 self.state = State.GLOBAL_SEARCH
                 self.s3.reset()
+                self._since_global_s = 0.0
+                self._global_cooldown_s = float(self.cfg.global_recheck_cooldown_s)
+                self._global_entry_reason = "psd_trigger"
+                self._global_p_before = float(m.p)
+                self._global_best_p = float(m.p)
+                self._global_best_v = float(m.v)
                 # Mark the transition on the Action
                 dbg = dict(a.debug) if a.debug else {}
                 dbg.update({"state": State.LOCK_HOLD.value, "next_state": State.GLOBAL_SEARCH.value, "reason": "psd_trigger"})
-                a.debug = dbg
-                return a
+                return Action(v_ref=m.v, debug=dbg)
 
             return self._with_state(a, State.LOCK_HOLD)
 
@@ -298,10 +421,32 @@ class HybridMPPT:
                 {"name": "imax",    "type": "number", "unit": "A",     "default": float(safety.imax)},
                 {"name": "pmax",    "type": "number", "unit": "W",     "default": float(safety.pmax)},
                 {"name": "tmod_max","type": "number", "unit": "°C",    "default": float(safety.tmod_max)},
-                {"name": "quiet_cycles","type": "integer",              "default": int(self.cfg.quiet_cycles), "help": "S4→S1 hold hysteresis"},
             ],
         }
-        return {"s1": s1_desc, "s3": s3_desc, "s4": s4_desc, "psd": psd_schema, "safety": safety_schema}
+        controller_schema = {
+            "key": "controller",
+            "label": "Controller",
+            "params": [
+                {"name": "quiet_cycles", "type": "integer", "min": 0, "max": 50, "step": 1,
+                "default": int(self.cfg.quiet_cycles), "help": "S4→S1 hold hysteresis (quiet ESC gradient cycles)"},
+                {"name": "hold_exit_dp_frac", "type": "number", "min": 0.0, "max": 0.5, "step": 0.005,
+                "default": float(self.cfg.hold_exit_dp_frac), "help": "Exit HOLD if power drops by this fraction vs lock reference"},
+                {"name": "hold_exit_dv_frac", "type": "number", "min": 0.0, "max": 0.5, "step": 0.005,
+                "default": float(self.cfg.hold_exit_dv_frac), "help": "Exit HOLD if voltage drifts by this fraction vs lock reference"},
+                {"name": "hold_revalidate_period_s", "type": "number", "min": 0.0, "max": 5.0, "step": 0.01,
+                "default": float(self.cfg.hold_revalidate_period_s), "help": "Every N seconds, run a few S1 steps to re-check slope"},
+                {"name": "hold_revalidate_cycles", "type": "integer", "min": 0, "max": 100, "step": 1,
+                "default": int(self.cfg.hold_revalidate_cycles), "help": "Number of S1 steps used during HOLD revalidation"},
+                {"name": "global_recheck_period_s", "type": "number", "min": 0.0, "max": 10.0, "step": 0.05,
+                "default": float(self.cfg.global_recheck_period_s), "help": "Force periodic GLOBAL_SEARCH even if PSD never triggers (0 disables)"},
+                {"name": "global_recheck_cooldown_s", "type": "number", "min": 0.0, "max": 10.0, "step": 0.05,
+                "default": float(self.cfg.global_recheck_cooldown_s), "help": "Minimum spacing between GLOBAL_SEARCH entries"},
+                {"name": "global_recheck_min_gain_frac", "type": "number", "min": 0.0, "max": 0.5, "step": 0.005,
+                "default": float(self.cfg.global_recheck_min_gain_frac), "help": "If periodic search yields less than this gain, log 'no_improve'"},
+                ],
+            }
+        
+        return {"s1": s1_desc, "s3": s3_desc, "s4": s4_desc, "psd": psd_schema, "safety": safety_schema, "controller": controller_schema}
 
     def get_config(self) -> Dict[str, Any]:
         """Return current config snapshot suitable for JSON serialization."""
@@ -313,7 +458,17 @@ class HybridMPPT:
             "psd": dict(self.cfg.psd),
             "safety": asdict(self.cfg.safety),
             "quiet_cycles": self.cfg.quiet_cycles,
-        }
+            "controller": {
+                "quiet_cycles": self.cfg.quiet_cycles,
+                "hold_exit_dp_frac": self.cfg.hold_exit_dp_frac,
+                "hold_exit_dv_frac": self.cfg.hold_exit_dv_frac,
+                "hold_revalidate_period_s": self.cfg.hold_revalidate_period_s,
+                "hold_revalidate_cycles": self.cfg.hold_revalidate_cycles,
+                "global_recheck_period_s": self.cfg.global_recheck_period_s,
+                "global_recheck_cooldown_s": self.cfg.global_recheck_cooldown_s,
+                "global_recheck_min_gain_frac": self.cfg.global_recheck_min_gain_frac,
+                },
+            }
 
     def update_params(self, section: str, **kw: Any) -> None:
         """Apply live parameter updates to a section ('s1'|'s3'|'s4'|'psd'|'safety'|'controller')."""
@@ -343,4 +498,13 @@ class HybridMPPT:
         elif sec == "controller":
             if "quiet_cycles" in kw:
                 self.cfg.quiet_cycles = int(kw["quiet_cycles"])
+            for k in [
+                "hold_exit_dp_frac", "hold_exit_dv_frac",
+                "hold_revalidate_period_s", "hold_revalidate_cycles",
+                "global_recheck_period_s", "global_recheck_cooldown_s",
+                "global_recheck_min_gain_frac",
+            ]:
+                if k in kw and hasattr(self.cfg, k):
+                    v = kw[k]
+                    setattr(self.cfg, k, int(v) if k.endswith("_cycles") else float(v))
         # else: ignore unknown section silently (non-breaking)
