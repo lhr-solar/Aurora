@@ -59,6 +59,14 @@ class RunData:
     state: List[str]
     reason: List[Optional[str]]
 
+    # Robust GMPP telemetry (optional; may be NaN for older runs)
+    v_gmp_ref: List[float]
+    p_gmp_ref: List[float]
+    v_best: List[float]
+    p_best: List[float]
+    eff_best: List[float]
+    g_strings: List[Optional[str]]
+
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -104,6 +112,13 @@ def load_run_csv(path: Path) -> RunData:
     state: List[str] = []
     reason: List[Optional[str]] = []
 
+    v_gmp_ref: List[float] = []
+    p_gmp_ref: List[float] = []
+    v_best: List[float] = []
+    p_best: List[float] = []
+    eff_best: List[float] = []
+    g_strings: List[Optional[str]] = []
+
     last_state = "UNKNOWN"
 
     with path.open("r", newline="") as f:
@@ -119,6 +134,15 @@ def load_run_csv(path: Path) -> RunData:
             g.append(float(_safe_float(row.get("g")) or float("nan")))
             t_mod.append(float(_safe_float(row.get("t_mod")) or float("nan")))
 
+            # GMPP reference/validator columns
+            v_gmp_ref.append(float(_safe_float(row.get("v_gmp_ref")) or float("nan")))
+            p_gmp_ref.append(float(_safe_float(row.get("p_gmp_ref")) or float("nan")))
+            v_best.append(float(_safe_float(row.get("v_best")) or float("nan")))
+            p_best.append(float(_safe_float(row.get("p_best")) or float("nan")))
+            eff_best.append(float(_safe_float(row.get("eff_best")) or float("nan")))
+            gs = row.get("g_strings")
+            g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
+
             ad = row.get("action_debug")
             st = None
             rsn = None
@@ -131,7 +155,23 @@ def load_run_csv(path: Path) -> RunData:
             state.append(last_state)
             reason.append(rsn if isinstance(rsn, str) and rsn else None)
 
-    return RunData(path=path, t=t, v=v, i=i, p=p, g=g, t_mod=t_mod, state=state, reason=reason)
+    return RunData(
+        path=path,
+        t=t,
+        v=v,
+        i=i,
+        p=p,
+        g=g,
+        t_mod=t_mod,
+        state=state,
+        reason=reason,
+        v_gmp_ref=v_gmp_ref,
+        p_gmp_ref=p_gmp_ref,
+        v_best=v_best,
+        p_best=p_best,
+        eff_best=eff_best,
+        g_strings=g_strings,
+    )
 
 
 def load_env_profile_csv(path: Path):
@@ -196,6 +236,7 @@ class _MPPTWorker(QThread):
         total_time: float,
         dt: float,
         overrides: Optional[LiveOverrides],
+        gmpp_ref: bool,
     ) -> None:
         super().__init__()
         self.out_path = out_path
@@ -206,6 +247,7 @@ class _MPPTWorker(QThread):
         self.total_time = total_time
         self.dt = dt
         self.overrides = overrides
+        self.gmpp_ref = bool(gmpp_ref)
         self._stop = False
 
     def request_stop(self) -> None:
@@ -232,6 +274,12 @@ class _MPPTWorker(QThread):
                 "t_mod",
                 "v_ref",
                 "action_debug",
+                "v_gmp_ref",
+                "p_gmp_ref",
+                "v_best",
+                "p_best",
+                "eff_best",
+                "g_strings"
             ]
 
             with self.out_path.open("w", newline="") as f:
@@ -241,7 +289,9 @@ class _MPPTWorker(QThread):
                 def _on_sample(rec: Dict[str, Any]) -> None:
                     action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
                     debug = action.get("debug") if isinstance(action.get("debug"), dict) else {}
+                    gmpp = rec.get("gmpp") if isinstance(rec.get("gmpp"), dict) else {}
                     v_ref = action.get("v_ref")
+                    g_strings = rec.get("g_strings")
 
                     row = {
                         "t": rec.get("t"),
@@ -253,6 +303,12 @@ class _MPPTWorker(QThread):
                         "t_mod": rec.get("t_mod"),
                         "v_ref": v_ref,
                         "action_debug": repr(debug),
+                        "v_gmp_ref": gmpp.get("v_gmp_ref"),
+                        "p_gmp_ref": gmpp.get("p_gmp_ref"),
+                        "v_best": gmpp.get("v_best"),
+                        "p_best": gmpp.get("p_best"),
+                        "eff_best": gmpp.get("eff_best"),
+                        "g_strings": repr(g_strings) if g_strings is not None else "",
                     }
                     writer.writerow(row)
                     f.flush()
@@ -264,6 +320,9 @@ class _MPPTWorker(QThread):
                     env_profile=profile,
                     controller_cfg=hcfg,
                     overrides=self.overrides,
+                    gmpp_ref=self.gmpp_ref,
+                    gmpp_ref_period_s=0.05,
+                    gmpp_ref_points=121,
                     on_sample=_on_sample,
                 )
 
@@ -394,6 +453,11 @@ class LabDashboard(QWidget):
         self.out_edit = QLineEdit("mppt_run.csv")
         row3.addWidget(self.out_edit, 1)
         left_l.addLayout(row3)
+
+        # Robust GMPP validator toggle
+        self.gmpp_chk = QCheckBox("Compute GMPP reference")
+        self.gmpp_chk.setChecked(True)
+        left_l.addWidget(self.gmpp_chk)
 
         btn_row = QHBoxLayout()
         self.btn_run = QPushButton("Run")
@@ -617,7 +681,12 @@ class LabDashboard(QWidget):
             self._worker = None
 
         # Reset run data
-        self._rd = RunData(path=out_path, t=[], v=[], i=[], p=[], g=[], t_mod=[], state=[], reason=[])
+        self._rd = RunData(
+            path=out_path,
+            t=[], v=[], i=[], p=[], g=[], t_mod=[],
+            state=[], reason=[],
+            v_gmp_ref=[], p_gmp_ref=[], v_best=[], p_best=[], eff_best=[], g_strings=[],
+        )
 
         self._log(f"[ui] Starting MPPT -> {out_path}")
         if use_csv:
@@ -637,6 +706,7 @@ class LabDashboard(QWidget):
             total_time=sim_time,
             dt=dt,
             overrides=self.overrides,
+            gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
         )
         w.sample.connect(self._on_live_sample)
         w.failed.connect(self._on_worker_failed)
@@ -688,6 +758,15 @@ class LabDashboard(QWidget):
         rd.p.append(float(_safe_float(row.get("p")) or float("nan")))
         rd.g.append(float(_safe_float(row.get("g")) or float("nan")))
         rd.t_mod.append(float(_safe_float(row.get("t_mod")) or float("nan")))
+
+        # Append GMPP reference/validator fields
+        rd.v_gmp_ref.append(float(_safe_float(row.get("v_gmp_ref")) or float("nan")))
+        rd.p_gmp_ref.append(float(_safe_float(row.get("p_gmp_ref")) or float("nan")))
+        rd.v_best.append(float(_safe_float(row.get("v_best")) or float("nan")))
+        rd.p_best.append(float(_safe_float(row.get("p_best")) or float("nan")))
+        rd.eff_best.append(float(_safe_float(row.get("eff_best")) or float("nan")))
+        gs = row.get("g_strings")
+        rd.g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
 
         ad = row.get("action_debug")
         st = None
@@ -778,5 +857,12 @@ class LabDashboard(QWidget):
         self.v_plot.plot(rd.t, rd.v)
         self.p_plot.plot(rd.t, rd.p)
 
+        # Overlay GMPP reference power if present (robust-GMPP validator)
+        if hasattr(rd, "p_gmp_ref") and rd.p_gmp_ref and any(x == x for x in rd.p_gmp_ref):
+            self.p_plot.plot(rd.t, rd.p_gmp_ref)
+
         if rd.t:
             self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
+
+        if hasattr(self, "gmpp_chk"):
+            self._log(f"[ui] gmpp_ref={self.gmpp_chk.isChecked()}")

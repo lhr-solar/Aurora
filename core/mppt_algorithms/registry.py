@@ -19,12 +19,14 @@ _REGISTRY = {
     "pando":  ("core.mppt_algorithms.local.pando", "PANDO"),
     "pso":    ("core.mppt_algorithms.global_search.pso", "PSO"),
     "nl_esc": ("core.mppt_algorithms.hold.nl_esc", "NL_ESC"),
+    "sweep":  ("core.mppt_algorithms.global_search.sweep", "Sweep")
 }
 
 # Optional user-facing aliases → canonical names (helps FE accept friendly inputs)
 _ALIASES = {
     "p&o": "pando",
     "po": "pando",
+    "gmpp": "sweep"
 }
 
 def register(name: str, module_path: str, class_name: str) -> None:

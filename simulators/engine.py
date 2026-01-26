@@ -16,8 +16,8 @@ This is intentionally lightweight and dependency-free so it can run inside
 bench scripts, Jupyter, or a desktop UI callback.
 """
 
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Optional, Iterable, Generator, Tuple, Callable
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Iterable, Generator, Tuple, Callable, Union, Sequence
 
 # PV plant imports
 from core.src.cell import Cell
@@ -93,10 +93,31 @@ class PVPlant:
         self._temperature = 25.0   # °C
         self.set_conditions(self._irradiance, self._temperature)
 
-    def set_conditions(self, irradiance: float, temperature_c: float) -> None:
-        self._irradiance = float(irradiance)
+    def set_conditions(self, irradiance: Union[float, Sequence[float]], temperature_c: float) -> None:
         self._temperature = float(temperature_c)
-        # broadcast to array
+
+        # Per-string irradiance support (partial shading)
+        if isinstance(irradiance, (list, tuple)):
+            g_list = [float(x) for x in irradiance]
+            self._irradiance = float(sum(g_list) / max(len(g_list), 1))
+
+            strings = getattr(self.array, "string_list", None)
+            if strings is None:
+                raise AttributeError("Array has no string_list; cannot apply per-string irradiance shading.")
+
+            if len(g_list) != len(strings):
+                raise ValueError(f"Per-string irradiance length {len(g_list)} != n_strings {len(strings)}")
+
+            for s, g in zip(strings, g_list):
+                s.set_conditions(float(g), self._temperature)
+
+            # Clear IV cache if present (important)
+            if hasattr(self.array, "cached_iv"):
+                self.array.cached_iv = None
+            return
+
+        # Scalar irradiance (broadcast)
+        self._irradiance = float(irradiance)
         self.array.set_conditions(self._irradiance, self._temperature)
 
     def step(self, v: float) -> Tuple[float, float]:
@@ -118,10 +139,6 @@ class PVPlant:
         i = i_fn(v)
         return float(v), float(i)
 
-# Live environment overrides dataclass
-from dataclasses import dataclass
-from typing import Optional
-
 @dataclass
 class LiveOverrides:
     """Live environment overrides that can be mutated while a simulation runs.
@@ -129,8 +146,8 @@ class LiveOverrides:
     If a field is not None, it takes precedence over the configured constant
     values and any env_profile-derived values.
     """
-    irradiance: Optional[float] = None      # W/m^2
-    temperature_c: Optional[float] = None   # °C
+    irradiance: Optional[Union[float, Sequence[float]]] = None
+    temperature_c: Optional[float] = None
 
 # Simulation config / result types
 @dataclass
@@ -138,13 +155,17 @@ class SimulationConfig:
     total_time: float = 1.0        # seconds
     dt: float = 1e-3               # control / sample period
     start_v: float = 20.0          # initial array voltage guess
-    irradiance: float = 1000.0     # W/m^2
+    irradiance: Union[float, Sequence[float]] = 1000.0     # W/m^2
     temperature_c: float = 25.0    # deg C
     array_kwargs: Dict[str, Any] = None
     controller_cfg: Optional[HybridConfig] = None
+    # GMPP reference (ground truth) computation
+    gmpp_ref: bool = False
+    gmpp_ref_period_s: float = 0.05   # compute reference every 50ms
+    gmpp_ref_points: int = 121        # sweep resolution for reference
 
     # Optional: time-varying environment as list of (time_s, irradiance, temp_c)
-    env_profile: Optional[List[Tuple[float, float, float]]] = None
+    env_profile: Optional[List[Tuple[float, Union[float, Sequence[float]], float]]] = None
     # Optional: per-sample callback for UIs/loggers
     on_sample: Optional[Callable[[Dict[str, Any]], None]] = None
     # Optional: live overrides (shared object mutated by UI)
@@ -159,7 +180,7 @@ class SimulationConfig:
             return HybridMPPT()
         return HybridMPPT(self.controller_cfg)
 
-    def env_at(self, t: float) -> Tuple[float, float]:
+    def env_at(self, t: float) -> Tuple[Union[float, Sequence[float]], float]:
         """Return (irradiance, temperature_c) for time t.
 
         Priority (highest first):
@@ -184,11 +205,12 @@ class SimulationConfig:
         # Live overrides win
         if self.overrides is not None:
             if self.overrides.irradiance is not None:
-                latest_g = float(self.overrides.irradiance)
+                latest_g = self.overrides.irradiance  # keep scalar OR sequence
             if self.overrides.temperature_c is not None:
                 latest_t = float(self.overrides.temperature_c)
 
-        return float(latest_g), float(latest_t)
+        # Return irradiance as-is (float or sequence), temp as float
+        return latest_g, float(latest_t)
 
 # Engine
 class SimulationEngine:
@@ -211,6 +233,47 @@ class SimulationEngine:
 
         # environment
         self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
+    
+    def _get_v_bounds(self) -> Tuple[float, float]:
+        # Prefer controller cfg bounds if present
+        vmin = 0.0
+        vmax = 100.0
+        cfg = getattr(self.ctrl, "cfg", None)
+        if cfg is not None:
+            if hasattr(cfg, "vmin"):
+                vmin = float(cfg.vmin)
+            if hasattr(cfg, "vmax"):
+                vmax = float(cfg.vmax)
+
+        # If array exposes voc(), prefer that as an upper bound
+        voc = getattr(self.array, "voc", None)
+        try:
+            if callable(voc):
+                vmax = max(vmax, float(voc()))
+            elif voc is not None:
+                vmax = max(vmax, float(voc))
+        except Exception:
+            pass
+
+        return float(vmin), float(vmax)
+
+    def _gmpp_reference(self, i_fn, points: int) -> Tuple[float, float]:
+        """Return (v_gmp, p_gmp) via a deterministic sweep using array current-at-voltage."""
+        vmin, vmax = self._get_v_bounds()
+        n = max(11, int(points))
+        if vmax - vmin < 1e-9:
+            return float(vmin), 0.0
+
+        best_v = vmin
+        best_p = -1e18
+        for k in range(n):
+            v = vmin + (vmax - vmin) * (k / (n - 1))
+            i = float(i_fn(v))
+            p = float(v * i)
+            if p > best_p:
+                best_p = p
+                best_v = v
+        return float(best_v), float(best_p)
 
     def run(self) -> Generator[Dict[str, Any], None, None]:
         """
@@ -218,10 +281,15 @@ class SimulationEngine:
         """
         t = 0.0
         v = self.cfg.start_v
+        p_best = -1e18
+        v_best = v
+        last_ref = None
+        next_ref_t = 0.0
 
         # resolve environment at t=0
         g0, t0 = self.cfg.env_at(t)
         self.plant.set_conditions(g0, t0)
+        g0_vec = list(g0) if isinstance(g0, (list, tuple)) else None
 
         # Prime the controller with an INIT measurement
         # Array API compatibility (same logic as PVPlant.step)
@@ -236,10 +304,31 @@ class SimulationEngine:
                 "Array object has no callable method to compute current at a voltage. "
                 "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
             )
-        i = i_fn(v)
-        m = Measurement(t=t, v=v, i=i, g=g0, t_mod=t0, dt=self.cfg.dt)
+        i = float(i_fn(v))
+        g_meas = float(sum(g0) / len(g0)) if isinstance(g0, (list, tuple)) else float(g0)
+        m = Measurement(t=t, v=v, i=i, g=g_meas, t_mod=t0, dt=self.cfg.dt)
         a = self.ctrl.step(m)
-        rec = self._to_record(m, a)
+        if m.p > p_best:
+            p_best = float(m.p)
+            v_best = float(m.v)
+
+        gmpp = None
+        if self.cfg.gmpp_ref:
+            v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+            eff = float(p_best / max(p_gmp, 1e-12))
+            gmpp = {
+                "v_gmp_ref": float(v_gmp),
+                "p_gmp_ref": float(p_gmp),
+                "v_best": float(v_best),
+                "p_best": float(p_best),
+                "eff_best": float(eff),
+            }
+            last_ref = gmpp
+            next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
+        extra0 = {"gmpp": gmpp} if gmpp else {}
+        if g0_vec is not None:
+            extra0["g_strings"] = g0_vec
+        rec = self._to_record(m, a, extra=extra0 if extra0 else None)
         if self.on_sample is not None:
             self.on_sample(rec)
         yield rec
@@ -256,29 +345,58 @@ class SimulationEngine:
 
             # measure plant at that voltage
             g_now, t_now = self.cfg.env_at(t)
+            g_vec = list(g_now) if isinstance(g_now, (list, tuple)) else None
             self.plant.set_conditions(g_now, t_now)
             v, i = self.plant.step(v_cmd)
 
+            g_meas = float(sum(g_now) / len(g_now)) if isinstance(g_now, (list, tuple)) else float(g_now)
             m = Measurement(
                 t=t,
                 v=v,
                 i=i,
-                g=g_now,
+                g=g_meas,
                 t_mod=t_now,
                 dt=self.cfg.dt,
             )
-
+            if m.p > p_best:
+                p_best = float(m.p)
+                v_best = float(m.v)
+            gmpp = None
+            if self.cfg.gmpp_ref and t >= next_ref_t:
+                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+                eff = float(p_best / max(p_gmp, 1e-12))
+                gmpp = {
+                    "v_gmp_ref": float(v_gmp),
+                    "p_gmp_ref": float(p_gmp),
+                    "v_best": float(v_best),
+                    "p_best": float(p_best),
+                    "eff_best": float(eff),
+                }
+                last_ref = gmpp
+                next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
+            elif last_ref is not None:
+                # Reuse last reference volt/power, but keep best-so-far and efficiency up to date
+                gmpp = dict(last_ref)
+                p_gmp_ref = float(gmpp.get("p_gmp_ref", float("nan")))
+                if p_gmp_ref == p_gmp_ref:  # not NaN
+                    gmpp["v_best"] = float(v_best)
+                    gmpp["p_best"] = float(p_best)
+                    gmpp["eff_best"] = float(p_best / max(p_gmp_ref, 1e-12))
+                last_ref = gmpp
             # controller next step
             a = self.ctrl.step(m)
 
             # emit a JSON-friendly record
-            rec = self._to_record(m, a)
+            extra = {"gmpp": gmpp} if gmpp else {}
+            if g_vec is not None:
+                extra["g_strings"] = g_vec
+            rec = self._to_record(m, a, extra=extra if extra else None)
             if self.on_sample is not None:
                 self.on_sample(rec)
             yield rec
 
     @staticmethod
-    def _to_record(m: Measurement, a: Action) -> Dict[str, Any]:
+    def _to_record(m: Measurement, a: Action, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         rec = {
             "t": m.t,
             "v": m.v,
@@ -289,6 +407,8 @@ class SimulationEngine:
             "dt": m.dt,
             "action": a.to_dict(),
         }
+        if extra:
+            rec.update(extra)
         return rec
 
 # CLI demo
