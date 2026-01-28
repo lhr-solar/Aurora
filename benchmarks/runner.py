@@ -1,5 +1,3 @@
-
-
 """Benchmark runner for Aurora MPPT algorithms.
 
 This module is intentionally *thin* on assumptions about your project structure.
@@ -22,13 +20,15 @@ If your engine uses different names, adjust `extract_*` helpers below.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from core.controller.hybrid_controller import HybridConfig
 
 
 # --- Imports from Aurora ------------------------------------------------------
@@ -307,35 +307,138 @@ def default_scenarios() -> List[ScenarioSpec]:
 
 
 def default_algorithms() -> List[AlgorithmSpec]:
-    """Return placeholder algorithms.
+    """Fallback algorithms if you don't use --use-registry.
 
-    IMPORTANT: Replace these with your real controller configs.
-
-    In many Aurora setups, `controller_cfg` is a `HybridControllerConfig` or
-    similar dataclass; you likely already have a registry of configs.
+    These use HybridConfig defaults but vary the NORMAL tracker.
     """
+    return [
+        AlgorithmSpec(name="ruca", controller_cfg=HybridConfig(normal_name="ruca")),
+        AlgorithmSpec(name="mepo", controller_cfg=HybridConfig(normal_name="mepo")),
+        AlgorithmSpec(name="pando", controller_cfg=HybridConfig(normal_name="pando")),
+    ]
 
-    raise RuntimeError(
-        "No default algorithms are defined. Edit benchmarks/runner.py and "
-        "populate default_algorithms() with your controller configs, or use the "
-        "--use-registry option after wiring `resolve_algorithms_from_registry()`."
-    )
+
+def _load_mppt_registry_map() -> Dict[str, str]:
+    """Load the MPPT algorithm registry as name -> "module:Class".
+
+    Uses Aurora's lazy MPPT registry at `core.mppt_algorithms.registry`.
+    Returns a dict like {"ruca": "core....:RUCA", ...}.
+    """
+    mod = importlib.import_module("core.mppt_algorithms.registry")
+    available_fn = getattr(mod, "available", None)
+    if not callable(available_fn):
+        raise RuntimeError(
+            "core.mppt_algorithms.registry.available() not found/callable. "
+            "Ensure you are using Aurora's MPPT registry module."
+        )
+    reg_map = available_fn()
+    if not isinstance(reg_map, dict):
+        raise RuntimeError(
+            "core.mppt_algorithms.registry.available() did not return a dict. "
+            f"Got: {type(reg_map)}"
+        )
+    return {str(k): str(v) for k, v in reg_map.items()}
+
+
+def list_registry_algorithms() -> List[str]:
+    """Return sorted MPPT algorithm keys from the registry."""
+    return sorted(_load_mppt_registry_map().keys())
+
+
+def _parse_algo_spec(spec: str) -> HybridConfig:
+    """Parse a CLI algo spec into a HybridConfig.
+
+    Supported forms:
+      - "ruca"                 -> sets normal_name
+      - "normal=ruca"          -> sets normal_name
+      - "normal=ruca,global=pso,hold=nl_esc" -> sets names per state
+
+    Any unspecified fields use HybridConfig defaults.
+    """
+    spec = spec.strip()
+    if not spec:
+        return HybridConfig()
+
+    cfg = HybridConfig()
+
+    if "=" not in spec:
+        cfg.normal_name = spec
+        return cfg
+
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    kv = {}
+    for p in parts:
+        if "=" not in p:
+            raise ValueError(f"Invalid algo spec segment '{p}'. Expected key=value.")
+        k, v = p.split("=", 1)
+        kv[k.strip().lower()] = v.strip()
+
+    if "normal" in kv:
+        cfg.normal_name = kv["normal"]
+    if "global" in kv:
+        cfg.global_name = kv["global"]
+    if "hold" in kv:
+        cfg.hold_name = kv["hold"]
+
+    return cfg
 
 
 def resolve_algorithms_from_registry(names: Sequence[str]) -> List[AlgorithmSpec]:
-    """Optional helper: resolve algorithm configs from an existing registry.
+    """Resolve algorithm names (or specs) into HybridConfig controller_cfg objects.
 
-    If your repo has something like `mppt_algorithms/registry.py` exposing a dict
-    of configs, wire it here.
-
-    For now, this function raises with instructions so you don't silently run the
-    wrong thing.
+    In Aurora, `SimulationConfig.controller_cfg` expects a `HybridConfig`.
+    We treat each provided `name` as an MPPT registry key for the NORMAL tracker
+    unless the user provides a key=value spec.
     """
 
-    raise RuntimeError(
-        "Algorithm registry resolver not wired. Implement resolve_algorithms_from_registry() "
-        "for your repo, or hardcode AlgorithmSpec list in default_algorithms()."
-    )
+    reg_keys = _load_mppt_registry_map()
+    reg_lc = {k.lower(): k for k in reg_keys.keys()}
+
+    resolved: List[AlgorithmSpec] = []
+    missing: List[str] = []
+
+    for raw in names:
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        # Build HybridConfig from a spec, then validate selected algos exist
+        try:
+            hc = _parse_algo_spec(raw)
+        except Exception as e:
+            raise RuntimeError(f"Invalid algorithm spec '{raw}': {e}") from e
+
+        # Validate each chosen algorithm name exists in MPPT registry
+        for field_name, val in (
+            ("normal", hc.normal_name),
+            ("global", hc.global_name),
+            ("hold", hc.hold_name),
+        ):
+            key = val
+            if key not in reg_keys:
+                # case-insensitive match
+                hit = reg_lc.get(key.lower())
+                if hit is None:
+                    missing.append(f"{field_name}={val}")
+                else:
+                    # normalize casing
+                    if field_name == "normal":
+                        hc.normal_name = hit
+                    elif field_name == "global":
+                        hc.global_name = hit
+                    else:
+                        hc.hold_name = hit
+
+        # Name used for output filenames / tables
+        display_name = raw.replace(" ", "")
+        resolved.append(AlgorithmSpec(name=display_name, controller_cfg=hc))
+
+    if missing:
+        raise RuntimeError(
+            f"Unknown MPPT algorithm(s): {missing}. Available: {sorted(reg_keys.keys())}"
+        )
+
+    return resolved
 
 
 # --- Suite runner -------------------------------------------------------------
@@ -401,6 +504,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Optional: hook into registry
     p.add_argument("--use-registry", action="store_true", help="Resolve algorithms by name from a registry")
     p.add_argument("--algs", type=str, default="", help="Comma-separated algorithm names (registry mode)")
+    p.add_argument("--list-algs", action="store_true", help="List available MPPT algorithm keys and exit")
 
     return p.parse_args(argv)
 
@@ -415,6 +519,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     budgets = default_budgets()
 
     if args.use_registry:
+        if getattr(args, "list_algs", False):
+            for k in list_registry_algorithms():
+                print(k)
+            return 0
+
         names = [s.strip() for s in args.algs.split(",") if s.strip()]
         if not names:
             raise SystemExit("--use-registry requires --algs name1,name2,...")

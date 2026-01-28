@@ -130,5 +130,9 @@ def available() -> Dict[str, str]:
     """Return a mapping of registry names -> "module:Class" strings."""
     return {k: f"{mod}:{cls}" for k, (mod, cls) in _REGISTRY.items()}
 
+# Public aliases for tooling (benchmarks, UI, etc.)
+REGISTRY = _REGISTRY
+ALIASES = _ALIASES
+ALGORITHMS = sorted(_REGISTRY.keys())
 
-__all__ = ["build", "available", "register", "get_class", "catalog"]
+__all__ = ["build", "available", "register", "get_class", "catalog", "REGISTRY", "ALIASES", "ALGORITHMS"]
