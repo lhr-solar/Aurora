@@ -2,7 +2,7 @@
 
 Main application window for Aurora.
 
-- Central area: a single 'Live Bench' tab (LabDashboard)
+- Central area: tabs for 'Live Bench' (LabDashboard) and 'Benchmarks' (BenchmarksDashboard)
 - Bottom dock: shared TerminalPanel (run log)
 - Shared LiveOverrides instance for Option A live control
 
@@ -86,11 +86,19 @@ class MainWindow(QMainWindow):
         )
         self._tabs.addTab(self._lab_tab, "Live Bench")
 
+        self._bench_tab = self._load_dashboard(
+            module_path="ui.desktop.benchmarks_dashboard",
+            class_name="BenchmarksDashboard",
+            fallback_title="Benchmarks",
+        )
+        self._tabs.addTab(self._bench_tab, "Benchmarks")
+
         # Status bar message to confirm the shell is alive
         self.statusBar().showMessage("Ready")
 
         self.terminal.append_line("[ui] Aurora UI started")
         self.terminal.append_line("[ui] LiveOverrides ready")
+        self.terminal.append_line("[ui] Benchmarks tab ready")
 
     def _load_dashboard(
         self,

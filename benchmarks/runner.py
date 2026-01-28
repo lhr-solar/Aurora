@@ -270,6 +270,32 @@ def run_once(
     wall_s = time.perf_counter() - t0
 
     summary = summarize_records(algo, scenario, budget, records, wall_s)
+
+    # Attach richer metrics (energy ratio, settle time, ripple) if available.
+    # Keep this import local so the runner still works even if the package path
+    # differs in certain launch contexts.
+    try:
+        from benchmarks.metrics import compute_metrics  # type: ignore
+
+        m = compute_metrics(records)
+        m_dict = asdict(m)
+        summary.extra["metrics"] = m_dict
+
+        # Convenience copies (top-level in extra) for easy JSONL filtering
+        for k in (
+            "energy_true_ratio",
+            "energy_meas_ratio",
+            "settle_time_s_true",
+            "settle_time_s_meas",
+            "ripple_rms_true",
+            "ripple_rms_meas",
+        ):
+            if k in m_dict:
+                summary.extra[k] = m_dict[k]
+    except Exception as e:
+        # Non-fatal: runner can still emit basic summaries
+        summary.extra["metrics_error"] = str(e)
+
     return records, summary
 
 
@@ -292,18 +318,45 @@ def default_budgets() -> List[BudgetSpec]:
 
 
 def default_scenarios() -> List[ScenarioSpec]:
-    """Return a minimal set of scenarios.
+    """Load default benchmark scenarios from `benchmarks.scenarios`.
 
-    NOTE: `env_profile` is passed through to your engine; use the representation
-    your engine expects (e.g., list of events, callable, etc.).
-
-    If you already have `benchmarks/scenarios.py`, import from there and delete
-    these placeholders.
+    This keeps scenario definitions centralized and reusable by both CLI and UI.
+    If the import fails due to package path differences, fall back to a single
+    steady-state scenario.
     """
 
-    return [
-        ScenarioSpec(name="steady", env_profile=None, description="No env_profile; uses cfg baseline G/T."),
-    ]
+    try:
+        from benchmarks.scenarios import default_scenarios as _default_scenarios  # type: ignore
+    except Exception:
+        return [
+            ScenarioSpec(
+                name="steady",
+                env_profile=None,
+                description="No env_profile; uses cfg baseline G/T.",
+            ),
+        ]
+
+    out: List[ScenarioSpec] = []
+    for s in _default_scenarios():
+        out.append(
+            ScenarioSpec(
+                name=str(getattr(s, "name", "")),
+                env_profile=getattr(s, "env_profile", None),
+                description=str(getattr(s, "description", "")),
+            )
+        )
+
+    # Safety: never return empty
+    if not out:
+        out = [
+            ScenarioSpec(
+                name="steady",
+                env_profile=None,
+                description="No env_profile; uses cfg baseline G/T.",
+            )
+        ]
+
+    return out
 
 
 def default_algorithms() -> List[AlgorithmSpec]:

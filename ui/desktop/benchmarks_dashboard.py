@@ -1,0 +1,513 @@
+"""ui.desktop.benchmarks_dashboard
+
+Benchmarks tab for Aurora.
+
+This dashboard provides a simple UI to:
+- select MPPT algorithms (from `core.mppt_algorithms.registry`)
+- select benchmark scenarios (from `benchmarks.scenarios`)
+- select budgets (from `benchmarks.runner.default_budgets()`)
+- run the benchmark suite in a background thread
+- render a sortable results table from `summaries.jsonl`
+
+Notes:
+- This runs benchmarks in-process (recommended for an MVP).
+- Output is written under `Aurora/data/benchmarks/` by default.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ui.desktop.terminal_panel import TerminalPanel
+
+
+def _repo_root() -> Path:
+    # file is Aurora/ui/desktop/benchmarks_dashboard.py
+    return Path(__file__).resolve().parents[2]
+
+
+def _data_dir() -> Path:
+    return _repo_root() / "data" / "benchmarks"
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    rows.append(obj)
+            except Exception:
+                continue
+    return rows
+
+
+def _flatten_metrics(extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull commonly-used metric keys out of the nested `extra` dict."""
+    out: Dict[str, Any] = {}
+    if not isinstance(extra, dict):
+        return out
+
+    # Preferred: `extra["metrics"]` from metrics.py integration
+    m = extra.get("metrics")
+    if isinstance(m, dict):
+        out.update(m)
+
+    # Convenience copies may also exist
+    for k in (
+        "energy_true_ratio",
+        "energy_meas_ratio",
+        "settle_time_s_true",
+        "settle_time_s_meas",
+        "ripple_rms_true",
+        "ripple_rms_meas",
+    ):
+        if k in extra and k not in out:
+            out[k] = extra[k]
+    return out
+
+
+class _BenchWorker(QThread):
+    """Run the benchmark suite in a background thread."""
+
+    log = pyqtSignal(str)
+    done = pyqtSignal(str)  # run_dir
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        algo_specs: Sequence[str],
+        scenario_names: Sequence[str],
+        budget_names: Sequence[str],
+        out_dir: Path,
+        total_time: float,
+        gmpp_ref: bool,
+        gmpp_period: float,
+        gmpp_points: int,
+        save_records: bool,
+    ) -> None:
+        super().__init__()
+        self.algo_specs = list(algo_specs)
+        self.scenario_names = list(scenario_names)
+        self.budget_names = list(budget_names)
+        self.out_dir = out_dir
+        self.total_time = float(total_time)
+        self.gmpp_ref = bool(gmpp_ref)
+        self.gmpp_period = float(gmpp_period)
+        self.gmpp_points = int(gmpp_points)
+        self.save_records = bool(save_records)
+
+    def run(self) -> None:
+        try:
+            from benchmarks.runner import (
+                default_budgets,
+                default_scenarios,
+                resolve_algorithms_from_registry,
+                run_suite,
+            )
+
+            # Resolve selections
+            algos = resolve_algorithms_from_registry(self.algo_specs)
+            scenarios_all = default_scenarios()
+            budgets_all = default_budgets()
+
+            scenarios = [s for s in scenarios_all if s.name in set(self.scenario_names)]
+            budgets = [b for b in budgets_all if b.name in set(self.budget_names)]
+
+            if not algos:
+                raise ValueError("No algorithms selected")
+            if not scenarios:
+                raise ValueError("No scenarios selected")
+            if not budgets:
+                raise ValueError("No budgets selected")
+
+            self.log.emit(
+                f"[bench] running: algos={len(algos)}, scenarios={len(scenarios)}, budgets={len(budgets)}"
+            )
+            self.log.emit(f"[bench] out_dir: {self.out_dir}")
+
+            # Run suite (writes to out_dir/bench_YYYYMMDD_HHMMSS/...)
+            run_suite(
+                algorithms=algos,
+                scenarios=scenarios,
+                budgets=budgets,
+                total_time=self.total_time,
+                gmpp_ref=self.gmpp_ref,
+                gmpp_ref_period_s=self.gmpp_period,
+                gmpp_ref_points=self.gmpp_points,
+                out_dir=self.out_dir,
+                save_records=self.save_records,
+            )
+
+            # Identify newest run folder
+            runs = sorted(
+                [p for p in self.out_dir.glob("bench_*") if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+            )
+            if not runs:
+                raise RuntimeError("Benchmark run completed but no output folder was found")
+            run_dir = runs[-1]
+
+            self.log.emit(f"[bench] complete: {run_dir}")
+            self.done.emit(str(run_dir))
+
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class BenchmarksDashboard(QWidget):
+    """Benchmarks dashboard widget."""
+
+    def __init__(
+        self,
+        *,
+        terminal: Optional[TerminalPanel] = None,
+        overrides: Any = None,  # kept for consistent DI signature
+    ) -> None:
+        super().__init__()
+        self.terminal = terminal
+        self._worker: Optional[_BenchWorker] = None
+
+        root = QVBoxLayout(self)
+
+        # --------------------
+        # Top controls
+        # --------------------
+        top = QHBoxLayout()
+
+        self.out_path = QLineEdit(str(_data_dir()))
+        self.out_path.setPlaceholderText("Output directory (benchmarks)")
+        btn_browse = QPushButton("Browse…")
+        btn_browse.clicked.connect(self._pick_out_dir)
+
+        self.chk_gmpp = QCheckBox("GMPP reference")
+        self.chk_gmpp.setChecked(True)
+
+        self.sp_total_time = QDoubleSpinBox()
+        self.sp_total_time.setRange(0.1, 60.0)
+        self.sp_total_time.setValue(1.0)
+        self.sp_total_time.setSuffix(" s")
+
+        self.sp_gmpp_period = QDoubleSpinBox()
+        self.sp_gmpp_period.setRange(0.01, 10.0)
+        self.sp_gmpp_period.setValue(0.25)
+        self.sp_gmpp_period.setSuffix(" s")
+
+        self.sp_gmpp_points = QSpinBox()
+        self.sp_gmpp_points.setRange(50, 5000)
+        self.sp_gmpp_points.setValue(300)
+
+        self.chk_save_records = QCheckBox("Save per-tick records")
+        self.chk_save_records.setChecked(False)
+
+        self.btn_run = QPushButton("Run Benchmarks")
+        self.btn_run.clicked.connect(self._run)
+
+        self.btn_open = QPushButton("Open summaries…")
+        self.btn_open.clicked.connect(self._open_summaries)
+
+        top.addWidget(QLabel("Out:"))
+        top.addWidget(self.out_path, 1)
+        top.addWidget(btn_browse)
+        top.addSpacing(10)
+
+        top.addWidget(self.chk_gmpp)
+        top.addWidget(QLabel("Total:"))
+        top.addWidget(self.sp_total_time)
+        top.addWidget(QLabel("GMPP period:"))
+        top.addWidget(self.sp_gmpp_period)
+        top.addWidget(QLabel("Pts:"))
+        top.addWidget(self.sp_gmpp_points)
+        top.addWidget(self.chk_save_records)
+        top.addStretch(1)
+        top.addWidget(self.btn_open)
+        top.addWidget(self.btn_run)
+
+        root.addLayout(top)
+
+        # --------------------
+        # Left: selectors
+        # Right: results table
+        # --------------------
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+
+        self.list_algos = QListWidget()
+        self.list_algos.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+        self.list_scenarios = QListWidget()
+        self.list_scenarios.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+        self.list_budgets = QListWidget()
+        self.list_budgets.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+        btn_refresh = QPushButton("Refresh lists")
+        btn_refresh.clicked.connect(self._refresh_lists)
+
+        left_layout.addWidget(QLabel("Algorithms"))
+        left_layout.addWidget(self.list_algos, 1)
+        left_layout.addWidget(QLabel("Scenarios"))
+        left_layout.addWidget(self.list_scenarios, 1)
+        left_layout.addWidget(QLabel("Budgets"))
+        left_layout.addWidget(self.list_budgets, 1)
+        left_layout.addWidget(btn_refresh)
+
+        splitter.addWidget(left)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+
+        self.lbl_status = QLabel("Select algorithms/scenarios/budgets, then run.")
+        self.lbl_status.setStyleSheet("color: #666;")
+        right_layout.addWidget(self.lbl_status)
+
+        self.table = QTableWidget(0, 0)
+        self.table.setSortingEnabled(True)
+        right_layout.addWidget(self.table, 1)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        # populate lists
+        self._refresh_lists(select_all=True)
+
+    # --------------------
+    # UI actions
+    # --------------------
+
+    def _log(self, msg: str) -> None:
+        if self.terminal is not None:
+            try:
+                self.terminal.append_line(msg)
+            except Exception:
+                pass
+
+    def _pick_out_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose output directory", self.out_path.text())
+        if path:
+            self.out_path.setText(path)
+
+    def _refresh_lists(self, *, select_all: bool = False) -> None:
+        # Algorithms
+        self.list_algos.clear()
+        try:
+            from benchmarks.runner import list_registry_algorithms
+
+            algos = list_registry_algorithms()
+        except Exception as e:
+            algos = []
+            self._log(f"[ui] failed to load algorithms: {type(e).__name__}: {e}")
+
+        for a in algos:
+            self.list_algos.addItem(QListWidgetItem(str(a)))
+
+        # Scenarios
+        self.list_scenarios.clear()
+        try:
+            from benchmarks.scenarios import list_scenarios
+
+            scs = list_scenarios()
+        except Exception as e:
+            scs = ["steady"]
+            self._log(f"[ui] failed to load scenarios: {type(e).__name__}: {e}")
+
+        for s in scs:
+            self.list_scenarios.addItem(QListWidgetItem(str(s)))
+
+        # Budgets
+        self.list_budgets.clear()
+        try:
+            from benchmarks.runner import default_budgets
+
+            bds = default_budgets()
+            bd_names = [b.name for b in bds]
+        except Exception as e:
+            bd_names = []
+            self._log(f"[ui] failed to load budgets: {type(e).__name__}: {e}")
+
+        for b in bd_names:
+            self.list_budgets.addItem(QListWidgetItem(str(b)))
+
+        if select_all:
+            for lw in (self.list_algos, self.list_scenarios, self.list_budgets):
+                for i in range(lw.count()):
+                    lw.item(i).setSelected(True)
+
+    def _selected_texts(self, lw: QListWidget) -> List[str]:
+        return [i.text() for i in lw.selectedItems()]
+
+    def _run(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Benchmarks", "A benchmark run is already in progress.")
+            return
+
+        algos = self._selected_texts(self.list_algos)
+        scenarios = self._selected_texts(self.list_scenarios)
+        budgets = self._selected_texts(self.list_budgets)
+
+        if not algos or not scenarios or not budgets:
+            QMessageBox.warning(
+                self,
+                "Benchmarks",
+                "Select at least one algorithm, one scenario, and one budget.",
+            )
+            return
+
+        out_dir = Path(self.out_path.text()).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.btn_run.setEnabled(False)
+        self.lbl_status.setText("Running benchmarks…")
+        self._log(f"[ui] benchmarks starting (out={out_dir})")
+
+        self._worker = _BenchWorker(
+            algo_specs=algos,
+            scenario_names=scenarios,
+            budget_names=budgets,
+            out_dir=out_dir,
+            total_time=float(self.sp_total_time.value()),
+            gmpp_ref=bool(self.chk_gmpp.isChecked()),
+            gmpp_period=float(self.sp_gmpp_period.value()),
+            gmpp_points=int(self.sp_gmpp_points.value()),
+            save_records=bool(self.chk_save_records.isChecked()),
+        )
+        self._worker.log.connect(self._log)
+        self._worker.done.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_failed(self, msg: str) -> None:
+        self.btn_run.setEnabled(True)
+        self.lbl_status.setText("Benchmark failed")
+        self._log(f"[ui] benchmark failed: {msg}")
+        QMessageBox.critical(self, "Benchmarks", msg)
+
+    def _on_done(self, run_dir_str: str) -> None:
+        self.btn_run.setEnabled(True)
+        run_dir = Path(run_dir_str)
+        self.lbl_status.setText(f"Complete: {run_dir}")
+        self._log(f"[ui] benchmark complete: {run_dir}")
+
+        summaries = run_dir / "summaries.jsonl"
+        if not summaries.exists():
+            QMessageBox.warning(self, "Benchmarks", f"No summaries.jsonl found in {run_dir}")
+            return
+
+        self._load_summaries(summaries)
+
+    def _open_summaries(self) -> None:
+        start = str(Path(self.out_path.text()).expanduser())
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open summaries.jsonl",
+            start,
+            "JSONL Files (*.jsonl);;All Files (*)",
+        )
+        if not path_str:
+            return
+        self._load_summaries(Path(path_str))
+
+    def _load_summaries(self, path: Path) -> None:
+        try:
+            rows = _read_jsonl(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Benchmarks", f"Failed to read file: {type(e).__name__}: {e}")
+            return
+
+        self._render_table(rows)
+        self.lbl_status.setText(f"Loaded: {path}")
+        self._log(f"[ui] loaded summaries: {path} ({len(rows)} rows)")
+
+    # --------------------
+    # Results table
+    # --------------------
+
+    def _render_table(self, rows: List[Dict[str, Any]]) -> None:
+        # Define columns (base + metrics)
+        cols = [
+            ("algo", "Algo"),
+            ("scenario", "Scenario"),
+            ("budget", "Budget"),
+            ("eff_true_final", "Eff True (final)"),
+            ("eff_meas_final", "Eff Meas (final)"),
+            ("ctrl_us_p95", "Ctrl µs p95"),
+            ("budget_violations", "Over budget"),
+            ("energy_true_ratio", "Energy True"),
+            ("energy_meas_ratio", "Energy Meas"),
+            ("settle_time_s_true", "Settle True (s)"),
+            ("settle_time_s_meas", "Settle Meas (s)"),
+            ("ripple_rms_true", "Ripple True"),
+            ("ripple_rms_meas", "Ripple Meas"),
+        ]
+
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        self.table.setRowCount(len(rows))
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels([c[1] for c in cols])
+
+        for r_i, row in enumerate(rows):
+            extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+            metrics_flat = _flatten_metrics(extra) if isinstance(extra, dict) else {}
+
+            def get_val(key: str) -> Any:
+                if key in row:
+                    return row.get(key)
+                if key in metrics_flat:
+                    return metrics_flat.get(key)
+                if isinstance(extra, dict) and key in extra:
+                    return extra.get(key)
+                return None
+
+            for c_i, (key, _) in enumerate(cols):
+                v = get_val(key)
+                item = QTableWidgetItem("" if v is None else str(v))
+
+                # Right-align numbers for readability
+                try:
+                    float(v)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                except Exception:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+                self.table.setItem(r_i, c_i, item)
+
+        self.table.resizeColumnsToContents()
+        self.table.setSortingEnabled(True)
+
+
+# For MainWindow dynamic loader
+__all__ = ["BenchmarksDashboard"]
