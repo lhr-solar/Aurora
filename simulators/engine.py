@@ -18,6 +18,8 @@ bench scripts, Jupyter, or a desktop UI callback.
 
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Iterable, Generator, Tuple, Callable, Union, Sequence
+import time
+import random
 
 # PV plant imports
 from core.src.cell import Cell
@@ -163,6 +165,26 @@ class SimulationConfig:
     gmpp_ref: bool = False
     gmpp_ref_period_s: float = 0.05   # compute reference every 50ms
     gmpp_ref_points: int = 121        # sweep resolution for reference
+    
+    # --- Benchmarking / profiling ---
+    perf_enabled: bool = True                    # include perf fields in output records
+    perf_budget_us: Optional[float] = None       # if set, flag if ctrl step exceeds this
+
+    # --- Measurement realism ---
+    rng_seed: Optional[int] = 0                  # deterministic noise if desired
+
+    noise_v_std: float = 0.0                     # volts (Gaussian)
+    noise_i_std: float = 0.0                     # amps  (Gaussian)
+    noise_g_std: float = 0.0                     # W/m^2 (Gaussian)
+
+    adc_bits_v: Optional[int] = None             # e.g., 12 for 12-bit ADC
+    adc_bits_i: Optional[int] = None
+    adc_bits_g: Optional[int] = None
+
+    # Full-scale ranges used for quantization (keep consistent with your sim bounds)
+    v_full_scale: float = 100.0                  # volts
+    i_full_scale: float = 20.0                   # amps
+    g_full_scale: float = 1200.0                 # W/m^2
 
     # Optional: time-varying environment as list of (time_s, irradiance, temp_c)
     env_profile: Optional[List[Tuple[float, Union[float, Sequence[float]], float]]] = None
@@ -230,6 +252,8 @@ class SimulationEngine:
         self.plant = PVPlant(self.array)
         self.ctrl = cfg.build_controller()
         self.on_sample = cfg.on_sample
+        # deterministic RNG for benchmark repeatability (noise/quantization)
+        self._rng = random.Random(cfg.rng_seed) if cfg.rng_seed is not None else random.Random()
 
         # environment
         self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
@@ -256,7 +280,59 @@ class SimulationEngine:
             pass
 
         return float(vmin), float(vmax)
+    
+    def _quantize_unsigned(self, x: float, bits: Optional[int], full_scale: float) -> float:
+        """Uniform quantization for unsigned signals in [0, full_scale]."""
+        if bits is None:
+            return float(x)
+        levels = (1 << int(bits)) - 1
+        if levels <= 0 or full_scale <= 0:
+            return float(x)
 
+        x_clipped = max(0.0, min(float(x), float(full_scale)))
+        step = float(full_scale) / float(levels)
+        q = round(x_clipped / step) * step
+        return float(q)
+
+    def _quantize_signed(self, x: float, bits: Optional[int], full_scale: float) -> float:
+        """Uniform quantization for signed signals in [-full_scale, +full_scale]."""
+        if bits is None:
+            return float(x)
+        levels = (1 << int(bits)) - 1
+        if levels <= 0 or full_scale <= 0:
+            return float(x)
+
+        fs = float(full_scale)
+        x_clipped = max(-fs, min(float(x), fs))
+
+        # Map [-fs, fs] -> [0, 2fs], quantize, then map back
+        step = (2.0 * fs) / float(levels)
+        q = round((x_clipped + fs) / step) * step - fs
+        return float(q)
+
+    def _apply_measurement_effects(self, v: float, i: float, g: float) -> Tuple[float, float, float]:
+        """Apply optional measurement noise + ADC quantization."""
+        cfg = self.cfg
+
+        # Gaussian noise
+        if cfg.noise_v_std > 0:
+            v = float(v) + self._rng.gauss(0.0, float(cfg.noise_v_std))
+        if cfg.noise_i_std > 0:
+            i = float(i) + self._rng.gauss(0.0, float(cfg.noise_i_std))
+        if cfg.noise_g_std > 0:
+            g = float(g) + self._rng.gauss(0.0, float(cfg.noise_g_std))
+
+        # Quantization
+        v = self._quantize_unsigned(v, cfg.adc_bits_v, cfg.v_full_scale)  # PV voltage is non-negative
+        i = self._quantize_signed(i, cfg.adc_bits_i, cfg.i_full_scale)    # CURRENT should be signed
+        g = self._quantize_unsigned(g, cfg.adc_bits_g, cfg.g_full_scale)  # irradiance is non-negative
+
+        return float(v), float(i), float(g)
+
+    @staticmethod
+    def _now_ns() -> int:
+        return time.perf_counter_ns()
+    
     def _gmpp_reference(self, i_fn, points: int) -> Tuple[float, float]:
         """Return (v_gmp, p_gmp) via a deterministic sweep using array current-at-voltage."""
         vmin, vmax = self._get_v_bounds()
@@ -281,10 +357,15 @@ class SimulationEngine:
         """
         t = 0.0
         v = self.cfg.start_v
-        p_best = -1e18
-        v_best = v
+        # Best-so-far should be tracked on TRUE plant power (pre noise/quantization)
+        p_best_true = -1e18
+        v_best_true = v
+        
+        p_best_meas = -1e18
+        v_best_meas = v
         last_ref = None
         next_ref_t = 0.0
+        last_ref_us = None
 
         # resolve environment at t=0
         g0, t0 = self.cfg.env_at(t)
@@ -306,26 +387,64 @@ class SimulationEngine:
             )
         i = float(i_fn(v))
         g_meas = float(sum(g0) / len(g0)) if isinstance(g0, (list, tuple)) else float(g0)
-        m = Measurement(t=t, v=v, i=i, g=g_meas, t_mod=t0, dt=self.cfg.dt)
-        a = self.ctrl.step(m)
-        if m.p > p_best:
-            p_best = float(m.p)
-            v_best = float(m.v)
+        p_true = float(v * i)
+        if p_true > p_best_true:
+            p_best_true = p_true
+            v_best_true = float(v)
+        # apply optional sensor effects
+        v_m, i_m, g_m = self._apply_measurement_effects(v, i, g_meas)
+        m = Measurement(t=t, v=v_m, i=i_m, g=g_m, t_mod=t0, dt=self.cfg.dt)
+
+        # time controller step
+        ctrl_us = None
+        over_budget = None
+        if self.cfg.perf_enabled:
+            t0_ns = self._now_ns()
+            a = self.ctrl.step(m)
+            t1_ns = self._now_ns()
+            ctrl_us = (t1_ns - t0_ns) / 1000.0
+            if self.cfg.perf_budget_us is not None:
+                over_budget = bool(ctrl_us > float(self.cfg.perf_budget_us))
+        else:
+            a = self.ctrl.step(m)
+        if m.p > p_best_meas:
+            p_best_meas = float(m.p)
+            v_best_meas = float(m.v)
 
         gmpp = None
+        ref_us = None
         if self.cfg.gmpp_ref:
-            v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-            eff = float(p_best / max(p_gmp, 1e-12))
+            if self.cfg.perf_enabled:
+                r0 = self._now_ns()
+                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+                r1 = self._now_ns()
+                ref_us = (r1 - r0) / 1000.0
+            else:
+                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+            
+            eff = float(p_best_true / max(p_gmp, 1e-12))
             gmpp = {
                 "v_gmp_ref": float(v_gmp),
                 "p_gmp_ref": float(p_gmp),
-                "v_best": float(v_best),
-                "p_best": float(p_best),
+                "v_best": float(v_best_true),
+                "p_best": float(p_best_true),
                 "eff_best": float(eff),
+
+                "v_best_meas": float(v_best_meas),
+                "p_best_meas": float(p_best_meas),
+                "eff_best_meas": float(p_best_meas / max(p_gmp, 1e-12)),
             }
             last_ref = gmpp
+            last_ref_us = ref_us
             next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
         extra0 = {"gmpp": gmpp} if gmpp else {}
+        if self.cfg.perf_enabled:
+            extra0["perf"] = {
+                "ctrl_us": ctrl_us,
+                "ref_us": ref_us,
+                "budget_us": self.cfg.perf_budget_us,
+                "over_budget": over_budget,
+            }
         if g0_vec is not None:
             extra0["g_strings"] = g0_vec
         rec = self._to_record(m, a, extra=extra0 if extra0 else None)
@@ -348,46 +467,86 @@ class SimulationEngine:
             g_vec = list(g_now) if isinstance(g_now, (list, tuple)) else None
             self.plant.set_conditions(g_now, t_now)
             v, i = self.plant.step(v_cmd)
+            p_true = float(v * i)
+            if p_true > p_best_true:
+                p_best_true = p_true
+                v_best_true = float(v)
 
             g_meas = float(sum(g_now) / len(g_now)) if isinstance(g_now, (list, tuple)) else float(g_now)
+
+            # apply optional sensor effects
+            v_m, i_m, g_m = self._apply_measurement_effects(v, i, g_meas)
             m = Measurement(
                 t=t,
-                v=v,
-                i=i,
-                g=g_meas,
+                v=v_m,
+                i=i_m,
+                g=g_m,
                 t_mod=t_now,
                 dt=self.cfg.dt,
             )
-            if m.p > p_best:
-                p_best = float(m.p)
-                v_best = float(m.v)
+            if m.p > p_best_meas:
+                p_best_meas = float(m.p)
+                v_best_meas = float(m.v)
             gmpp = None
+            ref_us = None
             if self.cfg.gmpp_ref and t >= next_ref_t:
-                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-                eff = float(p_best / max(p_gmp, 1e-12))
+                if self.cfg.perf_enabled:
+                    r0 = self._now_ns()
+                    v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+                    r1 = self._now_ns()
+                    ref_us = (r1 - r0) / 1000.0
+                else:
+                    v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
+                eff = float(p_best_true / max(p_gmp, 1e-12))
                 gmpp = {
                     "v_gmp_ref": float(v_gmp),
                     "p_gmp_ref": float(p_gmp),
-                    "v_best": float(v_best),
-                    "p_best": float(p_best),
+                    "v_best": float(v_best_true),
+                    "p_best": float(p_best_true),
                     "eff_best": float(eff),
+                    
+                    "v_best_meas": float(v_best_meas),
+                    "p_best_meas": float(p_best_meas),
+                    "eff_best_meas": float(p_best_meas / max(p_gmp, 1e-12)),
                 }
                 last_ref = gmpp
+                last_ref_us = ref_us
                 next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
             elif last_ref is not None:
                 # Reuse last reference volt/power, but keep best-so-far and efficiency up to date
                 gmpp = dict(last_ref)
                 p_gmp_ref = float(gmpp.get("p_gmp_ref", float("nan")))
                 if p_gmp_ref == p_gmp_ref:  # not NaN
-                    gmpp["v_best"] = float(v_best)
-                    gmpp["p_best"] = float(p_best)
-                    gmpp["eff_best"] = float(p_best / max(p_gmp_ref, 1e-12))
+                    gmpp["v_best"] = float(v_best_true)
+                    gmpp["p_best"] = float(p_best_true)
+                    gmpp["eff_best"] = float(p_best_true / max(p_gmp_ref, 1e-12))
+                    gmpp["v_best_meas"] = float(v_best_meas)
+                    gmpp["p_best_meas"] = float(p_best_meas)
+                    gmpp["eff_best_meas"] = float(p_best_meas / max(p_gmp_ref, 1e-12))
                 last_ref = gmpp
+                ref_us = last_ref_us
             # controller next step
-            a = self.ctrl.step(m)
+            ctrl_us = None
+            over_budget = None
+            if self.cfg.perf_enabled:
+                c0 = self._now_ns()
+                a = self.ctrl.step(m)
+                c1 = self._now_ns()
+                ctrl_us = (c1 - c0) / 1000.0
+                if self.cfg.perf_budget_us is not None:
+                    over_budget = bool(ctrl_us > float(self.cfg.perf_budget_us))
+            else:
+                a = self.ctrl.step(m)
 
             # emit a JSON-friendly record
             extra = {"gmpp": gmpp} if gmpp else {}
+            if self.cfg.perf_enabled:
+                extra["perf"] = {
+                    "ctrl_us": ctrl_us,
+                    "ref_us": ref_us,
+                    "budget_us": self.cfg.perf_budget_us,
+                    "over_budget": over_budget,
+                }
             if g_vec is not None:
                 extra["g_strings"] = g_vec
             rec = self._to_record(m, a, extra=extra if extra else None)
@@ -408,7 +567,11 @@ class SimulationEngine:
             "action": a.to_dict(),
         }
         if extra:
-            rec.update(extra)
+            for k, v in extra.items():
+                if k in rec:
+                    rec.setdefault("extra", {})[k] = v
+                else:
+                    rec[k] = v
         return rec
 
 # CLI demo
