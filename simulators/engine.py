@@ -186,8 +186,11 @@ class SimulationConfig:
     i_full_scale: float = 20.0                   # amps
     g_full_scale: float = 1200.0                 # W/m^2
 
-    # Optional: time-varying environment as list of (time_s, irradiance, temp_c)
-    env_profile: Optional[List[Tuple[float, Union[float, Sequence[float]], float]]] = None
+    # Optional: time-varying environment profile.
+    # Supported formats:
+    #   A) legacy tuples: List[(time_s, irradiance (float or per-string sequence), temp_c)]
+    #   B) event dicts (benchmarks/scenarios.py): List[{"t":..., "g":..., "t_mod":..., "g_strings":...}]
+    env_profile: Optional[List[Any]] = None
     # Optional: per-sample callback for UIs/loggers
     on_sample: Optional[Callable[[Dict[str, Any]], None]] = None
     # Optional: live overrides (shared object mutated by UI)
@@ -207,31 +210,75 @@ class SimulationConfig:
 
         Priority (highest first):
           1) live overrides (if provided and the specific field is not None)
-          2) env_profile stepwise values
+          2) env_profile stepwise-hold values
           3) constant irradiance/temperature_c from config
+
+        Supports two env_profile formats:
+          A) legacy tuples: (time_s, irradiance (float or per-string sequence), temp_c)
+          B) event dicts: {"t":..., "g":..., "t_mod":..., "g_strings":...}
         """
 
         # Base values from config
-        latest_g = self.irradiance
-        latest_t = self.temperature_c
+        latest_g: Union[float, Sequence[float]] = self.irradiance
+        latest_t: float = float(self.temperature_c)
 
-        # Stepwise-hold profile values (if provided)
-        if self.env_profile:
-            for tt, g, tc in self.env_profile:
-                if tt <= t:
-                    latest_g = g
-                    latest_t = tc
+        prof = self.env_profile
+        if prof:
+            for ev in prof:
+                # Format A: tuple/list
+                if isinstance(ev, (tuple, list)):
+                    if len(ev) != 3:
+                        # skip malformed legacy events
+                        continue
+                    tt, g, tc = ev
+                    try:
+                        if float(tt) <= t:
+                            latest_g = g  # float or sequence
+                            latest_t = float(tc)
+                        else:
+                            break
+                    except Exception:
+                        continue
+
+                # Format B: dict event
+                elif isinstance(ev, dict):
+                    try:
+                        tt = float(ev.get("t", 0.0))
+                    except Exception:
+                        continue
+
+                    if tt <= t:
+                        # per-string shading overrides scalar g if present
+                        if "g_strings" in ev and ev.get("g_strings") is not None:
+                            gs = ev.get("g_strings")
+                            if isinstance(gs, (list, tuple)):
+                                latest_g = [float(x) for x in gs]
+                        elif "g" in ev and ev.get("g") is not None:
+                            try:
+                                latest_g = float(ev.get("g"))
+                            except Exception:
+                                pass
+
+                        # temperature
+                        if "t_mod" in ev and ev.get("t_mod") is not None:
+                            try:
+                                latest_t = float(ev.get("t_mod"))
+                            except Exception:
+                                pass
+                    else:
+                        break
+
+                # Unknown event type
                 else:
-                    break
+                    continue
 
         # Live overrides win
         if self.overrides is not None:
             if self.overrides.irradiance is not None:
-                latest_g = self.overrides.irradiance  # keep scalar OR sequence
+                latest_g = self.overrides.irradiance
             if self.overrides.temperature_c is not None:
                 latest_t = float(self.overrides.temperature_c)
 
-        # Return irradiance as-is (float or sequence), temp as float
         return latest_g, float(latest_t)
 
 # Engine
