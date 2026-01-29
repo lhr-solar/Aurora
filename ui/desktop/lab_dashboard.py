@@ -949,17 +949,65 @@ class LabDashboard(QWidget):
         if not hasattr(self, "g_plot"):
             return
 
-        # If live overrides are set, show them as flat lines for G and T.
-        # But if the user is running a CSV profile, preserve the profile shape in the plot.
-        g_series = rd.g
-        t_series = rd.t_mod
-        use_csv = hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked()
-        if (not use_csv) and self.overrides is not None:
-            if self.overrides.irradiance is not None:
-                g_series = [float(self.overrides.irradiance)] * len(rd.t)
-            if self.overrides.temperature_c is not None:
-                t_series = [float(self.overrides.temperature_c)] * len(rd.t)
+        # ---------------------------
+        # Sticky-axis baseline config
+        # ---------------------------
+        BASE_G = 1000.0     # "normal" irradiance baseline
+        BASE_T = 25.0       # "normal" temperature baseline
+        HALFSPAN_G = 300.0  # default visible window: 1000 ± 300
+        HALFSPAN_T = 20.0   # default visible window: 25 ± 20
+        PAD_FRAC = 0.05     # extra padding when expanding axis
 
+        def _finite_minmax(xs: List[float]) -> Optional[Tuple[float, float]]:
+            mn = None
+            mx = None
+            for x in xs:
+                try:
+                    xf = float(x)
+                except Exception:
+                    continue
+                if xf != xf:  # NaN
+                    continue
+                if mn is None or xf < mn:
+                    mn = xf
+                if mx is None or xf > mx:
+                    mx = xf
+            if mn is None or mx is None:
+                return None
+            return (mn, mx)
+
+        def _apply_sticky_y(plot: Any, *, base: float, halfspan: float, series: List[float]) -> None:
+            mm = _finite_minmax(series)
+            if mm is None:
+                # Fall back to baseline window
+                plot.setYRange(base - halfspan, base + halfspan, padding=0.0)
+                return
+
+            smin, smax = mm
+            base_min = base - halfspan
+            base_max = base + halfspan
+
+            # If data fits in baseline window, keep it stable
+            if smin >= base_min and smax <= base_max:
+                plot.setYRange(base_min, base_max, padding=0.0)
+                return
+
+            # Otherwise expand just enough to include data (with a small pad)
+            span = max(1e-9, (smax - smin))
+            pad = PAD_FRAC * span
+            plot.setYRange(smin - pad, smax + pad, padding=0.0)
+
+        # ---------------------------
+        # Build series
+        # ---------------------------
+        g_series = rd.g[:]       # preserve profile shape
+        t_series = rd.t_mod[:]   # preserve profile shape
+
+        use_csv = hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked()
+        
+        # ---------------------------
+        # Clear + state shading
+        # ---------------------------
         self.g_plot.clear()
         self.t_plot.clear()
         self.v_plot.clear()
@@ -983,14 +1031,24 @@ class LabDashboard(QWidget):
             self.p_plot.addItem(region)
             self._state_regions.append(region)
 
+        # ---------------------------
+        # Plot lines
+        # ---------------------------
         self.g_plot.plot(rd.t, g_series)
         self.t_plot.plot(rd.t, t_series)
         self.v_plot.plot(rd.t, rd.v)
         self.p_plot.plot(rd.t, rd.p)
 
-        # Overlay GMPP reference power if present (robust-GMPP validator)
+        # Overlay GMPP reference power if present
         if hasattr(rd, "p_gmp_ref") and rd.p_gmp_ref and any(x == x for x in rd.p_gmp_ref):
             self.p_plot.plot(rd.t, rd.p_gmp_ref)
 
+        # ---------------------------
+        # Sticky Y axes for G/T
+        # ---------------------------
+        _apply_sticky_y(self.g_plot, base=BASE_G, halfspan=HALFSPAN_G, series=g_series)
+        _apply_sticky_y(self.t_plot, base=BASE_T, halfspan=HALFSPAN_T, series=t_series)
+
+        # X range
         if rd.t:
-            self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
+            self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)  

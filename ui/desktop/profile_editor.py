@@ -148,7 +148,7 @@ class ProfileEditor(QWidget):
             root.addWidget(self.t_plot, 1)
 
         # Wiring
-        self.btn_add.clicked.connect(self.add_row)
+        self.btn_add.clicked.connect(lambda _checked=False: self.add_row())
         self.btn_del.clicked.connect(self.delete_selected_rows)
         self.btn_clear.clicked.connect(self.clear)
         self.btn_browse.clicked.connect(self.browse)
@@ -225,6 +225,9 @@ class ProfileEditor(QWidget):
     # Actions
     # ---------------------------
     def add_row(self, row: Optional[ProfileRow] = None) -> None:
+        # QPushButton.clicked emits a bool (checked). If we get it, ignore it.
+        if isinstance(row, bool):
+            row = None
         r = self.table.rowCount()
         self.table.insertRow(r)
         if row is None:
