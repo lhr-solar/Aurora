@@ -51,6 +51,24 @@ def _placeholder(title: str, subtitle: str = "Not implemented yet") -> QWidget:
     return w
 
 
+class _TerminalDock(QDockWidget):
+    def __init__(self, title: str, parent: "MainWindow") -> None:
+        super().__init__(title, parent)
+        self._mw = parent
+
+    def closeEvent(self, event) -> None:
+        # If the user closes a floating (popped-out) terminal, restore it to the dock area.
+        try:
+            if self.isFloating():
+                self._mw._restore_terminal_dock(self)
+                event.ignore()
+                return
+        except Exception:
+            pass
+        # Otherwise, behave like a normal dock (hide on close).
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Aurora desktop application shell."""
 
@@ -65,16 +83,25 @@ class MainWindow(QMainWindow):
 
         # Global terminal/log dock (shared across dashboards)
         self.terminal = TerminalPanel(title="Terminal")
-        dock = QDockWidget("Terminal", self)
-        dock.setObjectName("aurora_terminal_dock")
-        dock.setWidget(self.terminal)
-        dock.setAllowedAreas(
+
+        self.terminal_dock = _TerminalDock("Terminal", self)
+        self.terminal_dock.setObjectName("aurora_terminal_dock")
+        self.terminal_dock.setWidget(self.terminal)
+        self.terminal_dock.setAllowedAreas(
             Qt.DockWidgetArea.BottomDockWidgetArea
             | Qt.DockWidgetArea.TopDockWidgetArea
             | Qt.DockWidgetArea.LeftDockWidgetArea
             | Qt.DockWidgetArea.RightDockWidgetArea
         )
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+        self.terminal_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.terminal_dock)
+
+        # Track terminal docks so we can create additional ones on demand
+        self._terminal_docks: list[QDockWidget] = [self.terminal_dock]
 
         # Shared live overrides (mutated by UI controls; read by in-process simulations)
         self.overrides = LiveOverrides()
@@ -99,6 +126,13 @@ class MainWindow(QMainWindow):
         self.terminal.append_line("[ui] Aurora UI started")
         self.terminal.append_line("[ui] LiveOverrides ready")
         self.terminal.append_line("[ui] Benchmarks tab ready")
+
+        # View menu actions for terminal management
+        view_menu = self.menuBar().addMenu("View")
+        act_show_term = view_menu.addAction("Show Terminal")
+        act_show_term.triggered.connect(self._show_terminal)
+        act_new_term = view_menu.addAction("New Terminal")
+        act_new_term.triggered.connect(self._new_terminal)
 
     def _load_dashboard(
         self,
@@ -148,6 +182,57 @@ class MainWindow(QMainWindow):
             )
             w.setToolTip(f"{module_path}.{class_name} import failed: {e}")
             return w
+
+    def _restore_terminal_dock(self, dock: QDockWidget) -> None:
+        """Restore a terminal dock back to the main window bottom area and show it."""
+        try:
+            dock.setFloating(False)
+        except Exception:
+            pass
+        try:
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+        except Exception:
+            pass
+        dock.show()
+        dock.raise_()
+
+    def _show_terminal(self) -> None:
+        """Show (reopen) the primary terminal dock if it is hidden."""
+        if getattr(self, "terminal_dock", None) is None:
+            return
+        self._restore_terminal_dock(self.terminal_dock)
+
+    def _new_terminal(self) -> None:
+        """Open a new terminal dock without affecting the existing one."""
+        term = TerminalPanel(title="Terminal")
+        dock = _TerminalDock("Terminal", self)
+        dock.setWidget(term)
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea
+            | Qt.DockWidgetArea.TopDockWidgetArea
+            | Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+
+        # Tabify with the primary terminal for a clean UI
+        if getattr(self, "terminal_dock", None) is not None:
+            try:
+                self.tabifyDockWidget(self.terminal_dock, dock)
+            except Exception:
+                pass
+
+        dock.show()
+        dock.raise_()
+        try:
+            self._terminal_docks.append(dock)
+        except Exception:
+            self._terminal_docks = [dock]
 
 
 def run(argv: Optional[list[str]] = None) -> int:

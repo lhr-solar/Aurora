@@ -158,7 +158,8 @@ class _BenchWorker(QThread):
                 f"[bench] running: algos={len(algos)}, scenarios={len(scenarios)}, budgets={len(budgets)}"
             )
             self.log.emit(f"[bench] out_dir: {self.out_dir}")
-
+            if self.isInterruptionRequested():
+                raise RuntimeError("Cancelled")
             # Run suite (writes to out_dir/bench_YYYYMMDD_HHMMSS/...)
             run_suite(
                 algorithms=algos,
@@ -173,6 +174,7 @@ class _BenchWorker(QThread):
                 log=self.log.emit,
                 log_every_s=self.log_every_s,
                 keep_records=self.keep_records,
+                cancel=self.isInterruptionRequested,
             )
 
             # Identify newest run folder
@@ -207,11 +209,10 @@ class BenchmarksDashboard(QWidget):
         root = QVBoxLayout(self)
 
         # --------------------
-        # Top controls
+        # Create top control widgets (must exist before layout wiring)
         # --------------------
-        top = QHBoxLayout()
-
         self.out_path = QLineEdit(str(_data_dir()))
+        self.out_path.setMinimumWidth(480)
         self.out_path.setPlaceholderText("Output directory (benchmarks)")
         btn_browse = QPushButton("Browse…")
         btn_browse.clicked.connect(self._pick_out_dir)
@@ -241,7 +242,9 @@ class BenchmarksDashboard(QWidget):
 
         self.chk_no_keep_records = QCheckBox("Don't keep records in memory")
         self.chk_no_keep_records.setChecked(False)
-        self.chk_no_keep_records.setToolTip("If enabled, runner will not store per-tick records in RAM. For metrics, enable 'Save per-tick records'.")
+        self.chk_no_keep_records.setToolTip(
+            "If enabled, runner will not store per-tick records in RAM. For metrics, enable 'Save per-tick records'."
+        )
 
         self.chk_save_records = QCheckBox("Save per-tick records")
         self.chk_save_records.setChecked(False)
@@ -249,28 +252,46 @@ class BenchmarksDashboard(QWidget):
         self.btn_run = QPushButton("Run Benchmarks")
         self.btn_run.clicked.connect(self._run)
 
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+
         self.btn_open = QPushButton("Open summaries…")
         self.btn_open.clicked.connect(self._open_summaries)
 
-        top.addWidget(QLabel("Out:"))
-        top.addWidget(self.out_path, 1)
-        top.addWidget(btn_browse)
-        top.addSpacing(10)
+        # --------------------
+        # Top controls
+        # --------------------
+        top = QVBoxLayout()
+        top_row1 = QHBoxLayout()
+        top_row2 = QHBoxLayout()
 
-        top.addWidget(self.chk_gmpp)
-        top.addWidget(QLabel("Total:"))
-        top.addWidget(self.sp_total_time)
-        top.addWidget(QLabel("GMPP period:"))
-        top.addWidget(self.sp_gmpp_period)
-        top.addWidget(QLabel("Pts:"))
-        top.addWidget(self.sp_gmpp_points)
-        top.addWidget(QLabel("Log every:"))
-        top.addWidget(self.sp_log_every)
-        top.addWidget(self.chk_no_keep_records)
-        top.addWidget(self.chk_save_records)
-        top.addStretch(1)
-        top.addWidget(self.btn_open)
-        top.addWidget(self.btn_run)
+        # Row 1: output + run controls
+        top_row1.addWidget(QLabel("Out:"))
+        top_row1.addWidget(self.out_path, 1)
+        top_row1.addWidget(btn_browse)
+        top_row1.addSpacing(10)
+        top_row1.addStretch(1)
+        top_row1.addWidget(self.btn_open)
+        top_row1.addWidget(self.btn_run)
+        top_row1.addWidget(self.btn_stop)
+
+        # Row 2: benchmark parameters
+        top_row2.addWidget(self.chk_gmpp)
+        top_row2.addWidget(QLabel("Total:"))
+        top_row2.addWidget(self.sp_total_time)
+        top_row2.addWidget(QLabel("GMPP period:"))
+        top_row2.addWidget(self.sp_gmpp_period)
+        top_row2.addWidget(QLabel("Pts:"))
+        top_row2.addWidget(self.sp_gmpp_points)
+        top_row2.addWidget(QLabel("Log every:"))
+        top_row2.addWidget(self.sp_log_every)
+        top_row2.addWidget(self.chk_no_keep_records)
+        top_row2.addWidget(self.chk_save_records)
+        top_row2.addStretch(1)
+
+        top.addLayout(top_row1)
+        top.addLayout(top_row2)
 
         root.addLayout(top)
 
@@ -418,6 +439,7 @@ class BenchmarksDashboard(QWidget):
             return
 
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.lbl_status.setText("Running benchmarks…")
         self._log(f"[ui] benchmarks starting (out={out_dir})")
 
@@ -439,13 +461,32 @@ class BenchmarksDashboard(QWidget):
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
+    def _stop(self) -> None:
+        if self._worker is None:
+            return
+        self._log("[ui] stopping benchmark…")
+        self.btn_stop.setEnabled(False)
+        self.lbl_status.setText("Stopping…")
+        try:
+            self._worker.requestInterruption()
+        except Exception:
+            pass
+
     def _on_failed(self, msg: str) -> None:
+        self.btn_stop.setEnabled(False)
         self.btn_run.setEnabled(True)
         self.lbl_status.setText("Benchmark failed")
         self._log(f"[ui] benchmark failed: {msg}")
+        if "Cancelled" in msg or "cancelled" in msg or "canceled" in msg:
+            self.btn_run.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.lbl_status.setText("Benchmark stopped")
+            self._log(f"[ui] benchmark stopped: {msg}")
+            return
         QMessageBox.critical(self, "Benchmarks", msg)
 
     def _on_done(self, run_dir_str: str) -> None:
+        self.btn_stop.setEnabled(False)
         self.btn_run.setEnabled(True)
         run_dir = Path(run_dir_str)
         self.lbl_status.setText(f"Complete: {run_dir}")

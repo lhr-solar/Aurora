@@ -293,6 +293,7 @@ def run_once(
     log_last_n: int = 5,
     keep_records: bool = True,
     records_path: Optional[Path] = None,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[Dict[str, Any]], RunSummary]:
     """Run one simulation and return (records, summary)."""
 
@@ -336,6 +337,8 @@ def run_once(
 
     try:
         for rec in eng.run():
+            if cancel is not None and cancel():
+                raise RuntimeError("Cancelled")
             # Optionally retain full per-tick records
             if keep_records:
                 records.append(rec)
@@ -674,6 +677,7 @@ def run_suite(
     log: Optional[Callable[[str], None]] = None,
     log_every_s: float = 0.25,
     keep_records: bool = True,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> List[RunSummary]:
     """Run Algorithm × Scenario × Budget and write JSONL output."""
 
@@ -686,6 +690,8 @@ def run_suite(
     for algo in algorithms:
         for sc in scenarios:
             for bd in budgets:
+                if cancel is not None and cancel():
+                    raise RuntimeError("Cancelled")
                 if log is not None:
                     log(
                         f"[bench] START algo={algo.name} scenario={sc.name} budget={bd.name} dt={bd.dt} total_time={total_time}"
@@ -706,6 +712,7 @@ def run_suite(
                     log_every_s=log_every_s,
                     keep_records=keep_records,
                     records_path=rec_path if save_records else None,
+                    cancel=cancel,
                 )
 
                 summaries.append(summary)
