@@ -26,7 +26,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 
 from core.controller.hybrid_controller import HybridConfig
 
@@ -173,6 +173,52 @@ def extract_perf(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[float],
     return ctrl, ref, over
 
 
+# --- Formatting and streaming helpers -----------------------------------------
+
+def _fmt(x: Any, nd: int = 4) -> str:
+    try:
+        if x is None:
+            return "None"
+        xf = float(x)
+        if xf != xf:  # NaN
+            return "nan"
+        return f"{xf:.{nd}f}"
+    except Exception:
+        return str(x)
+
+
+def format_bench_line(rec: Dict[str, Any], *, tick: int) -> str:
+    gmpp = rec.get("gmpp") or {}
+    perf = rec.get("perf") or {}
+    action = rec.get("action") or {}
+    dbg = {}
+    if isinstance(action, dict):
+        dbg = action.get("debug") or {}
+    state = None
+    reason = None
+    if isinstance(dbg, dict):
+        state = dbg.get("state")
+        reason = dbg.get("reason")
+
+    v_cmd = rec.get("v_cmd")
+    if v_cmd is None:
+        v_cmd = (action.get("v_ref") if isinstance(action, dict) else None)
+
+    msg = (
+        "[bench] "
+        f"tick={tick} "
+        f"t={_fmt(rec.get('t'), 4)} dt={_fmt(rec.get('dt'), 6)} | "
+        f"g={_fmt(rec.get('g'), 1)} t_mod={_fmt(rec.get('t_mod'), 2)} | "
+        f"v_cmd={_fmt(v_cmd, 4)} | "
+        f"meas(v,i,p)=({_fmt(rec.get('v'), 4)},{_fmt(rec.get('i'), 4)},{_fmt(rec.get('p'), 4)}) | "
+        f"eff={_fmt(gmpp.get('eff_best'), 4)} | "
+        f"ctrl_us={_fmt(perf.get('ctrl_us'), 1)} over={bool(perf.get('over_budget', False))}"
+    )
+    if state is not None or reason is not None:
+        msg += f" | state={state} reason={reason}"
+    return msg
+
+
 def summarize_records(
     algo: AlgorithmSpec,
     scenario: ScenarioSpec,
@@ -241,6 +287,12 @@ def run_once(
     gmpp_ref_period_s: float,
     gmpp_ref_points: int,
     perf_enabled: bool = True,
+    log: Optional[Callable[[str], None]] = None,
+    log_every_s: float = 0.25,
+    log_first_n: int = 5,
+    log_last_n: int = 5,
+    keep_records: bool = True,
+    records_path: Optional[Path] = None,
 ) -> Tuple[List[Dict[str, Any]], RunSummary]:
     """Run one simulation and return (records, summary)."""
 
@@ -266,22 +318,134 @@ def run_once(
 
     t0 = time.perf_counter()
     eng = SimulationEngine(cfg)
-    records = list(eng.run())
+
+    records: List[Dict[str, Any]] = []
+    eff_true_series: List[float] = []
+    eff_meas_series: List[float] = []
+    ctrl_us: List[float] = []
+    ref_us: List[float] = []
+    budget_viol = 0
+
+    tick = 0
+    last_log_wall = time.monotonic()
+
+    f = None
+    if records_path is not None:
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        f = records_path.open("w", encoding="utf-8")
+
+    try:
+        for rec in eng.run():
+            # Optionally retain full per-tick records
+            if keep_records:
+                records.append(rec)
+
+            # Optionally stream-save records to JSONL
+            if f is not None:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            # Online accumulation for summary (so keep_records can be False)
+            et, em = extract_gmpp_eff(rec)
+            if et is not None:
+                eff_true_series.append(et)
+            if em is not None:
+                eff_meas_series.append(em)
+            c, r, over = extract_perf(rec)
+            if c is not None:
+                ctrl_us.append(c)
+            if r is not None:
+                ref_us.append(r)
+            if over:
+                budget_viol += 1
+
+            tick += 1
+
+            # Streaming terminal logs (throttled)
+            if log is not None:
+                now = time.monotonic()
+                if tick <= log_first_n:
+                    log(format_bench_line(rec, tick=tick))
+                    last_log_wall = now
+                elif log_every_s > 0 and (now - last_log_wall) >= log_every_s:
+                    log(format_bench_line(rec, tick=tick))
+                    last_log_wall = now
+    finally:
+        if f is not None:
+            f.close()
+
     wall_s = time.perf_counter() - t0
 
-    summary = summarize_records(algo, scenario, budget, records, wall_s)
+    # Build summary from online series (works whether or not we kept records)
+    summary = RunSummary(
+        algo=algo.name,
+        scenario=scenario.name,
+        budget=budget.name,
+        n_ticks=int(tick),
+        wall_s=float(wall_s),
+        budget_violations=int(budget_viol),
+    )
+
+    if eff_true_series:
+        summary.eff_true_final = float(eff_true_series[-1])
+        summary.eff_true_median = float(median(eff_true_series))
+    if eff_meas_series:
+        summary.eff_meas_final = float(eff_meas_series[-1])
+        summary.eff_meas_median = float(median(eff_meas_series))
+
+    if ctrl_us:
+        summary.ctrl_us_p50 = float(percentile(ctrl_us, 0.50) or 0.0)
+        summary.ctrl_us_p95 = float(percentile(ctrl_us, 0.95) or 0.0)
+        summary.ctrl_us_p99 = float(percentile(ctrl_us, 0.99) or 0.0)
+    if ref_us:
+        summary.ref_us_p50 = float(percentile(ref_us, 0.50) or 0.0)
+        summary.ref_us_p95 = float(percentile(ref_us, 0.95) or 0.0)
+
+    summary.extra["scenario_description"] = scenario.description
+    summary.extra["budget"] = asdict(budget)
+
+    # If requested, log the last N ticks (using retained records if available,
+    # otherwise reload from JSONL if we saved)
+    if log is not None and log_last_n > 0:
+        tail: List[Dict[str, Any]] = []
+        if keep_records and records:
+            tail = records[-min(log_last_n, len(records)) :]
+        elif records_path is not None and records_path.exists():
+            try:
+                # Load only the last N lines
+                with records_path.open("r", encoding="utf-8") as rf:
+                    lines = rf.readlines()
+                for line in lines[-min(log_last_n, len(lines)) :]:
+                    tail.append(json.loads(line))
+            except Exception:
+                tail = []
+        if tail:
+            log(f"[bench] ... last {len(tail)} ticks:")
+            start_tick = int(tick) - int(len(tail)) + 1
+            for j, rec in enumerate(tail):
+                true_tick = start_tick + j
+                log(format_bench_line(rec, tick=true_tick))
 
     # Attach richer metrics (energy ratio, settle time, ripple) if available.
-    # Keep this import local so the runner still works even if the package path
-    # differs in certain launch contexts.
+    # Requires full records; if keep_records=False but records were saved, reload them.
     try:
         from benchmarks.metrics import compute_metrics  # type: ignore
 
-        m = compute_metrics(records)
+        recs_for_metrics: Optional[List[Dict[str, Any]]] = None
+        if keep_records:
+            recs_for_metrics = records
+        elif records_path is not None and records_path.exists():
+            recs_for_metrics = []
+            with records_path.open("r", encoding="utf-8") as rf:
+                for line in rf:
+                    recs_for_metrics.append(json.loads(line))
+
+        if recs_for_metrics is None:
+            raise RuntimeError("metrics require records; set keep_records=True or save_records=True")
+
+        m = compute_metrics(recs_for_metrics)
         m_dict = asdict(m)
         summary.extra["metrics"] = m_dict
 
-        # Convenience copies (top-level in extra) for easy JSONL filtering
         for k in (
             "energy_true_ratio",
             "energy_meas_ratio",
@@ -293,7 +457,6 @@ def run_once(
             if k in m_dict:
                 summary.extra[k] = m_dict[k]
     except Exception as e:
-        # Non-fatal: runner can still emit basic summaries
         summary.extra["metrics_error"] = str(e)
 
     return records, summary
@@ -508,6 +671,9 @@ def run_suite(
     gmpp_ref_points: int,
     out_dir: Path,
     save_records: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+    log_every_s: float = 0.25,
+    keep_records: bool = True,
 ) -> List[RunSummary]:
     """Run Algorithm × Scenario × Budget and write JSONL output."""
 
@@ -520,6 +686,13 @@ def run_suite(
     for algo in algorithms:
         for sc in scenarios:
             for bd in budgets:
+                if log is not None:
+                    log(
+                        f"[bench] START algo={algo.name} scenario={sc.name} budget={bd.name} dt={bd.dt} total_time={total_time}"
+                    )
+                rec_path = None
+                if save_records:
+                    rec_path = out_dir / run_id / "records" / f"{algo.name}__{sc.name}__{bd.name}.jsonl"
                 records, summary = run_once(
                     algo,
                     sc,
@@ -529,14 +702,24 @@ def run_suite(
                     gmpp_ref_period_s=gmpp_ref_period_s,
                     gmpp_ref_points=gmpp_ref_points,
                     perf_enabled=True,
+                    log=log,
+                    log_every_s=log_every_s,
+                    keep_records=keep_records,
+                    records_path=rec_path if save_records else None,
                 )
 
                 summaries.append(summary)
                 summary_rows.append(asdict(summary))
 
-                if save_records:
-                    rec_path = out_dir / run_id / "records" / f"{algo.name}__{sc.name}__{bd.name}.jsonl"
-                    write_jsonl(rec_path, records)
+                if log is not None:
+                    log(
+                        "[bench] DONE "
+                        f"algo={summary.algo} scenario={summary.scenario} budget={summary.budget} "
+                        f"ticks={summary.n_ticks} wall_s={summary.wall_s:.3f} "
+                        f"eff_true_final={summary.eff_true_final} eff_true_med={summary.eff_true_median} "
+                        f"ctrl_p50={summary.ctrl_us_p50} ctrl_p95={summary.ctrl_us_p95} "
+                        f"viol={summary.budget_violations}"
+                    )
 
     out_path = out_dir / run_id / "summaries.jsonl"
     write_jsonl(out_path, summary_rows)
@@ -553,6 +736,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--gmpp-period", type=float, default=0.25, help="GMPP reference period (s)")
     p.add_argument("--gmpp-points", type=int, default=300, help="Points per reference sweep")
     p.add_argument("--save-records", action="store_true", help="Also save per-tick records")
+    p.add_argument("--log-every", type=float, default=0.25, help="Terminal/log update period (s)")
+    p.add_argument("--no-keep-records", action="store_true", help="Do not keep full records in memory (requires --save-records for metrics)")
 
     # Optional: hook into registry
     p.add_argument("--use-registry", action="store_true", help="Resolve algorithms by name from a registry")
@@ -594,6 +779,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gmpp_ref_points=int(args.gmpp_points),
         out_dir=out_dir,
         save_records=bool(args.save_records),
+        log=None,
+        log_every_s=float(args.log_every),
+        keep_records=not bool(args.no_keep_records),
     )
 
     return 0

@@ -114,6 +114,8 @@ class _BenchWorker(QThread):
         gmpp_period: float,
         gmpp_points: int,
         save_records: bool,
+        log_every_s: float,
+        keep_records: bool,
     ) -> None:
         super().__init__()
         self.algo_specs = list(algo_specs)
@@ -125,6 +127,8 @@ class _BenchWorker(QThread):
         self.gmpp_period = float(gmpp_period)
         self.gmpp_points = int(gmpp_points)
         self.save_records = bool(save_records)
+        self.log_every_s = float(log_every_s)
+        self.keep_records = bool(keep_records)
 
     def run(self) -> None:
         try:
@@ -166,6 +170,9 @@ class _BenchWorker(QThread):
                 gmpp_ref_points=self.gmpp_points,
                 out_dir=self.out_dir,
                 save_records=self.save_records,
+                log=self.log.emit,
+                log_every_s=self.log_every_s,
+                keep_records=self.keep_records,
             )
 
             # Identify newest run folder
@@ -226,6 +233,16 @@ class BenchmarksDashboard(QWidget):
         self.sp_gmpp_points.setRange(50, 5000)
         self.sp_gmpp_points.setValue(300)
 
+        self.sp_log_every = QDoubleSpinBox()
+        self.sp_log_every.setRange(0.0, 5.0)
+        self.sp_log_every.setSingleStep(0.05)
+        self.sp_log_every.setValue(0.25)
+        self.sp_log_every.setSuffix(" s")
+
+        self.chk_no_keep_records = QCheckBox("Don't keep records in memory")
+        self.chk_no_keep_records.setChecked(False)
+        self.chk_no_keep_records.setToolTip("If enabled, runner will not store per-tick records in RAM. For metrics, enable 'Save per-tick records'.")
+
         self.chk_save_records = QCheckBox("Save per-tick records")
         self.chk_save_records.setChecked(False)
 
@@ -247,6 +264,9 @@ class BenchmarksDashboard(QWidget):
         top.addWidget(self.sp_gmpp_period)
         top.addWidget(QLabel("Pts:"))
         top.addWidget(self.sp_gmpp_points)
+        top.addWidget(QLabel("Log every:"))
+        top.addWidget(self.sp_log_every)
+        top.addWidget(self.chk_no_keep_records)
         top.addWidget(self.chk_save_records)
         top.addStretch(1)
         top.addWidget(self.btn_open)
@@ -389,6 +409,14 @@ class BenchmarksDashboard(QWidget):
         out_dir = Path(self.out_path.text()).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        if self.chk_no_keep_records.isChecked() and not self.chk_save_records.isChecked():
+            QMessageBox.warning(
+                self,
+                "Benchmarks",
+                "If you disable keeping records in memory, enable 'Save per-tick records' so metrics can be computed.",
+            )
+            return
+
         self.btn_run.setEnabled(False)
         self.lbl_status.setText("Running benchmarks…")
         self._log(f"[ui] benchmarks starting (out={out_dir})")
@@ -403,6 +431,8 @@ class BenchmarksDashboard(QWidget):
             gmpp_period=float(self.sp_gmpp_period.value()),
             gmpp_points=int(self.sp_gmpp_points.value()),
             save_records=bool(self.chk_save_records.isChecked()),
+            log_every_s=float(self.sp_log_every.value()),
+            keep_records=not bool(self.chk_no_keep_records.isChecked()),
         )
         self._worker.log.connect(self._log)
         self._worker.done.connect(self._on_done)
