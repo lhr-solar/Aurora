@@ -404,6 +404,8 @@ class SimulationEngine:
         """
         t = 0.0
         v = self.cfg.start_v
+        k = 0  # step index (0 = initial sample)
+
         # Best-so-far should be tracked on TRUE plant power (pre noise/quantization)
         p_best_true = -1e18
         v_best_true = v
@@ -432,9 +434,13 @@ class SimulationEngine:
                 "Array object has no callable method to compute current at a voltage. "
                 "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
             )
+        v_cmd = float(v)  # initial command equals start_v
         i = float(i_fn(v))
         g_meas = float(sum(g0) / len(g0)) if isinstance(g0, (list, tuple)) else float(g0)
         p_true = float(v * i)
+        v_true = float(v)
+        i_true = float(i)
+        # p_true already computed above
         if p_true > p_best_true:
             p_best_true = p_true
             v_best_true = float(v)
@@ -485,6 +491,11 @@ class SimulationEngine:
             last_ref_us = ref_us
             next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
         extra0 = {"gmpp": gmpp} if gmpp else {}
+        extra0["k"] = int(k)
+        extra0["v_cmd"] = float(v_cmd)
+        extra0["v_true"] = float(v_true)
+        extra0["i_true"] = float(i_true)
+        extra0["p_true"] = float(p_true)
         if self.cfg.perf_enabled:
             extra0["perf"] = {
                 "ctrl_us": ctrl_us,
@@ -502,6 +513,7 @@ class SimulationEngine:
         steps = int(self.cfg.total_time / self.cfg.dt)
         for _ in range(steps):
             t += self.cfg.dt
+            k += 1
 
             # apply controller action (voltage-mode)
             if a.v_ref is not None:
@@ -515,6 +527,9 @@ class SimulationEngine:
             self.plant.set_conditions(g_now, t_now)
             v, i = self.plant.step(v_cmd)
             p_true = float(v * i)
+            v_true = float(v)
+            i_true = float(i)
+            # p_true already computed above
             if p_true > p_best_true:
                 p_best_true = p_true
                 v_best_true = float(v)
@@ -587,6 +602,11 @@ class SimulationEngine:
 
             # emit a JSON-friendly record
             extra = {"gmpp": gmpp} if gmpp else {}
+            extra["k"] = int(k)
+            extra["v_cmd"] = float(v_cmd)
+            extra["v_true"] = float(v_true)
+            extra["i_true"] = float(i_true)
+            extra["p_true"] = float(p_true)
             if self.cfg.perf_enabled:
                 extra["perf"] = {
                     "ctrl_us": ctrl_us,

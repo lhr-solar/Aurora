@@ -1,5 +1,3 @@
-
-
 """ui.desktop.terminal_panel
 
 Reusable terminal/log panel for Aurora.
@@ -15,6 +13,7 @@ Use:
     panel.append_line("hello")
     panel.attach_process(proc)
 """
+import time
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,14 +30,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-
 @dataclass
 class TerminalSaveOptions:
     default_dir: Path = Path(".")
     default_name: str = "aurora_log.txt"
-
-
 class TerminalPanel(QWidget):
     """A lightweight terminal/log panel."""
 
@@ -50,7 +45,7 @@ class TerminalPanel(QWidget):
         *,
         title: str = "Terminal",
         placeholder: str = "Output will appear here…",
-        max_blocks: int = 5000,
+        max_blocks: int = 50000,
         enable_input: bool = False,
         save_opts: Optional[TerminalSaveOptions] = None,
     ) -> None:
@@ -68,10 +63,22 @@ class TerminalPanel(QWidget):
         header.addWidget(self.title_label)
         header.addStretch(1)
 
+        self.btn_autoscroll = QPushButton("Auto-scroll")
+        self.btn_autoscroll.setCheckable(True)
+        self.btn_autoscroll.setChecked(True)
+        self._autoscroll = True
+
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.setCheckable(True)
         self.btn_clear = QPushButton("Clear")
         self.btn_save = QPushButton("Save…")
+
+        header.addWidget(self.btn_autoscroll)
+        header.addWidget(self.btn_pause)
         header.addWidget(self.btn_clear)
         header.addWidget(self.btn_save)
+
+        self._paused = False
 
         root.addLayout(header)
 
@@ -104,24 +111,70 @@ class TerminalPanel(QWidget):
 
             btn.clicked.connect(self._on_send)
             inp.returnPressed.connect(self._on_send)
+        
 
+        self._min_update_period_s = 0.02  # 20ms
+        self._last_update_wall = 0.0
+        self._pending_text = ""
+        
         # Wire buttons
         self.btn_clear.clicked.connect(self.clear)
         self.btn_save.clicked.connect(self.save)
+        self.btn_pause.toggled.connect(self._on_pause_toggled)
+        self.btn_autoscroll.toggled.connect(self._on_autoscroll_toggled)
 
     # ---------------------------
     # Public API
     # ---------------------------
+    def _on_pause_toggled(self, checked: bool) -> None:
+        self._paused = checked
+        self.btn_pause.setText("Resume" if checked else "Pause")
+        if not checked:
+            self._flush_pending()
+
+    def _on_autoscroll_toggled(self, checked: bool) -> None:
+        self._autoscroll = checked
+
+    def _flush_pending(self) -> None:
+        """Flush any buffered text to the widget immediately (ignores rate limit)."""
+        if not self._pending_text:
+            return
+        text_to_add = self._pending_text
+        self._pending_text = ""
+        cursor = self.out.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(text_to_add)
+        self.out.setTextCursor(cursor)
+        if self._autoscroll:
+            self.out.ensureCursorVisible()
+
     def append_text(self, text: str) -> None:
         """Append raw text (no newline normalization)."""
         if not text:
             return
+        # While paused, buffer incoming text but do not flush to the widget.
+        if self._paused:
+            self._pending_text += text
+            return
+        # Buffer text and flush to the widget at most every _min_update_period_s seconds
+        self._pending_text += text
+        now = time.monotonic()
+        if self._min_update_period_s > 0 and (now - self._last_update_wall) < self._min_update_period_s:
+            return
+        self._last_update_wall = now
+
+        text_to_add = self._pending_text
+        self._pending_text = ""
+        if not text_to_add:
+            return
+
         # Preserve existing newlines; QPlainTextEdit appends at the end
         cursor = self.out.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertText(text)
+        cursor.insertText(text_to_add)
         self.out.setTextCursor(cursor)
-        self.out.ensureCursorVisible()
+        if self._autoscroll:
+            self.out.ensureCursorVisible()
 
     def append_line(self, line: str) -> None:
         """Append a single line with newline handling."""
@@ -133,6 +186,7 @@ class TerminalPanel(QWidget):
         self.append_text(s)
 
     def clear(self) -> None:
+        self._pending_text = ""
         self.out.clear()
 
     def set_title(self, title: str) -> None:
@@ -175,6 +229,7 @@ class TerminalPanel(QWidget):
 
     def save(self) -> None:
         """Save the current terminal buffer to a text file."""
+        self._flush_pending()
         start_dir = str(self._save_opts.default_dir)
         default_name = self._save_opts.default_name
         path_str, _ = QFileDialog.getSaveFileName(

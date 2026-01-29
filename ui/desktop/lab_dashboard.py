@@ -11,6 +11,7 @@ Saved runs are written to Aurora/data/runs and can be reopened.
 
 import ast
 import csv
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -66,6 +67,12 @@ class RunData:
     p_best: List[float]
     eff_best: List[float]
     g_strings: List[Optional[str]]
+    
+    k: List[float]
+    v_cmd: List[float]
+    v_true: List[float]
+    i_true: List[float]
+    p_true: List[float]
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -118,6 +125,11 @@ def load_run_csv(path: Path) -> RunData:
     p_best: List[float] = []
     eff_best: List[float] = []
     g_strings: List[Optional[str]] = []
+    k: List[float] = []
+    v_cmd: List[float] = []
+    v_true: List[float] = []
+    i_true: List[float] = []
+    p_true: List[float] = []
 
     last_state = "UNKNOWN"
 
@@ -128,6 +140,11 @@ def load_run_csv(path: Path) -> RunData:
             if tt is None:
                 continue
             t.append(float(tt))
+            k.append(float(_safe_float(row.get("k")) or float("nan")))
+            v_cmd.append(float(_safe_float(row.get("v_cmd")) or float("nan")))
+            v_true.append(float(_safe_float(row.get("v_true")) or float("nan")))
+            i_true.append(float(_safe_float(row.get("i_true")) or float("nan")))
+            p_true.append(float(_safe_float(row.get("p_true")) or float("nan")))
             v.append(float(_safe_float(row.get("v")) or float("nan")))
             i.append(float(_safe_float(row.get("i")) or float("nan")))
             p.append(float(_safe_float(row.get("p")) or float("nan")))
@@ -171,6 +188,11 @@ def load_run_csv(path: Path) -> RunData:
         p_best=p_best,
         eff_best=eff_best,
         g_strings=g_strings,
+        k=k,
+        v_cmd=v_cmd,
+        v_true=v_true,
+        i_true=i_true,
+        p_true=p_true,
     )
 
 
@@ -267,6 +289,11 @@ class _MPPTWorker(QThread):
             fieldnames = [
                 "t",
                 "dt",
+                "k",
+                "v_cmd",
+                "v_true",
+                "i_true",
+                "p_true",
                 "v",
                 "i",
                 "p",
@@ -296,6 +323,11 @@ class _MPPTWorker(QThread):
                     row = {
                         "t": rec.get("t"),
                         "dt": rec.get("dt"),
+                        "k": rec.get("k"),
+                        "v_cmd": rec.get("v_cmd"),
+                        "v_true": rec.get("v_true"),
+                        "i_true": rec.get("i_true"),
+                        "p_true": rec.get("p_true"),
                         "v": rec.get("v"),
                         "i": rec.get("i"),
                         "p": rec.get("p"),
@@ -348,6 +380,13 @@ class LabDashboard(QWidget):
 
         self.terminal = terminal
         self.overrides = overrides
+        
+        # Terminal streaming (per-sample) config.
+        # dt can be tiny (e.g. 0.001) so logging EVERY sample can freeze the UI.
+        # We default to streaming at a sane rate, but still show the latest state continuously.
+        self._term_stream_samples = True
+        self._term_period_s = 0.05  # log at most every 50ms of wall time
+        self._last_term_wall = 0.0
 
         # Repo root (Aurora/ui/desktop/lab_dashboard.py)
         self._repo_root = Path(__file__).resolve().parents[2]
@@ -458,6 +497,19 @@ class LabDashboard(QWidget):
         self.gmpp_chk = QCheckBox("Compute GMPP reference")
         self.gmpp_chk.setChecked(True)
         left_l.addWidget(self.gmpp_chk)
+        
+        # Terminal streaming controls
+        self.term_stream_chk = QCheckBox("Terminal: stream samples")
+        self.term_stream_chk.setChecked(True)
+        left_l.addWidget(self.term_stream_chk)
+
+        term_row = QHBoxLayout()
+        term_row.addWidget(QLabel("Terminal period (s)"))
+        self.term_period_edit = QLineEdit("0.05")
+        self.term_period_edit.setFixedWidth(80)
+        term_row.addWidget(self.term_period_edit)
+        term_row.addStretch(1)
+        left_l.addLayout(term_row)
 
         btn_row = QHBoxLayout()
         self.btn_run = QPushButton("Run")
@@ -521,10 +573,14 @@ class LabDashboard(QWidget):
         self.use_csv_chk.stateChanged.connect(self._on_profile_mode_changed)
         self.btn_browse_profile.clicked.connect(self.browse_profile_csv)
         self.btn_profile_editor.clicked.connect(self.open_profile_editor)
+        self.term_stream_chk.stateChanged.connect(self._on_terminal_settings_changed)
+        self.term_period_edit.editingFinished.connect(self._on_terminal_settings_changed)
 
         self.refresh_runs()
         self._on_override_changed()
         self._on_profile_mode_changed()
+        self._on_terminal_settings_changed()
+        
     def _on_profile_mode_changed(self) -> None:
         use_csv = self.use_csv_chk.isChecked()
         self.profile_edit.setEnabled(not use_csv)
@@ -579,6 +635,70 @@ class LabDashboard(QWidget):
     def _log(self, msg: str) -> None:
         if self.terminal is not None:
             self.terminal.append_line(msg)
+    
+    def _on_terminal_settings_changed(self) -> None:
+        self._term_stream_samples = bool(self.term_stream_chk.isChecked())
+        try:
+            self._term_period_s = max(0.0, float(self.term_period_edit.text().strip()))
+        except Exception:
+            self._term_period_s = 0.05
+            self.term_period_edit.setText("0.05")
+
+    def _fmt(self, x: Any, nd: int = 4) -> str:
+        try:
+            if x is None:
+                return "None"
+            xf = float(x)
+            if xf != xf:  # NaN
+                return "nan"
+            return f"{xf:.{nd}f}"
+        except Exception:
+            return str(x)
+
+    def _maybe_log_sample(self, row: Dict[str, Any], *, state: str, reason: Optional[str]) -> None:
+        if self.terminal is None or not self._term_stream_samples:
+            return
+
+        now = time.monotonic()
+        if self._term_period_s > 0 and (now - self._last_term_wall) < self._term_period_s:
+            return
+        self._last_term_wall = now
+
+        # Row already contains the flattened “CSV shape” fields.
+        msg = (
+            "[sim] "
+            f"k={self._fmt(row.get('k'), 0)} "
+            f"t={self._fmt(row.get('t'), 4)} dt={self._fmt(row.get('dt'), 6)} | "
+            f"g={self._fmt(row.get('g'), 1)} t_mod={self._fmt(row.get('t_mod'), 2)} | "
+            f"v_cmd={self._fmt(row.get('v_cmd'), 4)} v_ref={self._fmt(row.get('v_ref'), 4)} | "
+            f"meas(v,i,p)=({self._fmt(row.get('v'), 4)},{self._fmt(row.get('i'), 4)},{self._fmt(row.get('p'), 4)}) | "
+            f"true(v,i,p)=({self._fmt(row.get('v_true'), 4)},{self._fmt(row.get('i_true'), 4)},{self._fmt(row.get('p_true'), 4)}) | "
+            f"state={state}"
+        )
+        if reason:
+            msg += f" reason={reason}"
+
+        # Always include action_debug if present
+        ad = row.get("action_debug")
+        if isinstance(ad, str) and ad.strip():
+            msg += f" | action_debug={ad}"
+
+        # Robust GMPP validator fields (if enabled / present)
+        if row.get("v_gmp_ref") is not None or row.get("p_gmp_ref") is not None:
+            msg += (
+                " | gmpp:"
+                f" v_gmp_ref={self._fmt(row.get('v_gmp_ref'), 4)}"
+                f" p_gmp_ref={self._fmt(row.get('p_gmp_ref'), 4)}"
+                f" v_best={self._fmt(row.get('v_best'), 4)}"
+                f" p_best={self._fmt(row.get('p_best'), 4)}"
+                f" eff_best={self._fmt(row.get('eff_best'), 4)}"
+            )
+
+        gs = row.get("g_strings")
+        if isinstance(gs, str) and gs.strip():
+            msg += f" | g_strings={gs}"
+
+        self._log(msg)
 
     def refresh_runs(self) -> None:
         self.run_list.clear()
@@ -686,6 +806,11 @@ class LabDashboard(QWidget):
             t=[], v=[], i=[], p=[], g=[], t_mod=[],
             state=[], reason=[],
             v_gmp_ref=[], p_gmp_ref=[], v_best=[], p_best=[], eff_best=[], g_strings=[],
+            k=[],
+            v_cmd=[],
+            v_true=[],
+            i_true=[],
+            p_true=[],
         )
 
         self._log(f"[ui] Starting MPPT -> {out_path}")
@@ -753,6 +878,11 @@ class LabDashboard(QWidget):
         if tt is None:
             return
         rd.t.append(float(tt))
+        rd.k.append(float(_safe_float(row.get("k")) or float("nan")))
+        rd.v_cmd.append(float(_safe_float(row.get("v_cmd")) or float("nan")))
+        rd.v_true.append(float(_safe_float(row.get("v_true")) or float("nan")))
+        rd.i_true.append(float(_safe_float(row.get("i_true")) or float("nan")))
+        rd.p_true.append(float(_safe_float(row.get("p_true")) or float("nan")))
         rd.v.append(float(_safe_float(row.get("v")) or float("nan")))
         rd.i.append(float(_safe_float(row.get("i")) or float("nan")))
         rd.p.append(float(_safe_float(row.get("p")) or float("nan")))
@@ -781,6 +911,7 @@ class LabDashboard(QWidget):
             last_state = st
         rd.state.append(last_state)
         rd.reason.append(rsn if isinstance(rsn, str) and rsn else None)
+        self._maybe_log_sample(row, state=last_state, reason=(rsn if isinstance(rsn, str) and rsn else None))
 
     def _refresh_live_plot(self) -> None:
         if self._rd is None or len(self._rd.t) < 2:
@@ -863,6 +994,3 @@ class LabDashboard(QWidget):
 
         if rd.t:
             self.g_plot.setXRange(rd.t[0], rd.t[-1], padding=0.01)
-
-        if hasattr(self, "gmpp_chk"):
-            self._log(f"[ui] gmpp_ref={self.gmpp_chk.isChecked()}")
