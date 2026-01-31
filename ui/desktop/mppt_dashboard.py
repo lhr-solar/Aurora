@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover
 # Simulation engine (Option A)
 from simulators.engine import SimulationConfig, SimulationEngine, LiveOverrides
 from core.controller.hybrid_controller import HybridConfig
+from core.mppt_algorithms import registry as mppt_registry
 from simulators.mppt_sim import get_profile
 
 from ui.desktop.terminal_panel import TerminalPanel
@@ -273,7 +274,7 @@ class _MPPTWorker(QThread):
         self,
         *,
         out_path: Path,
-        algo: str,
+        selection: str,
         profile_name: str,
         total_time: float,
         dt: float,
@@ -281,7 +282,7 @@ class _MPPTWorker(QThread):
     ) -> None:
         super().__init__()
         self.out_path = out_path
-        self.algo = algo
+        self.selection = selection
         self.profile_name = profile_name
         self.total_time = total_time
         self.dt = dt
@@ -295,8 +296,22 @@ class _MPPTWorker(QThread):
         try:
             profile = get_profile(self.profile_name)
 
-            # Force the NORMAL (local tracker) algorithm while keeping the hybrid structure.
-            hcfg = HybridConfig(normal_name=self.algo)
+            sel = (self.selection or "hybrid").strip()
+            sel_l = sel.lower()
+
+            if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+                controller_mode = "hybrid"
+                algo_name = None
+                controller_cfg = HybridConfig()
+            else:
+                # Single algorithm run (alias-aware)
+                if not mppt_registry.is_valid(sel):
+                    raise SystemExit(
+                        f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
+                    )
+                controller_mode = "single"
+                algo_name = mppt_registry.resolve_key(sel)
+                controller_cfg = None
 
             # Ensure output directory exists
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,7 +364,10 @@ class _MPPTWorker(QThread):
                     start_v=18.0,
                     array_kwargs={"n_strings": 2, "substrings_per_string": 3, "cells_per_substring": 18},
                     env_profile=profile,
-                    controller_cfg=hcfg,
+                    controller_mode=controller_mode,
+                    algo_name=algo_name,
+                    algo_kwargs={},
+                    controller_cfg=controller_cfg,
                     overrides=self.overrides,
                     on_sample=_on_sample,
                 )
@@ -402,11 +420,15 @@ class MPPTDashboard(QWidget):
 
         controls.addWidget(QLabel("Algo"))
         self.algo_box = QComboBox()
-        self.algo_box.setEditable(True)
-        # Defaults (editable; user can type any string)
-        # Keep in sync with simulators.mppt_sim (it prints the available list on error)
-        self.algo_box.addItems(["ruca", "mepo", "nl_esc", "pando", "pso"])
-        self.algo_box.setCurrentText("ruca")
+        self.algo_box.setEditable(False)
+
+        # Special controller choice + canonical registry algorithms
+        self.algo_box.addItem("Hybrid (controller)", "hybrid")
+        for key in mppt_registry.ALGORITHMS:
+            self.algo_box.addItem(key, key)
+
+        # Default to Hybrid so users don't accidentally think RUCA == hybrid
+        self.algo_box.setCurrentIndex(0)
         controls.addWidget(self.algo_box)
 
         controls.addWidget(QLabel("Profile"))
@@ -726,17 +748,8 @@ class MPPTDashboard(QWidget):
             QMessageBox.warning(self, "Invalid settings", "Time and dt must be positive numbers.")
             return
 
-        algo = self.algo_box.currentText().strip() or "ruca"
-        known_algos = {self.algo_box.itemText(i) for i in range(self.algo_box.count())}
-        if algo not in known_algos:
-            QMessageBox.warning(
-                self,
-                "Unknown algorithm",
-                "Unknown algorithm name.\n\n"
-                f"You entered: {algo}\n"
-                f"Known options: {', '.join(sorted(known_algos))}",
-            )
-            return
+        # Use canonical selection value stored in the combo box
+        algo = str(self.algo_box.currentData() or "hybrid")
 
         profile = self.profile_box.currentText().strip() or "cloud"
         if profile.lower() == "csv":
@@ -758,7 +771,7 @@ class MPPTDashboard(QWidget):
 
         # Clear UI
         self._append_log(f"[ui] Starting MPPT (in-process) -> {out_path}\n")
-        self._append_log(f"[ui] algo={algo} profile={profile} time={sim_time} dt={dt}\n")
+        self._append_log(f"[ui] selection={algo} profile={profile} time={sim_time} dt={dt}\n")
 
         if pg is not None and self.p_plot is not None and self.v_plot is not None:
             self.p_plot.clear(); self.v_plot.clear()
@@ -776,7 +789,7 @@ class MPPTDashboard(QWidget):
         # Start worker
         w = _MPPTWorker(
             out_path=out_path,
-            algo=algo,
+            selection=algo,
             profile_name=profile,
             total_time=sim_time,
             dt=dt,

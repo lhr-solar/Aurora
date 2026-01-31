@@ -29,6 +29,7 @@ from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 
 from core.controller.hybrid_controller import HybridConfig
+from core.mppt_algorithms import registry as mppt_registry
 
 
 # --- Imports from Aurora ------------------------------------------------------
@@ -80,14 +81,24 @@ class BudgetSpec:
 class AlgorithmSpec:
     """A named MPPT controller configuration.
 
-    `controller_cfg` is passed directly to SimulationConfig. In your repo this is
-    typically a dataclass/config object consumed by the hybrid controller.
+    Aurora supports two controller modes:
+      - hybrid: HybridMPPT state machine (uses HybridConfig)
+      - single: run exactly one registry algorithm for the full run
 
-    If you want to support string names -> configs, add a resolver.
+    For backward compatibility, `controller_cfg` can still be provided; if
+    controller_mode is not specified we treat it as a hybrid config.
     """
 
     name: str
-    controller_cfg: Any
+
+    # New controller selection API (preferred)
+    controller_mode: str = "hybrid"          # "hybrid" or "single"
+    algo_name: Optional[str] = None           # required when controller_mode == "single"
+    algo_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # Legacy hybrid config (still supported)
+    controller_cfg: Any = None
+
     description: str = ""
 
 
@@ -300,7 +311,11 @@ def run_once(
     cfg = SimulationConfig(
         total_time=float(total_time),
         dt=float(budget.dt),
-        controller_cfg=algo.controller_cfg,
+        # Controller selection
+        controller_mode=str(getattr(algo, "controller_mode", "hybrid")),
+        algo_name=getattr(algo, "algo_name", None),
+        algo_kwargs=getattr(algo, "algo_kwargs", {}) or {},
+        controller_cfg=(algo.controller_cfg if str(getattr(algo, "controller_mode", "hybrid")).strip().lower() != "single" else None),
         env_profile=scenario.env_profile,
         gmpp_ref=bool(gmpp_ref),
         gmpp_ref_period_s=float(gmpp_ref_period_s),
@@ -526,42 +541,32 @@ def default_scenarios() -> List[ScenarioSpec]:
 
 
 def default_algorithms() -> List[AlgorithmSpec]:
-    """Fallback algorithms if you don't use --use-registry.
+    """Default algorithm set.
 
-    These use HybridConfig defaults but vary the NORMAL tracker.
+    Includes:
+      - "hybrid": HybridMPPT controller with default HybridConfig
+      - a few single-algorithm baselines (true single-controller runs)
+
+    This is used when you don't enable --use-registry.
     """
     return [
-        AlgorithmSpec(name="ruca", controller_cfg=HybridConfig(normal_name="ruca")),
-        AlgorithmSpec(name="mepo", controller_cfg=HybridConfig(normal_name="mepo")),
-        AlgorithmSpec(name="pando", controller_cfg=HybridConfig(normal_name="pando")),
+        AlgorithmSpec(name="hybrid", controller_mode="hybrid", controller_cfg=HybridConfig()),
+        AlgorithmSpec(name="ruca", controller_mode="single", algo_name="ruca"),
+        AlgorithmSpec(name="mepo", controller_mode="single", algo_name="mepo"),
+        AlgorithmSpec(name="pando", controller_mode="single", algo_name="pando"),
     ]
 
 
 def _load_mppt_registry_map() -> Dict[str, str]:
-    """Load the MPPT algorithm registry as name -> "module:Class".
-
-    Uses Aurora's lazy MPPT registry at `core.mppt_algorithms.registry`.
-    Returns a dict like {"ruca": "core....:RUCA", ...}.
-    """
-    mod = importlib.import_module("core.mppt_algorithms.registry")
-    available_fn = getattr(mod, "available", None)
-    if not callable(available_fn):
-        raise RuntimeError(
-            "core.mppt_algorithms.registry.available() not found/callable. "
-            "Ensure you are using Aurora's MPPT registry module."
-        )
-    reg_map = available_fn()
-    if not isinstance(reg_map, dict):
-        raise RuntimeError(
-            "core.mppt_algorithms.registry.available() did not return a dict. "
-            f"Got: {type(reg_map)}"
-        )
-    return {str(k): str(v) for k, v in reg_map.items()}
+    """Load the MPPT algorithm registry as name -> "module:Class"."""
+    return {str(k): str(v) for k, v in (mppt_registry.available() or {}).items()}
 
 
 def list_registry_algorithms() -> List[str]:
-    """Return sorted MPPT algorithm keys from the registry."""
-    return sorted(_load_mppt_registry_map().keys())
+    """Return sorted MPPT algorithm keys from the registry plus the special 'hybrid' choice."""
+    keys = sorted(_load_mppt_registry_map().keys())
+    # 'hybrid' is a controller, not a registry algorithm, but we expose it as a top-level benchmark choice.
+    return ["hybrid"] + keys
 
 
 def _parse_algo_spec(spec: str) -> HybridConfig:
@@ -603,11 +608,14 @@ def _parse_algo_spec(spec: str) -> HybridConfig:
 
 
 def resolve_algorithms_from_registry(names: Sequence[str]) -> List[AlgorithmSpec]:
-    """Resolve algorithm names (or specs) into HybridConfig controller_cfg objects.
+    """Resolve user-provided algorithm selections into AlgorithmSpec.
 
-    In Aurora, `SimulationConfig.controller_cfg` expects a `HybridConfig`.
-    We treat each provided `name` as an MPPT registry key for the NORMAL tracker
-    unless the user provides a key=value spec.
+    Rules:
+      - "hybrid" (or hybrid aliases) => HybridMPPT with default HybridConfig
+      - "normal=ruca,global=pso,..." => HybridMPPT with an explicit HybridConfig
+      - "ruca" / "p&o" / "gmpp" etc => SINGLE controller running that registry algo
+
+    This matches the UI semantics: selecting an algo runs it for the entire run.
     """
 
     reg_keys = _load_mppt_registry_map()
@@ -621,36 +629,50 @@ def resolve_algorithms_from_registry(names: Sequence[str]) -> List[AlgorithmSpec
         if not raw:
             continue
 
-        # Build HybridConfig from a spec, then validate selected algos exist
-        try:
-            hc = _parse_algo_spec(raw)
-        except Exception as e:
-            raise RuntimeError(f"Invalid algorithm spec '{raw}': {e}") from e
+        raw_l = raw.lower().strip()
 
-        # Validate each chosen algorithm name exists in MPPT registry
-        for field_name, val in (
-            ("normal", hc.normal_name),
-            ("global", hc.global_name),
-            ("hold", hc.hold_name),
-        ):
-            key = val
-            if key not in reg_keys:
-                # case-insensitive match
-                hit = reg_lc.get(key.lower())
-                if hit is None:
-                    missing.append(f"{field_name}={val}")
-                else:
-                    # normalize casing
-                    if field_name == "normal":
-                        hc.normal_name = hit
-                    elif field_name == "global":
-                        hc.global_name = hit
+        # Special controller choice
+        if raw_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+            resolved.append(AlgorithmSpec(name="hybrid", controller_mode="hybrid", controller_cfg=HybridConfig()))
+            continue
+
+        # Hybrid spec (explicit per-state algorithms)
+        if "=" in raw:
+            try:
+                hc = _parse_algo_spec(raw)
+            except Exception as e:
+                raise RuntimeError(f"Invalid algorithm spec '{raw}': {e}") from e
+
+            # Validate each chosen algorithm name exists in MPPT registry (case-insensitive)
+            for field_name, val in (
+                ("normal", hc.normal_name),
+                ("global", hc.global_name),
+                ("hold", hc.hold_name),
+            ):
+                key = val
+                if key not in reg_keys:
+                    hit = reg_lc.get(str(key).lower())
+                    if hit is None:
+                        missing.append(f"{field_name}={val}")
                     else:
-                        hc.hold_name = hit
+                        if field_name == "normal":
+                            hc.normal_name = hit
+                        elif field_name == "global":
+                            hc.global_name = hit
+                        else:
+                            hc.hold_name = hit
 
-        # Name used for output filenames / tables
-        display_name = raw.replace(" ", "")
-        resolved.append(AlgorithmSpec(name=display_name, controller_cfg=hc))
+            display_name = raw.replace(" ", "")
+            resolved.append(AlgorithmSpec(name=display_name, controller_mode="hybrid", controller_cfg=hc))
+            continue
+
+        # Plain name => single algo (alias-aware)
+        if not mppt_registry.is_valid(raw):
+            missing.append(raw)
+            continue
+
+        canonical = mppt_registry.resolve_key(raw)
+        resolved.append(AlgorithmSpec(name=canonical, controller_mode="single", algo_name=canonical))
 
     if missing:
         raise RuntimeError(

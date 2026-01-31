@@ -3,7 +3,7 @@
 Benchmarks tab for Aurora.
 
 This dashboard provides a simple UI to:
-- select MPPT algorithms (from `core.mppt_algorithms.registry`)
+- select MPPT algorithms (single-controller runs from `core.mppt_algorithms.registry`) or the special `hybrid` controller
 - select benchmark scenarios (from `benchmarks.scenarios`)
 - select budgets (from `benchmarks.runner.default_budgets()`)
 - run the benchmark suite in a background thread
@@ -307,6 +307,9 @@ class BenchmarksDashboard(QWidget):
 
         self.list_algos = QListWidget()
         self.list_algos.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.list_algos.setToolTip(
+            "Select 'Hybrid (controller)' to run the HybridMPPT state machine, or select registry algorithms (ruca, pando, etc.) to run that single algorithm for the entire run."
+        )
 
         self.list_scenarios = QListWidget()
         self.list_scenarios.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -317,7 +320,7 @@ class BenchmarksDashboard(QWidget):
         btn_refresh = QPushButton("Refresh lists")
         btn_refresh.clicked.connect(self._refresh_lists)
 
-        left_layout.addWidget(QLabel("Algorithms"))
+        left_layout.addWidget(QLabel("Algorithms / Controller"))
         left_layout.addWidget(self.list_algos, 1)
         left_layout.addWidget(QLabel("Scenarios"))
         left_layout.addWidget(self.list_scenarios, 1)
@@ -373,7 +376,11 @@ class BenchmarksDashboard(QWidget):
             self._log(f"[ui] failed to load algorithms: {type(e).__name__}: {e}")
 
         for a in algos:
-            self.list_algos.addItem(QListWidgetItem(str(a)))
+            a_str = str(a)
+            item = QListWidgetItem("Hybrid (controller)" if a_str == "hybrid" else a_str)
+            # Store the actual spec string separately so selection returns canonical values
+            item.setData(Qt.ItemDataRole.UserRole, a_str)
+            self.list_algos.addItem(item)
 
         # Scenarios
         self.list_scenarios.clear()
@@ -408,7 +415,11 @@ class BenchmarksDashboard(QWidget):
                     lw.item(i).setSelected(True)
 
     def _selected_texts(self, lw: QListWidget) -> List[str]:
-        return [i.text() for i in lw.selectedItems()]
+        out: List[str] = []
+        for i in lw.selectedItems():
+            v = i.data(Qt.ItemDataRole.UserRole)
+            out.append(str(v) if v is not None else i.text())
+        return out
 
     def _run(self) -> None:
         if self._worker is not None and self._worker.isRunning():

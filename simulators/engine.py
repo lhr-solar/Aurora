@@ -29,6 +29,7 @@ from core.src.array import Array
 
 # Controller imports
 from core.controller.hybrid_controller import HybridMPPT, HybridConfig
+from core.controller.single_controller import SingleMPPT, SingleConfig
 from core.mppt_algorithms.types import Measurement, Action
 
 # Plant construction helpers
@@ -161,6 +162,14 @@ class SimulationConfig:
     temperature_c: float = 25.0    # deg C
     array_kwargs: Dict[str, Any] = None
     controller_cfg: Optional[HybridConfig] = None
+
+    # Controller selection
+    #   - controller_mode = "hybrid" uses HybridMPPT (state machine)
+    #   - controller_mode = "single" runs one registry algorithm for the full run
+    controller_mode: str = "hybrid"
+    algo_name: Optional[str] = None
+    algo_kwargs: Dict[str, Any] = None
+
     # GMPP reference (ground truth) computation
     gmpp_ref: bool = False
     gmpp_ref_period_s: float = 0.05   # compute reference every 50ms
@@ -200,7 +209,28 @@ class SimulationConfig:
         kwargs = self.array_kwargs or {}
         return build_default_array(**kwargs)
 
-    def build_controller(self) -> HybridMPPT:
+    def build_controller(self):
+        """Build the MPPT controller.
+
+        Selection precedence:
+          1) If controller_mode == "single" and algo_name is set, run a single registry
+             algorithm for the entire run.
+          2) Otherwise run the HybridMPPT controller. If controller_cfg is provided,
+             it is used; else HybridMPPT defaults are used.
+
+        This keeps legacy callers working (controller_cfg-only) while enabling the
+        new controller selection API used by mppt_sim and the UI.
+        """
+
+        mode = (self.controller_mode or "hybrid").strip().lower()
+
+        if mode == "single":
+            if not self.algo_name:
+                raise ValueError("SimulationConfig.controller_mode='single' requires algo_name")
+            kwargs = self.algo_kwargs or {}
+            return SingleMPPT(SingleConfig(algo_name=str(self.algo_name), algo_kwargs=kwargs))
+
+        # Default: hybrid
         if self.controller_cfg is None:
             return HybridMPPT()
         return HybridMPPT(self.controller_cfg)

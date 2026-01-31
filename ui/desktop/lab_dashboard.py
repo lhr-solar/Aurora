@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QCheckBox,
+    QComboBox,
 )
 
 try:
@@ -40,6 +41,7 @@ except Exception:  # pragma: no cover
 from simulators.engine import LiveOverrides, SimulationConfig, SimulationEngine
 from core.controller.hybrid_controller import HybridConfig
 from simulators.mppt_sim import get_profile
+from core.mppt_algorithms import registry as mppt_registry
 
 from ui.desktop.terminal_panel import TerminalPanel
 from ui.desktop.profile_editor import ProfileEditorDialog
@@ -196,10 +198,14 @@ def load_run_csv(path: Path) -> RunData:
     )
 
 
-def load_env_profile_csv(path: Path):
-    """Load a stepwise environment profile from a CSV with header: t,g,t_c.
+def load_env_profile_csv(path: Path) -> List[Tuple[float, float, float]]:
+    """Load an environment profile from CSV with header: t,g,t_c.
 
-    Returns a callable env_profile(t) -> (g, t_c).
+    IMPORTANT: SimulationConfig.env_profile is expected to be *iterable*.
+    The engine supports a legacy tuple format:
+        List[(time_s, irradiance_w_m2, temperature_c)]
+
+    This function therefore returns a list of tuples (t, g, t_c), sorted by t.
     """
     rows: List[Tuple[float, float, float]] = []
     with path.open("r", newline="") as f:
@@ -214,25 +220,12 @@ def load_env_profile_csv(path: Path):
                 rows.append((float(tt), float(gg), float(tc)))
             except Exception:
                 continue
+
     rows.sort(key=lambda x: x[0])
     if not rows:
         raise ValueError(f"CSV profile has no valid rows: {path}")
 
-    times = [r0 for (r0, _, _) in rows]
-    gs = [g0 for (_, g0, _) in rows]
-    tcs = [tc0 for (_, _, tc0) in rows]
-
-    def env_at(t: float) -> Tuple[float, float]:
-        # Last-value-hold step profile
-        idx = 0
-        for k in range(len(times)):
-            if times[k] <= t:
-                idx = k
-            else:
-                break
-        return float(gs[idx]), float(tcs[idx])
-
-    return env_at
+    return rows
 
 
 def resolve_repo_path(repo_root: Path, p: str) -> Path:
@@ -251,7 +244,7 @@ class _MPPTWorker(QThread):
         self,
         *,
         out_path: Path,
-        algo: str,
+        selection: str,
         profile_name: str,
         use_csv_profile: bool,
         csv_profile_path: Optional[Path],
@@ -262,7 +255,7 @@ class _MPPTWorker(QThread):
     ) -> None:
         super().__init__()
         self.out_path = out_path
-        self.algo = algo
+        self.selection = selection
         self.profile_name = profile_name
         self.use_csv_profile = use_csv_profile
         self.csv_profile_path = csv_profile_path
@@ -282,8 +275,28 @@ class _MPPTWorker(QThread):
                     raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
                 profile = load_env_profile_csv(self.csv_profile_path)
             else:
-                profile = get_profile(self.profile_name)
-            hcfg = HybridConfig(normal_name=self.algo)
+                # If no built-in profile name was provided, fall back to a flat baseline.
+                # LiveOverrides (sliders) will typically override these values.
+                if isinstance(self.profile_name, str) and self.profile_name.strip():
+                    profile = get_profile(self.profile_name.strip())
+                else:
+                    profile = [(0.0, 1000.0, 25.0)]
+
+            sel = (self.selection or "hybrid").strip()
+            sel_l = sel.lower()
+
+            if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+                controller_mode = "hybrid"
+                algo_name = None
+                controller_cfg = HybridConfig()
+            else:
+                if not mppt_registry.is_valid(sel):
+                    raise SystemExit(
+                        f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
+                    )
+                controller_mode = "single"
+                algo_name = mppt_registry.resolve_key(sel)
+                controller_cfg = None
 
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
             fieldnames = [
@@ -350,7 +363,10 @@ class _MPPTWorker(QThread):
                     total_time=self.total_time,
                     dt=self.dt,
                     env_profile=profile,
-                    controller_cfg=hcfg,
+                    controller_mode=controller_mode,
+                    algo_name=algo_name,
+                    algo_kwargs={},
+                    controller_cfg=controller_cfg,
                     overrides=self.overrides,
                     gmpp_ref=self.gmpp_ref,
                     gmpp_ref_period_s=0.05,
@@ -446,12 +462,23 @@ class LabDashboard(QWidget):
         left_l.addWidget(QLabel("MPPT controls"))
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Algo"))
-        self.algo_edit = QLineEdit("ruca")
-        self.algo_edit.setFixedWidth(120)
-        row1.addWidget(self.algo_edit)
+        self.algo_box = QComboBox()
+        self.algo_box.setEditable(False)
+        self.algo_box.setFixedWidth(160)
+
+        self.algo_box.addItem("Hybrid (controller)", "hybrid")
+        for key in mppt_registry.ALGORITHMS:
+            self.algo_box.addItem(key, key)
+
+        # Default to Hybrid to avoid conflating RUCA with the hybrid controller
+        self.algo_box.setCurrentIndex(0)
+        row1.addWidget(self.algo_box)
         row1.addWidget(QLabel("Profile"))
-        self.profile_edit = QLineEdit("cloud")
-        self.profile_edit.setFixedWidth(120)
+        # Leave blank by default so the simulation relies on the live irradiance/temp sliders.
+        # If provided, this selects a built-in environment profile name.
+        self.profile_edit = QLineEdit("")
+        self.profile_edit.setPlaceholderText("(manual sliders)")
+        self.profile_edit.setFixedWidth(160)
         row1.addWidget(self.profile_edit)
         left_l.addLayout(row1)
 
@@ -461,7 +488,8 @@ class LabDashboard(QWidget):
 
         csv_row = QHBoxLayout()
         csv_row.addWidget(QLabel("CSV path"))
-        self.csv_path_edit = QLineEdit("profiles/cloud_late.csv")
+        self.csv_path_edit = QLineEdit("")
+        self.csv_path_edit.setPlaceholderText("profiles/my_profile.csv")
         csv_row.addWidget(self.csv_path_edit, 1)
         self.btn_browse_profile = QPushButton("Browse…")
         csv_row.addWidget(self.btn_browse_profile)
@@ -583,16 +611,27 @@ class LabDashboard(QWidget):
         
     def _on_profile_mode_changed(self) -> None:
         use_csv = self.use_csv_chk.isChecked()
+
+        # If using CSV, disable manual sliders (CSV drives the environment).
+        self.g_slider.setEnabled(not use_csv)
+        self.t_slider.setEnabled(not use_csv)
+
+        # Built-in profile name is only relevant when NOT using CSV.
         self.profile_edit.setEnabled(not use_csv)
+
+        # CSV widgets are only relevant when using CSV.
         self.csv_path_edit.setEnabled(use_csv)
         self.btn_browse_profile.setEnabled(use_csv)
 
-        # Recommendation: when running a CSV profile, disable live overrides so the
-        # environment comes from the profile (not from the sliders).
+        # When running a CSV profile, ensure live overrides are not applied.
         if use_csv and self.overrides is not None:
             self.overrides.irradiance = None
             self.overrides.temperature_c = None
 
+        # When exiting CSV mode, re-apply the current slider values as overrides.
+        if not use_csv:
+            self._on_override_changed()
+            
     def browse_profile_csv(self) -> None:
         start_dir = str(self._repo_root / "profiles")
         (self._repo_root / "profiles").mkdir(parents=True, exist_ok=True)
@@ -774,8 +813,8 @@ class LabDashboard(QWidget):
             QMessageBox.warning(self, "Invalid settings", "Time and dt must be positive numbers.")
             return
 
-        algo = self.algo_edit.text().strip() or "ruca"
-        profile = self.profile_edit.text().strip() or "cloud"
+        algo = str(getattr(self, "algo_box", None) and self.algo_box.currentData() or "hybrid")
+        profile = self.profile_edit.text().strip()
 
         use_csv = bool(self.use_csv_chk.isChecked())
         csv_profile_path: Optional[Path] = None
@@ -815,16 +854,16 @@ class LabDashboard(QWidget):
 
         self._log(f"[ui] Starting MPPT -> {out_path}")
         if use_csv:
-            self._log(f"[ui] algo={algo} profile=csv ({csv_profile_path}) time={sim_time} dt={dt}")
+            self._log(f"[ui] selection={algo} profile=csv ({csv_profile_path}) time={sim_time} dt={dt}")
         else:
-            self._log(f"[ui] algo={algo} profile={profile} time={sim_time} dt={dt}")
-
+            prof_label = profile if profile else "(manual sliders)"
+            self._log(f"[ui] selection={algo} profile={prof_label} time={sim_time} dt={dt}")
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
         w = _MPPTWorker(
             out_path=out_path,
-            algo=algo,
+            selection=algo,
             profile_name=profile,
             use_csv_profile=use_csv,
             csv_profile_path=csv_profile_path,

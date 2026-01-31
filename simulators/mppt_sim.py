@@ -54,23 +54,43 @@ def get_profile(name: str) -> List[Tuple[float, float, float]]:
     # default
     return [(0.0, 1000.0, 25.0)]
 
-# Controller builders
-def build_hybrid_with(algo_name: Optional[str]) -> HybridConfig:
+
+# Controller selection
+
+def parse_controller_selection(selection: Optional[str]) -> Tuple[str, Optional[str], HybridConfig]:
+    """Return (controller_mode, algo_name, hybrid_cfg).
+
+    Contract:
+      - None / 'hybrid' -> run HybridMPPT controller
+      - anything else  -> run that *single* algorithm for the whole run
+
+    Notes:
+      - We always return a HybridConfig for backward compatibility with older
+        `SimulationConfig` signatures; newer engines can ignore it for single-mode.
     """
-    Build a HybridConfig that forces the local tracker to the chosen algo.
-    If algo_name is None, we just use whatever defaults the HybridMPPT has.
-    """
-    if not algo_name:
-        return HybridConfig()
-    # We don't want to break if the user typoed the name; so we validate
-    cat = mppt_registry.catalog()
-    if algo_name not in cat:
+    if selection is None:
+        return "hybrid", None, HybridConfig()
+
+    sel = str(selection).strip()
+    sel_l = sel.lower()
+
+    if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+        return "hybrid", None, HybridConfig()
+
+    if not mppt_registry.is_valid(sel):
+        # Show canonical keys (not aliases) for clarity
+        keys = mppt_registry.ALGORITHMS
         raise SystemExit(
-            f"[mppt_sim] Unknown algorithm '{algo_name}'. "
-            f"Available: {', '.join(sorted(cat.keys()))}"
+            f"[mppt_sim] Unknown algorithm '{sel}'. "
+            f"Available: {', '.join(keys)}"
         )
-    # HybridConfig takes a mapping of phase -> algo name; we at least set the local one
-    return HybridConfig(normal_name=algo_name)
+
+    # Normalize to canonical key so downstream (engine/controller) uses consistent naming
+    sel = mppt_registry.resolve_key(sel)
+
+    # For backward compatibility: older engines only support HybridConfig, so we
+    # set normal_name=sel as a best-effort fallback.
+    return "single", sel, HybridConfig(normal_name=sel)
 
 # Runner
 def run_mppt_sim(
@@ -85,7 +105,7 @@ def run_mppt_sim(
     Run a single MPPT scenario and return the list of records.
     """
     profile = get_profile(profile_name)
-    hcfg = build_hybrid_with(algo)
+    controller_mode, algo_name, hcfg = parse_controller_selection(algo)
 
     records: List[Dict[str, Any]] = []
 
@@ -94,15 +114,32 @@ def run_mppt_sim(
         if verbose:
             print(rec)
 
-    cfg = SimulationConfig(
-        total_time=total_time,
-        dt=dt,
-        start_v=18.0,
-        array_kwargs={"n_strings": 2, "substrings_per_string": 3, "cells_per_substring": 18},
-        env_profile=profile,
-        controller_cfg=hcfg,
-        on_sample=_collect,
-    )
+    # Prefer the newer controller selection API if available; fall back to the
+    # legacy HybridConfig-only API.
+    try:
+        cfg = SimulationConfig(
+            total_time=total_time,
+            dt=dt,
+            start_v=18.0,
+            array_kwargs={"n_strings": 2, "substrings_per_string": 3, "cells_per_substring": 18},
+            env_profile=profile,
+            controller_mode=controller_mode,
+            algo_name=algo_name,
+            controller_cfg=(hcfg if controller_mode == "hybrid" else None),
+            on_sample=_collect,
+        )
+    except TypeError:
+        # Legacy engines: still run, but single-mode will behave like
+        # "hybrid with normal_name=<algo>".
+        cfg = SimulationConfig(
+            total_time=total_time,
+            dt=dt,
+            start_v=18.0,
+            array_kwargs={"n_strings": 2, "substrings_per_string": 3, "cells_per_substring": 18},
+            env_profile=profile,
+            controller_cfg=hcfg,
+            on_sample=_collect,
+        )
     eng = SimulationEngine(cfg)
     for _ in eng.run():
         pass
@@ -138,7 +175,17 @@ def run_mppt_sim(
 # CLI
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a single MPPT simulation.")
-    parser.add_argument("--algo", type=str, default=None, help="Algorithm key from core.mppt_algorithms.registry (e.g. local.pando, local.ruca, global_search.pso)")
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default=None,
+        help=(
+            "Controller selection. Use 'hybrid' for the HybridMPPT controller, "
+            "or pass an algorithm key from core.mppt_algorithms.registry "
+            "(e.g. local.pando, local.ruca, global_search.pso) to run that single "
+            "algorithm for the entire run."
+        ),
+    )
     parser.add_argument("--profile", type=str, default="stc", help="Environment profile name: stc, cloud, shade")
     parser.add_argument("--dt", type=float, default=1e-3, help="Simulation step (s)")
     parser.add_argument("--time", type=float, default=0.25, help="Total simulation time (s)")

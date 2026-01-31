@@ -29,6 +29,27 @@ _ALIASES = {
     "gmpp": "sweep"
 }
 
+def resolve_key(name: str) -> str:
+    """Normalize a user-supplied algorithm name to a canonical registry key.
+
+    Applies:
+      - stripping
+      - lowercasing
+      - alias resolution (e.g., 'p&o' -> 'pando')
+
+    Returns the canonical key (which may or may not exist in the registry).
+    """
+    if name is None:
+        return ""
+    raw = str(name).strip().lower()
+    return _ALIASES.get(raw, raw)
+
+
+def is_valid(name: str) -> bool:
+    """Return True if the given name resolves to a registered algorithm key."""
+    key = resolve_key(name)
+    return bool(key) and key in _REGISTRY
+
 def register(name: str, module_path: str, class_name: str) -> None:
     """Add or override a registry entry.
 
@@ -43,7 +64,7 @@ def register(name: str, module_path: str, class_name: str) -> None:
 def get_class(name: str) -> Type[MPPTAlgorithm]:
     """Resolve a registry name (with simple aliases) to a class object (lazy import)."""
     # Normalize and resolve alias
-    key = _ALIASES.get(name.lower(), name.lower())
+    key = resolve_key(name)
     try:
         mod_path, cls_name = _REGISTRY[key]
     except KeyError as e:
@@ -90,7 +111,8 @@ def build(name: str, **kwargs) -> MPPTAlgorithm:
 
     Parameters
     name : str
-        Registry key (e.g., "mepo", "ruca", "pso", "nl_esc").
+        Registry key (e.g., "mepo", "ruca", "pso", "nl_esc"), or a supported alias
+        (see ALIASES).
     **kwargs
         Constructor parameters forwarded to the algorithm class.
     """
@@ -135,4 +157,15 @@ REGISTRY = _REGISTRY
 ALIASES = _ALIASES
 ALGORITHMS = sorted(_REGISTRY.keys())
 
-__all__ = ["build", "available", "register", "get_class", "catalog", "REGISTRY", "ALIASES", "ALGORITHMS"]
+__all__ = [
+    "build",
+    "available",
+    "register",
+    "get_class",
+    "catalog",
+    "resolve_key",
+    "is_valid",
+    "REGISTRY",
+    "ALIASES",
+    "ALGORITHMS",
+]
