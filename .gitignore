@@ -33,3 +33,4 @@ htmlcov/
 .vscode/
 
 data/runs/
+data/benchmarks/
