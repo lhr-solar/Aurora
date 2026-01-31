@@ -119,6 +119,14 @@ class MainWindow(QMainWindow):
             fallback_title="Benchmarks",
         )
         self._tabs.addTab(self._bench_tab, "Benchmarks")
+        
+        # Docs / Glossary tab
+        self._docs_tab = self._load_dashboard(
+            module_path="ui.desktop.glossary_dashboard",
+            class_name="GlossaryDashboard",
+            fallback_title="Glossary / Docs",
+        )
+        self._tabs.addTab(self._docs_tab, "Glossary / Docs")
 
         # Status bar message to confirm the shell is alive
         self.statusBar().showMessage("Ready")
@@ -126,6 +134,7 @@ class MainWindow(QMainWindow):
         self.terminal.append_line("[ui] Aurora UI started")
         self.terminal.append_line("[ui] LiveOverrides ready")
         self.terminal.append_line("[ui] Benchmarks tab ready")
+        self.terminal.append_line("[ui] Glossary/Docs tab ready")
 
         # View menu actions for terminal management
         view_menu = self.menuBar().addMenu("View")

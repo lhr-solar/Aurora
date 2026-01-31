@@ -543,6 +543,10 @@ class LabDashboard(QWidget):
         prof_btn_row = QHBoxLayout()
         self.btn_profile_editor = QPushButton("Profile Editor…")
         prof_btn_row.addWidget(self.btn_profile_editor)
+
+        self.btn_save_profile = QPushButton("Save as profile…")
+        prof_btn_row.addWidget(self.btn_save_profile)
+
         prof_btn_row.addStretch(1)
         left_l.addLayout(prof_btn_row)
 
@@ -679,6 +683,7 @@ class LabDashboard(QWidget):
         self.use_csv_chk.stateChanged.connect(self._on_profile_mode_changed)
         self.btn_browse_profile.clicked.connect(self.browse_profile_csv)
         self.btn_profile_editor.clicked.connect(self.open_profile_editor)
+        self.btn_save_profile.clicked.connect(self.save_current_as_profile)
         self.term_stream_chk.stateChanged.connect(self._on_terminal_settings_changed)
         self.term_period_edit.editingFinished.connect(self._on_terminal_settings_changed)
 
@@ -705,6 +710,10 @@ class LabDashboard(QWidget):
         if use_csv and self.overrides is not None:
             self.overrides.irradiance = None
             self.overrides.temperature_c = None
+
+        # Saving a profile only makes sense in manual mode (sliders drive the environment).
+        if hasattr(self, "btn_save_profile"):
+            self.btn_save_profile.setEnabled(not use_csv)
 
         # When exiting CSV mode, re-apply the current slider values as overrides.
         if not use_csv:
@@ -745,6 +754,101 @@ class LabDashboard(QWidget):
 
         dlg.editor.profile_saved.connect(_on_saved)
         dlg.exec()
+
+    def save_current_as_profile(self) -> None:
+        """Save the current irradiance/temperature as a new environment profile CSV (t,g,t_c).
+
+        Preference order:
+        1) If we have streamed run data in `self._rd`, save the full time series (exact reproduction).
+        2) Otherwise, save a flat profile from the current slider values across [0, Time].
+
+        After saving, auto-enable CSV mode and point the CSV path to the saved file.
+        """
+        # If we're already in CSV mode, saving from sliders is ambiguous.
+        if hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked():
+            QMessageBox.information(self, "Save profile", "Disable 'Use CSV profile' to save from manual sliders.")
+            return
+
+        profiles_dir = self._repo_root / "profiles"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+
+        default_path = str(profiles_dir / "manual_profile.csv")
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save environment profile CSV",
+            default_path,
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+
+        out_path = Path(path_str)
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_suffix(".csv")
+
+        # Build rows (t,g,t_c)
+        rows: List[Tuple[float, float, float]] = []
+
+        rd = getattr(self, "_rd", None)
+        if (
+            rd is not None
+            and getattr(rd, "t", None)
+            and getattr(rd, "g", None)
+            and getattr(rd, "t_mod", None)
+            and len(rd.t) >= 2
+            and len(rd.g) == len(rd.t)
+            and len(rd.t_mod) == len(rd.t)
+        ):
+            # Save the exact time series used in the run.
+            for tt, gg, tc in zip(rd.t, rd.g, rd.t_mod):
+                try:
+                    ttf = float(tt)
+                    ggf = float(gg)
+                    tcf = float(tc)
+                except Exception:
+                    continue
+                # filter NaNs
+                if ttf != ttf or ggf != ggf or tcf != tcf:
+                    continue
+                rows.append((ttf, ggf, tcf))
+        else:
+            # Fall back: flat profile from current sliders over [0, sim_time]
+            try:
+                sim_time = float(self.time_edit.text().strip())
+                if sim_time <= 0:
+                    sim_time = 1.0
+            except Exception:
+                sim_time = 1.0
+
+            g = float(self.g_slider.value())
+            t = float(self.t_slider.value())
+            rows = [(0.0, g, t), (sim_time, g, t)]
+
+        rows.sort(key=lambda x: x[0])
+        if not rows:
+            QMessageBox.warning(self, "Save profile", "No valid data available to save as a profile.")
+            return
+
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["t", "g", "t_c"])
+                w.writeheader()
+                for tt, gg, tc in rows:
+                    w.writerow({"t": tt, "g": gg, "t_c": tc})
+        except Exception as e:
+            QMessageBox.warning(self, "Save profile", f"{type(e).__name__}: {e}")
+            return
+
+        self._log(f"[ui] profile saved -> {out_path}")
+
+        # Auto-select CSV mode and point to saved file.
+        self.use_csv_chk.setChecked(True)
+        try:
+            rel = out_path.relative_to(self._repo_root)
+            self.csv_path_edit.setText(str(rel))
+        except Exception:
+            self.csv_path_edit.setText(str(out_path))
 
     # ---------------------------
     # Helpers
@@ -869,7 +973,7 @@ class LabDashboard(QWidget):
 
         use_csv = hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked()
 
-        # Option A: mutate shared overrides (only when NOT running a CSV profile)
+        # mutate shared overrides (only when NOT running a CSV profile)
         if (not use_csv) and self.overrides is not None:
             self.overrides.irradiance = float(g)
             self.overrides.temperature_c = float(t)
