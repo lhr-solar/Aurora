@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QCheckBox,
     QComboBox,
+    QSizePolicy,
 )
 
 try:
@@ -426,6 +427,10 @@ class LabDashboard(QWidget):
         left = QWidget()
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(0, 0, 0, 0)
+        # Keep the control panel narrow so plots get most of the horizontal space.
+        left.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        left.setMinimumWidth(360)
+        left.setMaximumWidth(460)
 
         left_l.addWidget(QLabel("Live Bench"))
 
@@ -505,14 +510,30 @@ class LabDashboard(QWidget):
         self.btn_browse_profile.setEnabled(False)
 
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Time"))
+        row2.setSpacing(4)
+
+        time_lbl = QLabel("Time")
+        time_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        row2.addWidget(time_lbl)
+
         self.time_edit = QLineEdit("0.5")
         self.time_edit.setFixedWidth(80)
+        self.time_edit.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         row2.addWidget(self.time_edit)
-        row2.addWidget(QLabel("dt"))
+
+        row2.addSpacing(50)
+
+        dt_lbl = QLabel("dt")
+        dt_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        row2.addWidget(dt_lbl)
+
         self.dt_edit = QLineEdit("0.001")
         self.dt_edit.setFixedWidth(80)
+        self.dt_edit.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         row2.addWidget(self.dt_edit)
+
+        # Keep the fields packed to the left instead of spreading across the row.
+        row2.addStretch(1)
         left_l.addLayout(row2)
 
         row3 = QHBoxLayout()
@@ -567,6 +588,7 @@ class LabDashboard(QWidget):
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
+        right.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         if pg is None:
             right_l.addWidget(QLabel("pyqtgraph not available"))
@@ -587,8 +609,9 @@ class LabDashboard(QWidget):
             right_l.addWidget(self.p_plot, 1)
 
         split.addWidget(right)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 3)
+        # Left panel is width-constrained (Fixed policy). Give remaining space to plots.
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
 
         # Wire events
         self.btn_refresh.clicked.connect(self.refresh_runs)
