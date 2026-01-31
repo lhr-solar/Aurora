@@ -1,255 +1,274 @@
-
-
 # Aurora Architecture
 
-This document explains **how Aurora is structured internally** and **how data flows through the system** during a simulation.
+This document provides a **technical, end‑to‑end description of Aurora’s internal architecture** and execution model.
+It is intended for contributors who want to modify system behavior, add algorithms, or reason precisely about simulation correctness.
 
-If you want to modify behavior, add algorithms, or debug unexpected results, this is the document to read.
-
----
-
-## Architectural Goals
-
-Aurora is designed around the following principles:
-
-- **Deterministic simulation**  
-  Same inputs produce the same outputs.
-
-- **Separation of concerns**  
-  Physics, control, UI, and benchmarking are isolated.
-
-- **Explicit state**  
-  No hidden globals, no magic coupling.
-
-- **Extensibility first**  
-  New algorithms, scenarios, and dashboards should be easy to add.
+If you only read one technical document before touching code, read this one.
 
 ---
 
-## High-Level System View
+## Design Objectives
 
-At a high level, Aurora is composed of five layers:
+Aurora’s architecture is guided by four explicit goals:
+
+1. **Deterministic execution**  
+   Given identical inputs (environment, configuration, algorithm), the simulation produces identical outputs.
+
+2. **Strict separation of concerns**  
+   Physics, control logic, orchestration, UI, and benchmarking are isolated by design.
+
+3. **Explicit state and data flow**  
+   All state transitions occur in known locations; no implicit globals or hidden coupling.
+
+4. **Extensibility under constraint**  
+   New algorithms, scenarios, metrics, and dashboards should be easy to add *without* weakening correctness.
+
+---
+
+## High‑Level System Decomposition
+
+Aurora can be understood as five interacting layers:
 
 ```
-Environment (Profiles / Scenarios)
-        ↓
-Simulation Engine
-        ↓
-PV Array Model
-        ↓
-MPPT Controller
-        ↓
-Logging + UI
+Environment Sources (profiles / scenarios / sliders)
+                ↓
+Simulation Engine (time orchestration)
+                ↓
+PV Physics Model (array evaluation)
+                ↓
+MPPT Controller (decision logic)
+                ↓
+Logging, Metrics, and UI
 ```
 
-Each layer has a single responsibility and communicates through well-defined interfaces.
+Each layer has a single responsibility and communicates through explicit interfaces.
+Violating these boundaries is the most common source of bugs.
 
 ---
 
-## Core Data Flow (Single Time Step)
+## Time‑Stepped Execution Model
 
-Aurora runs in **discrete time steps**.  
-Each step follows the same sequence:
+Aurora runs as a **discrete‑time simulation** with a fixed timestep `Δt`.
 
-1. Environment values are updated
-2. The array electrical state is evaluated
-3. The controller proposes a new operating point
-4. Power and state are updated
-5. Results are logged and visualized
+At simulation time step *k → k+1*, the following sequence occurs:
 
-This order is **intentional** and should not be rearranged casually.
+1. **Environment sampling**
+2. **Array electrical evaluation**
+3. **Controller state update**
+4. **Operating point application**
+5. **Measurement logging and visualization**
+
+This ordering is **intentional and invariant**.
+Reordering steps breaks controller assumptions and invalidates benchmarks.
 
 ---
 
-## Engine (`engine/`)
+## Simulation Engine (`simulators/engine.py`)
 
-The engine owns the **simulation loop**.
+The engine is the **central orchestrator** of the simulation.
 
-Responsibilities:
-- Advance simulation time
-- Pull environment inputs (irradiance, temperature)
-- Evaluate the PV array
-- Invoke the MPPT controller
-- Emit measurements to UI and loggers
+### Responsibilities
+- Maintain simulation time
+- Invoke environment sources
+- Trigger PV array evaluation
+- Call the MPPT controller
+- Emit measurements to loggers and UI consumers
 
-The engine does **not**:
-- Know about UI widgets
-- Care where environment data originates
-- Implement control logic itself
+### Non‑Responsibilities
+- No physics calculations
+- No control logic
+- No UI rendering
+- No benchmarking logic
 
-Think of the engine as the **orchestrator**.
+The engine is deliberately “thin”: it coordinates *when* things happen, not *how* they work.
 
 ---
 
 ## Environment Sources
 
-Environment values (irradiance, temperature) can come from:
+Environment inputs consist of:
+- irradiance
+- temperature
 
-- Manual UI sliders
-- CSV profiles
-- Benchmark scenarios
+These values originate from exactly **one active source** at runtime:
 
-These are mutually exclusive at runtime.
+- UI sliders (interactive, non‑deterministic)
+- CSV profiles (deterministic, replayable)
+- Benchmark scenarios (scripted, controlled)
 
-Once an environment source is selected, the engine treats it as a **pure data provider**.
+Once selected, an environment source behaves as a **pure function of time**.
+The engine does not care where the data came from.
 
-This ensures:
-- Repeatability
-- Clean benchmarking
-- No UI-side state leakage
+This abstraction enables:
+- reproducible experiments
+- fair benchmarking
+- clean separation between UI and simulation logic
 
 ---
 
-## PV Array Model (`array/`)
+## PV Physics Layer (`core/src/`)
 
-This layer implements the **physics**.
+This layer implements the **electrical model of the PV system**.
 
-Hierarchy:
+### Hierarchy
 ```
 Cell → Substring → String → Array
 ```
 
-Responsibilities:
-- Convert irradiance + temperature into IV curves
+### Properties
+- Stateless with respect to simulation time
+- Deterministic for a given environment state
+- Safe to evaluate multiple times per timestep
+
+### Responsibilities
+- Compute IV curves from irradiance and temperature
 - Aggregate electrical behavior hierarchically
-- Produce deterministic electrical outputs
+- Expose array‑level electrical characteristics
 
-Key properties:
-- Stateless with respect to time
-- Fully deterministic
-- Safe to evaluate repeatedly
-
-Any change here affects *every* simulation mode.
+Any modification here affects *every* controller, benchmark, and UI visualization.
 
 ---
 
-## MPPT Controllers (`controllers/`)
+## MPPT Controllers (`core/mppt_algorithms/`)
 
-Controllers implement **decision-making logic**.
+Controllers implement **decision‑making logic**.
 
-Responsibilities:
-- Consume measurements (V, I, P, history)
+### Responsibilities
+- Consume electrical measurements (V, I, P, history)
 - Maintain internal algorithm state
-- Propose the next operating point
+- Propose the next operating voltage (or equivalent control variable)
 
-Controllers:
-- Do **not** evaluate physics
-- Do **not** touch UI code
-- Are agnostic to execution context (UI vs CLI vs benchmark)
+### Constraints
+- Controllers do **not** evaluate physics
+- Controllers do **not** interact with UI state
+- Controllers are agnostic to execution context (UI vs CLI vs benchmarks)
 
-This makes controllers:
-- Testable
-- Comparable
-- Swappable
+This isolation makes controllers:
+- directly comparable
+- testable in isolation
+- reusable across all simulation modes
 
 ---
 
-## Simulation Modes
+## Controller Integration (`core/controller/`)
 
-Aurora supports three execution contexts:
+This layer defines the **contract** between the engine and MPPT algorithms.
+
+It is responsible for:
+- enforcing a common controller interface
+- adapting controller outputs into engine‑usable control signals
+- mediating data passed to algorithms
+
+If a controller can be “plugged in,” it passes through this layer.
+
+---
+
+## Execution Contexts
+
+Aurora supports three execution contexts that all share the same core logic:
 
 ### Live UI
-- Real-time stepping
+- Real‑time stepping
 - Interactive environment changes
-- Visualization-first
+- Visualization‑first feedback
 
 ### CLI Simulation
-- Scriptable execution
+- Scripted execution
 - Fast iteration for debugging
 - No UI overhead
 
 ### Benchmarking
-- Controlled scenarios
-- Identical conditions across algorithms
-- Metrics-driven comparison
+- Controlled environment scenarios
+- Identical initial conditions across algorithms
+- Metric‑driven comparison
 
-All three share the **same engine and controller code**.
+The engine, physics model, and controllers are identical in all three cases.
 
 ---
 
 ## Benchmarking Architecture (`benchmarks/`)
 
-Benchmarking is a **first-class system**, not an afterthought.
+Benchmarking is treated as a **first‑class system**, not a bolt‑on.
 
-Components:
-- `scenarios.py` → defines environment timelines
-- `metrics.py` → computes performance metrics
-- `runner.py` → executes simulations and aggregates results
+### Components
+- `scenarios.py` — defines time‑indexed environment inputs
+- `metrics.py` — computes performance metrics from logged data
+- `runner.py` — executes simulations and aggregates results
 
-Benchmarks enforce:
-- Identical initial conditions
-- Identical environment inputs
-- Identical simulation parameters
+### Guarantees
+- identical environment inputs
+- identical simulation parameters
+- identical initialization
 
-This guarantees fair comparison.
+These guarantees are required for meaningful algorithm comparison.
 
 ---
 
 ## UI Architecture (`ui/desktop/`)
 
-UI code is strictly a **consumer** of simulation outputs.
+The desktop UI is a **pure consumer of simulation outputs**.
 
-Rules:
-- UI never modifies physics directly
-- UI never implements control logic
+### Rules
+- UI code never modifies physics
+- UI code never implements control logic
 - UI reflects state, it does not own it
 
-Dashboards:
-- Live Bench → real-time simulation view
-- Benchmarks → comparative analysis
-- Glossary / Docs → embedded documentation
+### Dashboards
+- **Live Bench** — real‑time simulation inspection
+- **Benchmarks** — comparative results and metrics
+- **Glossary / Docs** — embedded documentation
 
-This separation keeps the system debuggable.
+Keeping the UI passive prevents subtle correctness bugs.
 
 ---
 
-## Logging & Outputs
+## Logging and Data Outputs
 
 Simulation outputs are:
-- Timestamped
-- Structured
-- Saved to `data/runs/`
+- timestamped
+- structured
+- written to `data/runs/` and `data/benchmarks/`
 
-Properties:
-- Machine-readable
-- Reproducible
-- Comparable across runs
+Design goals:
+- machine‑readable
+- reproducible
+- suitable for offline analysis and regression testing
 
-Logs are designed to support:
-- Offline analysis
-- Visualization
-- Regression testing
+Logs are the canonical source of truth for benchmarking.
 
 ---
 
-## Common Architecture Mistakes
+## Common Architectural Failure Modes
 
 Avoid:
-- Putting logic in UI files
-- Letting controllers read UI state
-- Mixing benchmarking logic into the engine
-- Introducing implicit global state
+- embedding logic in UI files
+- letting controllers depend on UI state
+- mixing benchmarking logic into the engine
+- introducing implicit or global state
+- altering timestep ordering
 
-If something feels “convenient” but breaks separation, it is probably wrong.
+If a change feels convenient but blurs boundaries, it is likely incorrect.
 
 ---
 
-## Mental Model Summary
+## Mental Model (Compressed)
 
 If you remember nothing else:
 
-- **Engine orchestrates**
-- **Array computes physics**
-- **Controller decides**
-- **UI displays**
-- **Benchmarks compare**
+- **Engine orchestrates time**
+- **Physics computes electrical behavior**
+- **Controller decides control actions**
+- **UI visualizes state**
+- **Benchmarks compare outcomes**
 
-Keep these roles clean, and Aurora stays easy to evolve.
+Maintaining these roles is what keeps Aurora correct and extensible.
 
 ---
 
-## Where to Go Next
+## Pointers
 
-- `docs/glossary.md` → terminology & workflows
-- `docs/api.md` → controller interfaces
-- `benchmarks/` → example comparative experiments
+- `docs/glossary.md` — terminology and workflows
+- `docs/api.md` — controller contracts
+- `docs/usage.md` — execution and configuration
+
+This document should evolve as the system evolves.

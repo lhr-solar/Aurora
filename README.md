@@ -186,3 +186,207 @@ Then follow the existing patterns in the codebase.
 
 Developed for **Longhorn Racing Solar**  
 University of Texas at Austin
+# Aurora
+
+Aurora is a **time-stepped photovoltaic (PV) simulation and MPPT experimentation platform** developed for Longhorn Racing Solar.
+
+It combines:
+- a physics-based PV model (cell → substring → string → array)
+- a discrete-time simulation engine
+- pluggable MPPT algorithms
+- a PyQt6 + **pyqtgraph** desktop UI for interactive debugging and benchmarking
+
+If you’re new, the shortest path is:
+1. Run the desktop app
+2. Open the **Glossary / Docs** tab
+3. Use Live Bench first, then Benchmarks once you’re comfortable
+
+---
+
+## What Aurora Simulates
+
+Aurora simulates PV behavior under **time-varying environment conditions** and evaluates how an MPPT controller tracks the maximum power point.
+
+In realistic conditions (especially **partial shading**), the PV power curve can develop **multiple local maxima**, which is exactly where MPPT algorithms can fail in interesting ways (oscillation, slow convergence, local trapping, etc.). Aurora is built to make those failure modes observable and measurable.
+
+---
+
+## Core Concepts (quick glossary)
+
+- **IV curve**: current vs voltage at a fixed instant.
+- **PV curve**: power vs voltage at a fixed instant; the peak is the MPP.
+- **MPP vs GMPP**: local peak vs global peak (important under shading).
+- **Environment**: irradiance + temperature, supplied by sliders, CSV profiles, or benchmark scenarios.
+
+For the detailed version, see `docs/glossary.md` (also rendered inside the UI).
+
+---
+
+## Key Features
+
+### PV Physics Model
+- Single-diode cell model with explicit irradiance and temperature dependence
+- Hierarchical electrical aggregation:
+  ```
+  Cell → Substring → String → Array
+  ```
+- Deterministic evaluation (same inputs → same curves)
+
+### MPPT Algorithms
+Aurora includes multiple MPPT implementations (and is designed to make adding more straightforward). The CLI and UI expose registered algorithms such as:
+- `pando` (Perturb & Observe)
+- `pso`, `mepo`, `nl_esc`, `ruca`, `sweep` (see `core/mppt_algorithms/`)
+
+### Simulation Engine
+- Discrete time-step simulation loop (engine orchestrates: environment → array evaluation → controller → logging)
+- Run logging for post-analysis (see `data/runs/`)
+
+### Desktop UI (PyQt6 + pyqtgraph)
+- Live IV/PV plotting
+- Irradiance/temperature input via **sliders** or **CSV profiles**
+- MPPT state visualization
+- Benchmark dashboard for comparative evaluation
+- Embedded documentation tab (**Glossary / Docs**) rendered from `docs/*.md`
+
+---
+
+## Repository Structure (actual)
+
+```text
+Aurora/
+├── core/
+│   ├── src/                 # PV physics + array hierarchy (cell/substring/string/array)
+│   ├── controller/          # Controller interface / glue layer
+│   └── mppt_algorithms/     # MPPT implementations (local/, global_search/, hold/, ...)
+├── simulators/              # CLI simulators (engine.py, mppt_sim.py, source_sim.py)
+├── benchmarks/              # Scenarios + metrics + benchmark runner
+├── ui/
+│   └── desktop/             # PyQt dashboards (Live Bench, Benchmarks, Glossary)
+├── profiles/                # CSV profiles (environment timelines)
+├── configs/                 # Saved UI/sim configs (if enabled)
+├── docs/                    # Markdown docs rendered in the UI
+├── data/
+│   ├── runs/                # Logged simulation runs
+│   └── benchmarks/          # Benchmark outputs
+└── requirements.txt
+```
+
+---
+
+## Installation
+
+### Requirements
+- Python **3.10+** recommended
+- macOS / Linux works best (Windows can work, but Qt tooling is pickier)
+
+### Setup
+
+```bash
+git clone https://github.com/<your-org-or-username>/Aurora.git
+cd Aurora
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+---
+
+## Running Aurora
+
+### Desktop UI (recommended)
+
+```bash
+python -m ui.desktop.main_window
+```
+
+This launches the main window with tabs:
+- **Live Bench**: interactive environment control + plots
+- **Benchmarks**: scenario-driven comparison + metrics
+- **Glossary / Docs**: in-app documentation rendered from `docs/`
+
+### Command-line MPPT simulation
+
+```bash
+python -m simulators.mppt_sim --algo pando
+```
+
+If you pass an invalid algorithm name, the simulator prints the valid options.
+
+### Engine/source simulator (utility)
+
+```bash
+python -m simulators.source_sim
+```
+
+(Useful when you’re isolating environment/profile behavior from MPPT behavior.)
+
+---
+
+## Documentation
+
+Aurora keeps documentation **in the repo** and **inside the app**.
+
+- In-app: open **Glossary / Docs** tab
+- In-repo: `docs/`
+
+Key docs:
+- `docs/usage.md` — how to run / common workflows
+- `docs/architecture.md` — data flow + module boundaries
+- `docs/api.md` — controller interfaces and expectations
+- `docs/glossary.md` — vocabulary + “how to extend” playbook
+
+---
+
+## Extending Aurora (common paths)
+
+### Add a new MPPT algorithm
+- Implement in `core/mppt_algorithms/`
+- Register it with the algorithm registry used by the simulator/UI (see existing algorithms for the exact pattern)
+- Test via:
+  - Live Bench (UI)
+  - `python -m simulators.mppt_sim --algo <name>`
+  - Benchmarks
+
+### Add a benchmark scenario or metric
+- Scenarios: `benchmarks/scenarios.py`
+- Metrics: `benchmarks/metrics.py`
+- Execution: `benchmarks/runner.py`
+
+### Add a new dashboard tab
+- Implement a `QWidget` in `ui/desktop/`
+- Wire it into `ui/desktop/main_window.py`
+
+---
+
+## Data & Outputs
+
+- Logged runs: `data/runs/`
+- Benchmark outputs: `data/benchmarks/`
+
+These outputs are intended to be:
+- deterministic (given identical inputs)
+- machine-readable
+- comparable across algorithms and runs
+
+---
+
+## Contributing / Onboarding
+
+If you’re modifying the system, read these in order:
+1. `docs/glossary.md`
+2. `docs/architecture.md`
+
+Aurora stays maintainable when these boundaries remain clean:
+- **Engine orchestrates**
+- **PV model computes**
+- **Controller decides**
+- **UI displays**
+- **Benchmarks compare**
+
+---
+
+## Acknowledgements
+
+Developed for **Longhorn Racing Solar** (The University of Texas at Austin)
