@@ -95,6 +95,18 @@ class PVPlant:
         self._irradiance = 1000.0  # W/m^2
         self._temperature = 25.0   # °C
         self.set_conditions(self._irradiance, self._temperature)
+        # Resolve the array current-at-voltage function once (avoid per-step getattr scanning)
+        self._i_fn = None
+        for _name in ("i_at_v", "solve_i_at_v", "current_at_v", "i_of_v", "i_from_v"):
+            _cand = getattr(self.array, _name, None)
+            if callable(_cand):
+                self._i_fn = _cand
+                break
+        if self._i_fn is None:
+            raise AttributeError(
+                "Array object has no callable method to compute current at a voltage. "
+                "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
+            )
 
     def set_conditions(self, irradiance: Union[float, Sequence[float]], temperature_c: float) -> None:
         self._temperature = float(temperature_c)
@@ -127,19 +139,7 @@ class PVPlant:
         """
         Given a terminal voltage, return (v, i) as seen by the controller.
         """
-        # Array API compatibility: different versions may expose different method names
-        i_fn = None
-        for _name in ("i_at_v", "solve_i_at_v", "current_at_v", "i_of_v", "i_from_v"):
-            _cand = getattr(self.array, _name, None)
-            if callable(_cand):
-                i_fn = _cand
-                break
-        if i_fn is None:
-            raise AttributeError(
-                "Array object has no callable method to compute current at a voltage. "
-                "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
-            )
-        i = i_fn(v)
+        i = self._i_fn(v)
         return float(v), float(i)
 
 @dataclass
@@ -155,6 +155,74 @@ class LiveOverrides:
 # Simulation config / result types
 @dataclass
 class SimulationConfig:
+    # --- Internal: compiled env profile for fast env_at() ---
+    _env_compiled: Optional[List[Tuple[float, Union[float, Sequence[float]], float]]] = None
+    _env_idx: int = 0
+    _env_last_t: float = -1e18
+    def _compile_env_profile(self) -> None:
+        """Compile env_profile into a sorted list of (t, g, t_mod) tuples for fast lookup."""
+        prof = self.env_profile
+        if not prof:
+            self._env_compiled = None
+            self._env_idx = 0
+            self._env_last_t = -1e18
+            return
+
+        compiled: List[Tuple[float, Union[float, Sequence[float]], float]] = []
+        for ev in prof:
+            # Format A: legacy tuple/list (t, g, tc)
+            if isinstance(ev, (tuple, list)):
+                if len(ev) != 3:
+                    continue
+                tt, g, tc = ev
+                try:
+                    compiled.append((float(tt), g, float(tc)))
+                except Exception:
+                    continue
+
+            # Format B: dict event
+            elif isinstance(ev, dict):
+                try:
+                    tt = float(ev.get("t", 0.0))
+                except Exception:
+                    continue
+
+                # per-string shading overrides scalar g if present
+                g_val: Union[float, Sequence[float]]
+                if "g_strings" in ev and ev.get("g_strings") is not None:
+                    gs = ev.get("g_strings")
+                    if isinstance(gs, (list, tuple)):
+                        try:
+                            g_val = [float(x) for x in gs]
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                elif "g" in ev and ev.get("g") is not None:
+                    try:
+                        g_val = float(ev.get("g"))
+                    except Exception:
+                        continue
+                else:
+                    # No irradiance info; skip
+                    continue
+
+                # temperature
+                if "t_mod" in ev and ev.get("t_mod") is not None:
+                    try:
+                        t_val = float(ev.get("t_mod"))
+                    except Exception:
+                        continue
+                else:
+                    # If missing, keep the configured constant temperature
+                    t_val = float(self.temperature_c)
+
+                compiled.append((tt, g_val, t_val))
+
+        compiled.sort(key=lambda x: x[0])
+        self._env_compiled = compiled if compiled else None
+        self._env_idx = 0
+        self._env_last_t = -1e18
     total_time: float = 1.0        # seconds
     dt: float = 1e-3               # control / sample period
     start_v: float = 20.0          # initial array voltage guess
@@ -252,55 +320,30 @@ class SimulationConfig:
         latest_g: Union[float, Sequence[float]] = self.irradiance
         latest_t: float = float(self.temperature_c)
 
-        prof = self.env_profile
-        if prof:
-            for ev in prof:
-                # Format A: tuple/list
-                if isinstance(ev, (tuple, list)):
-                    if len(ev) != 3:
-                        # skip malformed legacy events
-                        continue
-                    tt, g, tc = ev
-                    try:
-                        if float(tt) <= t:
-                            latest_g = g  # float or sequence
-                            latest_t = float(tc)
-                        else:
-                            break
-                    except Exception:
-                        continue
+        # Compile once lazily
+        if self._env_compiled is None and self.env_profile:
+            self._compile_env_profile()
 
-                # Format B: dict event
-                elif isinstance(ev, dict):
-                    try:
-                        tt = float(ev.get("t", 0.0))
-                    except Exception:
-                        continue
+        comp = self._env_compiled
+        if comp:
+            # If time goes backwards (new run / reset), restart cursor
+            if t < self._env_last_t:
+                self._env_idx = 0
 
-                    if tt <= t:
-                        # per-string shading overrides scalar g if present
-                        if "g_strings" in ev and ev.get("g_strings") is not None:
-                            gs = ev.get("g_strings")
-                            if isinstance(gs, (list, tuple)):
-                                latest_g = [float(x) for x in gs]
-                        elif "g" in ev and ev.get("g") is not None:
-                            try:
-                                latest_g = float(ev.get("g"))
-                            except Exception:
-                                pass
+            # Advance cursor while next event time is <= t
+            idx = self._env_idx
+            n = len(comp)
+            while (idx + 1) < n and comp[idx + 1][0] <= t:
+                idx += 1
 
-                        # temperature
-                        if "t_mod" in ev and ev.get("t_mod") is not None:
-                            try:
-                                latest_t = float(ev.get("t_mod"))
-                            except Exception:
-                                pass
-                    else:
-                        break
+            self._env_idx = idx
+            self._env_last_t = float(t)
 
-                # Unknown event type
-                else:
-                    continue
+            # Apply the selected event if its time is <= t
+            tt, g_ev, t_ev = comp[idx]
+            if tt <= t:
+                latest_g = g_ev
+                latest_t = float(t_ev)
 
         # Live overrides win
         if self.overrides is not None:
@@ -334,6 +377,8 @@ class SimulationEngine:
 
         # environment
         self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
+        # Track last applied environment to avoid redundant set_conditions work
+        self._last_env_key: Optional[Tuple[Any, float]] = None
     
     def _get_v_bounds(self) -> Tuple[float, float]:
         # Prefer controller cfg bounds if present
@@ -448,22 +493,14 @@ class SimulationEngine:
 
         # resolve environment at t=0
         g0, t0 = self.cfg.env_at(t)
+        env_key0 = (tuple(g0) if isinstance(g0, (list, tuple)) else float(g0), float(t0))
+        self._last_env_key = env_key0
         self.plant.set_conditions(g0, t0)
         g0_vec = list(g0) if isinstance(g0, (list, tuple)) else None
 
         # Prime the controller with an INIT measurement
-        # Array API compatibility (same logic as PVPlant.step)
-        i_fn = None
-        for _name in ("i_at_v", "solve_i_at_v", "current_at_v", "i_of_v", "i_from_v"):
-            _cand = getattr(self.array, _name, None)
-            if callable(_cand):
-                i_fn = _cand
-                break
-        if i_fn is None:
-            raise AttributeError(
-                "Array object has no callable method to compute current at a voltage. "
-                "Tried: i_at_v, solve_i_at_v, current_at_v, i_of_v, i_from_v"
-            )
+        # Use PVPlant's resolved current-at-voltage function
+        i_fn = self.plant._i_fn
         v_cmd = float(v)  # initial command equals start_v
         i = float(i_fn(v))
         g_meas = float(sum(g0) / len(g0)) if isinstance(g0, (list, tuple)) else float(g0)
@@ -554,7 +591,11 @@ class SimulationEngine:
             # measure plant at that voltage
             g_now, t_now = self.cfg.env_at(t)
             g_vec = list(g_now) if isinstance(g_now, (list, tuple)) else None
-            self.plant.set_conditions(g_now, t_now)
+
+            env_key = (tuple(g_now) if isinstance(g_now, (list, tuple)) else float(g_now), float(t_now))
+            if env_key != self._last_env_key:
+                self.plant.set_conditions(g_now, t_now)
+                self._last_env_key = env_key
             v, i = self.plant.step(v_cmd)
             p_true = float(v * i)
             v_true = float(v)

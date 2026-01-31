@@ -163,17 +163,32 @@ def load_run_csv(path: Path) -> RunData:
             gs = row.get("g_strings")
             g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
 
-            ad = row.get("action_debug")
-            st = None
-            rsn = None
-            if isinstance(ad, str) and ad.strip():
-                dbg = _parse_action_debug(ad)
-                st = dbg.get("state")
-                rsn = dbg.get("reason")
-            if isinstance(st, str) and st:
-                last_state = st
-            state.append(last_state)
-            reason.append(rsn if isinstance(rsn, str) and rsn else None)
+            # Prefer explicit state/reason columns (newer runs); fall back to action_debug (older runs)
+            st = row.get("state")
+            rsn = row.get("reason")
+
+            if isinstance(st, str) and st.strip():
+                last_state = st.strip()
+                state.append(last_state)
+            else:
+                ad = row.get("action_debug")
+                st2 = None
+                if isinstance(ad, str) and ad.strip():
+                    dbg = _parse_action_debug(ad)
+                    st2 = dbg.get("state")
+                if isinstance(st2, str) and st2:
+                    last_state = st2
+                state.append(last_state)
+
+            if isinstance(rsn, str) and rsn.strip():
+                reason.append(rsn.strip())
+            else:
+                ad = row.get("action_debug")
+                rsn2 = None
+                if isinstance(ad, str) and ad.strip():
+                    dbg = _parse_action_debug(ad)
+                    rsn2 = dbg.get("reason")
+                reason.append(rsn2 if isinstance(rsn2, str) and rsn2 else None)
 
     return RunData(
         path=path,
@@ -263,6 +278,12 @@ class _MPPTWorker(QThread):
         self.total_time = total_time
         self.dt = dt
         self.overrides = overrides
+
+        # Enforce CSV profile mode: LiveOverrides always win over env_profile in the engine.
+        # If CSV is enabled, do NOT allow overrides to mask it.
+        if self.use_csv_profile:
+            self.overrides = None
+
         self.gmpp_ref = bool(gmpp_ref)
         self._stop = False
 
@@ -314,6 +335,8 @@ class _MPPTWorker(QThread):
                 "g",
                 "t_mod",
                 "v_ref",
+                "state",
+                "reason",
                 "action_debug",
                 "v_gmp_ref",
                 "p_gmp_ref",
@@ -326,6 +349,11 @@ class _MPPTWorker(QThread):
             with self.out_path.open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
+                
+                _rows_since_flush = 0
+                _last_flush_wall = time.monotonic()
+                _flush_every_rows = 200
+                _flush_every_s = 0.5
 
                 def _on_sample(rec: Dict[str, Any]) -> None:
                     action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
@@ -333,6 +361,8 @@ class _MPPTWorker(QThread):
                     gmpp = rec.get("gmpp") if isinstance(rec.get("gmpp"), dict) else {}
                     v_ref = action.get("v_ref")
                     g_strings = rec.get("g_strings")
+                    st = debug.get("state")
+                    rsn = debug.get("reason")
 
                     row = {
                         "t": rec.get("t"),
@@ -348,6 +378,8 @@ class _MPPTWorker(QThread):
                         "g": rec.get("g"),
                         "t_mod": rec.get("t_mod"),
                         "v_ref": v_ref,
+                        "state": st if isinstance(st, str) else "",
+                        "reason": rsn if isinstance(rsn, str) else "",
                         "action_debug": repr(debug),
                         "v_gmp_ref": gmpp.get("v_gmp_ref"),
                         "p_gmp_ref": gmpp.get("p_gmp_ref"),
@@ -357,7 +389,15 @@ class _MPPTWorker(QThread):
                         "g_strings": repr(g_strings) if g_strings is not None else "",
                     }
                     writer.writerow(row)
-                    f.flush()
+
+                    nonlocal _rows_since_flush, _last_flush_wall
+                    _rows_since_flush += 1
+                    now = time.monotonic()
+                    if _rows_since_flush >= _flush_every_rows or (now - _last_flush_wall) >= _flush_every_s:
+                        f.flush()
+                        _rows_since_flush = 0
+                        _last_flush_wall = now
+
                     self.sample.emit(row)
 
                 cfg = SimulationConfig(
@@ -597,6 +637,21 @@ class LabDashboard(QWidget):
             self.t_plot = pg.PlotWidget(title="Temperature (°C)")
             self.v_plot = pg.PlotWidget(title="Voltage (V)")
             self.p_plot = pg.PlotWidget(title="Power (W)")
+            
+            # Persistent plot items (don’t recreate every refresh)
+            self._g_curve = self.g_plot.plot([], [])
+            self._t_curve = self.t_plot.plot([], [])
+            self._v_curve = self.v_plot.plot([], [])
+            self._p_curve = self.p_plot.plot([], [])
+            self._p_gmpp_curve = self.p_plot.plot([], [])
+
+            self._last_state_segs = []
+
+            # Debounce plot refresh so sliders don’t trigger heavy work on every tick
+            self._plot_debounce = QTimer(self)
+            self._plot_debounce.setSingleShot(True)
+            self._plot_debounce.setInterval(50)
+            self._plot_debounce.timeout.connect(lambda: self._rd is not None and self._plot(self._rd))
 
             # Keep X linked for easier inspection
             self.t_plot.setXLink(self.g_plot)
@@ -819,9 +874,8 @@ class LabDashboard(QWidget):
             self.overrides.irradiance = float(g)
             self.overrides.temperature_c = float(t)
 
-        # Also update plots immediately if we have data
-        if self._rd is not None:
-            self._plot(self._rd)
+        if self._rd is not None and hasattr(self, "_plot_debounce"):
+            self._plot_debounce.start()
 
     # ---------------------------
     # Run/Stop
@@ -884,6 +938,9 @@ class LabDashboard(QWidget):
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
+        # CSV mode must fully drive the environment; don't let sliders override it.
+        overrides_for_run = None if use_csv else self.overrides
+
         w = _MPPTWorker(
             out_path=out_path,
             selection=algo,
@@ -892,7 +949,7 @@ class LabDashboard(QWidget):
             csv_profile_path=csv_profile_path,
             total_time=sim_time,
             dt=dt,
-            overrides=self.overrides,
+            overrides=overrides_for_run,
             gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
         )
         w.sample.connect(self._on_live_sample)
@@ -960,13 +1017,16 @@ class LabDashboard(QWidget):
         gs = row.get("g_strings")
         rd.g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
 
-        ad = row.get("action_debug")
-        st = None
-        rsn = None
-        if isinstance(ad, str) and ad.strip():
-            dbg = _parse_action_debug(ad)
-            st = dbg.get("state")
-            rsn = dbg.get("reason")
+        # Prefer explicit state/reason columns; fall back to parsing action_debug for older rows
+        st = row.get("state")
+        rsn = row.get("reason")
+
+        if not (isinstance(st, str) and st.strip()):
+            ad = row.get("action_debug")
+            if isinstance(ad, str) and ad.strip():
+                dbg = _parse_action_debug(ad)
+                st = dbg.get("state")
+                rsn = dbg.get("reason")
 
         last_state = rd.state[-1] if rd.state else "UNKNOWN"
         if isinstance(st, str) and st:
@@ -1070,40 +1130,40 @@ class LabDashboard(QWidget):
         # ---------------------------
         # Clear + state shading
         # ---------------------------
-        self.g_plot.clear()
-        self.t_plot.clear()
-        self.v_plot.clear()
-        self.p_plot.clear()
-        self._clear_regions()
 
         segs = build_state_segments(rd.t, rd.state)
-        brushes = {
-            "NORMAL": (0, 160, 80, 40),
-            "GLOBAL_SEARCH": (245, 158, 11, 45),
-            "LOCK_HOLD": (59, 130, 246, 40),
-            "UNKNOWN": (120, 120, 120, 25),
-        }
-        for st, t0, t1 in segs:
-            rgba = brushes.get(st, brushes["UNKNOWN"])
-            region = pg.LinearRegionItem(values=(t0, t1), brush=pg.mkBrush(*rgba), movable=False)
-            region.setZValue(-10)
-            self.g_plot.addItem(region)
-            self.t_plot.addItem(region)
-            self.v_plot.addItem(region)
-            self.p_plot.addItem(region)
-            self._state_regions.append(region)
+        if segs != self._last_state_segs:
+            self._clear_regions()
+            self._last_state_segs = segs
+
+            brushes = {
+                "NORMAL": (0, 160, 80, 40),
+                "GLOBAL_SEARCH": (245, 158, 11, 45),
+                "LOCK_HOLD": (59, 130, 246, 40),
+                "UNKNOWN": (120, 120, 120, 25),
+            }
+            for st, t0, t1 in segs:
+                rgba = brushes.get(st, brushes["UNKNOWN"])
+                region = pg.LinearRegionItem(values=(t0, t1), brush=pg.mkBrush(*rgba), movable=False)
+                region.setZValue(-10)
+                self.g_plot.addItem(region)
+                self.t_plot.addItem(region)
+                self.v_plot.addItem(region)
+                self.p_plot.addItem(region)
+                self._state_regions.append(region)
 
         # ---------------------------
         # Plot lines
         # ---------------------------
-        self.g_plot.plot(rd.t, g_series)
-        self.t_plot.plot(rd.t, t_series)
-        self.v_plot.plot(rd.t, rd.v)
-        self.p_plot.plot(rd.t, rd.p)
+        self._g_curve.setData(rd.t, g_series)
+        self._t_curve.setData(rd.t, t_series)
+        self._v_curve.setData(rd.t, rd.v)
+        self._p_curve.setData(rd.t, rd.p)
 
-        # Overlay GMPP reference power if present
-        if hasattr(rd, "p_gmp_ref") and rd.p_gmp_ref and any(x == x for x in rd.p_gmp_ref):
-            self.p_plot.plot(rd.t, rd.p_gmp_ref)
+        if rd.p_gmp_ref and any(x == x for x in rd.p_gmp_ref):
+            self._p_gmpp_curve.setData(rd.t, rd.p_gmp_ref)
+        else:
+            self._p_gmpp_curve.setData([], [])
 
         # ---------------------------
         # Sticky Y axes for G/T
