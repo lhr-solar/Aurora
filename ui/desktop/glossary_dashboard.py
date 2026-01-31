@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import (
     QWidget,
     QHBoxLayout,
@@ -134,8 +134,8 @@ class GlossaryDashboard(QWidget):
             )
             return
 
-        # Ensure relative links work
-        self.viewer.setSource(path.as_uri())
+        # QTextBrowser.setSource expects a QUrl in PyQt6
+        self.viewer.setSource(QUrl.fromLocalFile(str(path)))
         self.viewer.setMarkdown(content)
 
     # ---------------- Helpers ---------------- #
