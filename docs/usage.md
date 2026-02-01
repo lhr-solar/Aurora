@@ -3,7 +3,7 @@
 # Aurora Usage Guide
 
 This document explains **how to run, configure, and use Aurora correctly**.
-It is written for users who want to run simulations, debug MPPT behavior, or generate reproducible benchmarks.
+It is written for users who want to explore MPPT behavior, debug algorithms, or generate reproducible benchmark results.
 
 If you are new, read this once end-to-end before running experiments.
 
@@ -12,9 +12,9 @@ If you are new, read this once end-to-end before running experiments.
 ## Prerequisites
 
 ### System Requirements
-- Python **3.10+** (3.11 works)
+- Python **3.10+** (3.11 supported)
 - macOS or Linux recommended  
-  (Windows can work, but Qt and OpenGL backends are more fragile)
+  (Windows can work, but Qt/OpenGL backends are more fragile)
 
 ### Python Environment
 Aurora is designed to run inside a virtual environment.
@@ -29,12 +29,13 @@ pip install -r requirements.txt
 
 ## Ways to Run Aurora
 
-Aurora can be run in three primary modes:
-1. **Desktop UI** (interactive exploration)
-2. **CLI simulation** (algorithm debugging)
-3. **Benchmarking** (controlled comparison)
+Aurora supports three execution modes:
 
-All three modes share the same engine, physics model, and controllers.
+1. **Desktop UI** — interactive exploration and debugging  
+2. **CLI simulation** — fast, scriptable algorithm testing  
+3. **Benchmarking** — controlled, reproducible comparison  
+
+All three modes share the same engine, physics model, and controller code.
 
 ---
 
@@ -42,13 +43,13 @@ All three modes share the same engine, physics model, and controllers.
 
 ### Launching the UI
 
-From the repo root:
+From the repository root:
 
 ```bash
 python -m ui.desktop.main_window
 ```
 
-This launches the main window with three tabs:
+This opens the main window with three tabs:
 - **Live Bench**
 - **Benchmarks**
 - **Glossary / Docs**
@@ -57,55 +58,65 @@ This launches the main window with three tabs:
 
 ### Live Bench Tab
 
-The Live Bench is designed for **interactive debugging and intuition building**.
+The Live Bench is intended for **intuition building and debugging**, not formal evaluation.
 
 #### Controls
 - **Irradiance slider** (W/m²)
 - **Temperature slider** (°C)
 - **MPPT algorithm selector**
-- **Time step and simulation controls**
+- **Simulation timestep and run controls**
 - **CSV profile toggle (optional)**
 
 #### Behavior
 - Slider changes immediately affect the environment
-- IV and PV curves update in real time
-- MPPT operating point and power output are visualized continuously
+- IV and PV curves update continuously
+- MPPT operating point and power output are visualized in real time
 
-This mode is *not deterministic* and should not be used for formal comparison.
+⚠️ **Important:**  
+Live Bench runs are *not deterministic* due to UI event timing and manual interaction.  
+Do not use Live Bench results for benchmarking or algorithm comparison.
 
 ---
 
-### CSV Profiles (Environment Playback)
+### CSV Profiles (Deterministic Environment Playback)
 
-CSV profiles define **time-indexed environment inputs**.
+CSV profiles define **time-indexed environment inputs** and enable reproducible simulations.
 
 When a CSV profile is active:
 - Sliders are disabled
-- Environment values are driven exclusively by the profile
-- Simulation becomes deterministic and replayable
+- Environment values come exclusively from the profile
+- Simulation becomes deterministic (given fixed `dt`)
 
-Typical CSV columns:
+#### CSV Format
+
+Required columns (header names must match):
+
 ```text
 time, irradiance, temperature
 ```
 
-Profiles live in:
+Conventions:
+- `time` is in seconds and must be monotonically increasing
+- `irradiance` is in W/m²
+- `temperature` is in °C
+
+Profiles are stored in:
 ```text
 profiles/
 ```
 
-CSV profiles are required for benchmarking and reproducible experiments.
+CSV profiles are **required** for benchmarking and fair algorithm comparison.
 
 ---
 
 ### Glossary / Docs Tab
 
-The Docs tab renders all files in `docs/` inside the application.
+The Docs tab renders all Markdown files in `docs/` directly inside the application.
 
-Start here if:
-- You are new to Aurora
-- You want to understand architecture or terminology
-- You are adding new algorithms or metrics
+Use this tab to:
+- understand architecture and terminology
+- review controller contracts
+- follow extension guides
 
 ---
 
@@ -119,26 +130,26 @@ CLI simulation is useful for **fast iteration and debugging** without UI overhea
 python -m simulators.mppt_sim --algo pando
 ```
 
-If an invalid algorithm is passed, the simulator prints all available options.
+If an invalid algorithm name is provided, the simulator prints the list of available algorithms.
 
-### Common Use Cases
-- Verifying algorithm behavior
-- Debugging convergence issues
-- Testing under fixed environment conditions
-- Running batch experiments via scripts
+### Typical CLI Use Cases
+- Verifying algorithm logic
+- Debugging convergence or oscillation
+- Testing under fixed or profile-driven environments
+- Running batch experiments from scripts
 
 CLI simulation uses the same engine and controller code as the UI.
 
 ---
 
-### Source Simulation Utility
+### Source / Environment Simulator
 
 ```bash
 python -m simulators.source_sim
 ```
 
-This utility isolates **environment and source behavior** from MPPT logic.
-It is helpful when debugging profiles or irradiance/temperature handling.
+This utility isolates **environment playback** from MPPT logic.
+It is useful when debugging CSV profiles or irradiance/temperature handling.
 
 ---
 
@@ -150,7 +161,7 @@ Benchmarking is used to **compare MPPT algorithms under identical conditions**.
 
 The Benchmarks tab:
 - Executes predefined scenarios
-- Runs multiple algorithms under identical inputs
+- Runs multiple algorithms with identical initialization
 - Computes standardized metrics
 - Displays comparative plots and tables
 
@@ -163,7 +174,7 @@ This is the preferred method for performance comparison.
 Benchmarks are defined by three elements:
 
 1. **Scenario**
-   - Time-indexed environment definition
+   - Deterministic, time-indexed environment definition
    - Implemented in `benchmarks/scenarios.py`
 
 2. **Metric**
@@ -175,24 +186,21 @@ Benchmarks are defined by three elements:
    - Implemented in `benchmarks/runner.py`
 
 All benchmarks enforce:
-- identical initialization
 - identical environment inputs
 - identical simulation parameters
+- isolated controller instances
 
 ---
 
 ## Configuration Files
 
-Aurora may save configuration state (when enabled) to:
+Aurora may persist configuration state (when enabled) to:
 
 ```text
 configs/
 ```
 
-These files capture:
-- communication settings
-- capture parameters
-- UI state needed for reproducibility
+These files capture UI and simulation configuration needed for reproducibility.
 
 ---
 
@@ -206,10 +214,10 @@ Simulation outputs are written to:
 data/runs/
 ```
 
-Each run contains:
-- timestamped measurements
-- environment values
-- controller state outputs
+Each run typically contains:
+- time series of `(t, G, T, V, I, P)`
+- controller outputs or exposed internal signals
+- metadata (algorithm name, timestep, profile/scenario)
 
 ### Benchmark Outputs
 
@@ -233,7 +241,7 @@ These outputs are:
    - Build intuition for algorithm behavior
 
 2. **Stabilize**
-   - Capture conditions with CSV profiles
+   - Capture conditions using CSV profiles
 
 3. **Compare**
    - Run benchmarks across algorithms
@@ -247,33 +255,34 @@ These outputs are:
 ## Common Mistakes
 
 - Using Live Bench results for formal comparison
-- Comparing algorithms under different profiles
-- Modifying UI code to change simulation behavior
-- Forgetting to register new algorithms
+- Comparing algorithms under different profiles or scenarios
+- Modifying UI code to affect simulation behavior
+- Forgetting to register a new algorithm
 
 ---
 
 ## Troubleshooting
 
 ### UI does not launch
-- Confirm virtual environment is activated
+- Confirm the virtual environment is activated
 - Verify PyQt6 and pyqtgraph are installed
-- Run from repo root
+- Ensure you are running from the repo root
 
 ### Algorithm not listed
 - Ensure it is registered in the algorithm registry
-- Check naming consistency
+- Check naming consistency between file and registration
 
 ### Inconsistent benchmark results
-- Verify CSV profiles and scenarios are identical
-- Confirm timestep and initialization settings
+- Verify scenarios and profiles are deterministic
+- Confirm timestep and initialization settings are identical
+- Ensure controllers do not retain state across runs
 
 ---
 
 ## Where to Go Next
 
 - `docs/glossary.md` — concepts and terminology
-- `docs/architecture.md` — execution model and boundaries
+- `docs/architecture.md` — execution model and invariants
 - `docs/api.md` — controller interfaces and contracts
 
-This guide should evolve as new features are added.
+This guide should evolve alongside the codebase.
