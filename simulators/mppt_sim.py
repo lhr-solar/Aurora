@@ -23,6 +23,7 @@ python -m simulators.mppt_sim --profile cloud
 """
 
 import argparse
+import time
 from typing import Any, Dict, List, Tuple, Optional, Callable
 from pathlib import Path
 
@@ -100,6 +101,8 @@ def run_mppt_sim(
     dt: float = 1e-3,
     verbose: bool = True,
     csv_path: Optional[str] = None,
+    realtime: bool = False,
+    tick_ms: int = 33,
 ) -> List[Dict[str, Any]]:
     """
     Run a single MPPT scenario and return the list of records.
@@ -141,8 +144,21 @@ def run_mppt_sim(
             on_sample=_collect,
         )
     eng = SimulationEngine(cfg)
-    for _ in eng.run():
-        pass
+
+    if realtime:
+        # Wall-clock paced stepping (useful for demos / interactive observation)
+        tick_s = max(0.0, float(tick_ms) / 1000.0)
+        eng.reset()  # emits initial record via on_sample
+        while True:
+            rec = eng.step_once()
+            if rec is None:
+                break
+            if tick_s > 0:
+                time.sleep(tick_s)
+    else:
+        # Batch mode (as fast as possible)
+        for _ in eng.run():
+            pass
 
     if csv_path and records:
         # Ensure output directory exists: Aurora/data/runs
@@ -155,10 +171,18 @@ def run_mppt_sim(
         rows = []
         for rec in records:
             row = dict(rec)
+
+            # Flatten nested dicts for nicer CSVs
             action = row.pop("action", None)
             if isinstance(action, dict):
                 for k, v in action.items():
                     row[f"action_{k}"] = v
+
+            gmpp = row.pop("gmpp", None)
+            if isinstance(gmpp, dict):
+                for k, v in gmpp.items():
+                    row[f"gmpp_{k}"] = v
+
             rows.append(row)
 
         fieldnames = sorted({k for r in rows for k in r.keys()})
@@ -191,6 +215,17 @@ def main() -> None:
     parser.add_argument("--time", type=float, default=0.25, help="Total simulation time (s)")
     parser.add_argument("--quiet", action="store_true", help="Do not print each sample")
     parser.add_argument("--csv", type=str, default=None, help="Path to write CSV results")
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Pace the simulation in wall-clock time (one step per tick).",
+    )
+    parser.add_argument(
+        "--tick-ms",
+        type=int,
+        default=33,
+        help="Tick interval in milliseconds for --realtime (default: 33ms ~ 30Hz).",
+    )
     args = parser.parse_args()
 
     run_mppt_sim(
@@ -200,6 +235,8 @@ def main() -> None:
         dt=args.dt,
         verbose=not args.quiet,
         csv_path=args.csv,
+        realtime=args.realtime,
+        tick_ms=args.tick_ms,
     )
 
 

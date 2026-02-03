@@ -12,6 +12,7 @@ Saved runs are written to Aurora/data/runs and can be reopened.
 import ast
 import csv
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -249,6 +250,48 @@ def resolve_repo_path(repo_root: Path, p: str) -> Path:
     return pp if pp.is_absolute() else (repo_root / pp)
 
 
+# ---------------------------
+# Record -> CSV-row shaping
+# ---------------------------
+
+def record_to_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an engine record dict into the CSV row shape used by the UI."""
+    action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
+    debug = action.get("debug") if isinstance(action.get("debug"), dict) else {}
+    gmpp = rec.get("gmpp") if isinstance(rec.get("gmpp"), dict) else {}
+
+    v_ref = action.get("v_ref")
+    g_strings = rec.get("g_strings")
+    st = debug.get("state")
+    rsn = debug.get("reason")
+
+    row = {
+        "t": rec.get("t"),
+        "dt": rec.get("dt"),
+        "k": rec.get("k"),
+        "v_cmd": rec.get("v_cmd"),
+        "v_true": rec.get("v_true"),
+        "i_true": rec.get("i_true"),
+        "p_true": rec.get("p_true"),
+        "v": rec.get("v"),
+        "i": rec.get("i"),
+        "p": rec.get("p"),
+        "g": rec.get("g"),
+        "t_mod": rec.get("t_mod"),
+        "v_ref": v_ref,
+        "state": st if isinstance(st, str) else "",
+        "reason": rsn if isinstance(rsn, str) else "",
+        "action_debug": repr(debug),
+        "v_gmp_ref": gmpp.get("v_gmp_ref"),
+        "p_gmp_ref": gmpp.get("p_gmp_ref"),
+        "v_best": gmpp.get("v_best"),
+        "p_best": gmpp.get("p_best"),
+        "eff_best": gmpp.get("eff_best"),
+        "g_strings": repr(g_strings) if g_strings is not None else "",
+    }
+    return row
+
+
 class _MPPTWorker(QThread):
     """Run MPPT simulation in-process (Option A) and stream CSV-row-shaped samples."""
 
@@ -356,38 +399,7 @@ class _MPPTWorker(QThread):
                 _flush_every_s = 0.5
 
                 def _on_sample(rec: Dict[str, Any]) -> None:
-                    action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
-                    debug = action.get("debug") if isinstance(action.get("debug"), dict) else {}
-                    gmpp = rec.get("gmpp") if isinstance(rec.get("gmpp"), dict) else {}
-                    v_ref = action.get("v_ref")
-                    g_strings = rec.get("g_strings")
-                    st = debug.get("state")
-                    rsn = debug.get("reason")
-
-                    row = {
-                        "t": rec.get("t"),
-                        "dt": rec.get("dt"),
-                        "k": rec.get("k"),
-                        "v_cmd": rec.get("v_cmd"),
-                        "v_true": rec.get("v_true"),
-                        "i_true": rec.get("i_true"),
-                        "p_true": rec.get("p_true"),
-                        "v": rec.get("v"),
-                        "i": rec.get("i"),
-                        "p": rec.get("p"),
-                        "g": rec.get("g"),
-                        "t_mod": rec.get("t_mod"),
-                        "v_ref": v_ref,
-                        "state": st if isinstance(st, str) else "",
-                        "reason": rsn if isinstance(rsn, str) else "",
-                        "action_debug": repr(debug),
-                        "v_gmp_ref": gmpp.get("v_gmp_ref"),
-                        "p_gmp_ref": gmpp.get("p_gmp_ref"),
-                        "v_best": gmpp.get("v_best"),
-                        "p_best": gmpp.get("p_best"),
-                        "eff_best": gmpp.get("eff_best"),
-                        "g_strings": repr(g_strings) if g_strings is not None else "",
-                    }
+                    row = record_to_row(rec)
                     writer.writerow(row)
 
                     nonlocal _rows_since_flush, _last_flush_wall
@@ -445,6 +457,13 @@ class LabDashboard(QWidget):
         self._term_period_s = 0.05  # log at most every 50ms of wall time
         self._last_term_wall = 0.0
 
+        # Terminal buffering: when printing every step (period=0), we batch UI updates
+        # to avoid starving the Qt event loop. All samples are still printed.
+        self._term_buf = deque()  # type: ignore[var-annotated]
+        self._term_flush_timer = QTimer(self)
+        self._term_flush_timer.setInterval(30)
+        self._term_flush_timer.timeout.connect(self._flush_terminal_buffer)
+
         # Repo root (Aurora/ui/desktop/lab_dashboard.py)
         self._repo_root = Path(__file__).resolve().parents[2]
         self._runs_root = self._repo_root / "data" / "runs"
@@ -452,6 +471,17 @@ class LabDashboard(QWidget):
 
         self._worker: Optional[_MPPTWorker] = None
         self._poll: Optional[QTimer] = None
+
+        # Continuous-mode runner state (no thread; driven by QTimer)
+        self._cont_timer: Optional[QTimer] = None
+        self._cont_eng: Optional[SimulationEngine] = None
+        self._cont_f = None
+        self._cont_writer: Optional[csv.DictWriter] = None
+        self._cont_rows_since_flush = 0
+        self._cont_last_flush_wall = 0.0
+        self._cont_stopping = False
+        self._pending_stop_msg: Optional[str] = None
+        self._batch_stopping = False
         self._rd: Optional[RunData] = None
         self._state_regions: List[Any] = []
 
@@ -518,13 +548,14 @@ class LabDashboard(QWidget):
         # Default to Hybrid to avoid conflating RUCA with the hybrid controller
         self.algo_box.setCurrentIndex(0)
         row1.addWidget(self.algo_box)
-        row1.addWidget(QLabel("Profile"))
-        # Leave blank by default so the simulation relies on the live irradiance/temp sliders.
-        # If provided, this selects a built-in environment profile name.
-        self.profile_edit = QLineEdit("")
-        self.profile_edit.setPlaceholderText("(manual sliders)")
-        self.profile_edit.setFixedWidth(160)
-        row1.addWidget(self.profile_edit)
+
+        # Continuous is the default mode for interactive slider use.
+        # When CSV profile mode is enabled, we automatically disable continuous.
+        self.cont_chk = QCheckBox("Continuous")
+        self.cont_chk.setChecked(True)
+        row1.addWidget(self.cont_chk)
+
+        row1.addStretch(1)
         left_l.addLayout(row1)
 
         # --- CSV profile mode controls ---
@@ -552,6 +583,7 @@ class LabDashboard(QWidget):
 
         self.csv_path_edit.setEnabled(False)
         self.btn_browse_profile.setEnabled(False)
+
 
         row2 = QHBoxLayout()
         row2.setSpacing(4)
@@ -604,6 +636,15 @@ class LabDashboard(QWidget):
         term_row.addStretch(1)
         left_l.addLayout(term_row)
 
+        # Continuous tick (used only when continuous is enabled)
+        cont_row = QHBoxLayout()
+        cont_row.addWidget(QLabel("Tick (ms)"))
+        self.cont_tick_edit = QLineEdit("33")
+        self.cont_tick_edit.setFixedWidth(80)
+        cont_row.addWidget(self.cont_tick_edit)
+        cont_row.addStretch(1)
+        left_l.addLayout(cont_row)
+
         btn_row = QHBoxLayout()
         self.btn_run = QPushButton("Run")
         self.btn_stop = QPushButton("Stop")
@@ -650,12 +691,13 @@ class LabDashboard(QWidget):
             self._p_gmpp_curve = self.p_plot.plot([], [])
 
             self._last_state_segs = []
+            self._last_state_transitions: List[Tuple[str, float]] = []
 
             # Debounce plot refresh so sliders don’t trigger heavy work on every tick
             self._plot_debounce = QTimer(self)
             self._plot_debounce.setSingleShot(True)
             self._plot_debounce.setInterval(50)
-            self._plot_debounce.timeout.connect(lambda: self._rd is not None and self._plot(self._rd))
+            self._plot_debounce.timeout.connect(self._on_plot_debounce)
 
             # Keep X linked for easier inspection
             self.t_plot.setXLink(self.g_plot)
@@ -686,21 +728,43 @@ class LabDashboard(QWidget):
         self.btn_save_profile.clicked.connect(self.save_current_as_profile)
         self.term_stream_chk.stateChanged.connect(self._on_terminal_settings_changed)
         self.term_period_edit.editingFinished.connect(self._on_terminal_settings_changed)
+        self.cont_chk.stateChanged.connect(lambda _=None: self._on_continuous_mode_changed())
+        self.cont_chk.stateChanged.connect(lambda _=None: self.cont_tick_edit.setEnabled(self._continuous_enabled()))
 
         self.refresh_runs()
         self._on_override_changed()
         self._on_profile_mode_changed()
         self._on_terminal_settings_changed()
+        # Ensure tick edit reflects initial continuous/csv state
+        self.cont_tick_edit.setEnabled(self._continuous_enabled())
         
+    def _on_continuous_mode_changed(self) -> None:
+        """Keep Continuous and CSV modes mutually exclusive."""
+        cont = bool(self.cont_chk.isChecked())
+
+        # If user turns OFF continuous, force CSV mode ON.
+        if not cont:
+            if hasattr(self, "use_csv_chk") and not self.use_csv_chk.isChecked():
+                self.use_csv_chk.blockSignals(True)
+                self.use_csv_chk.setChecked(True)
+                self.use_csv_chk.blockSignals(False)
+            self._on_profile_mode_changed()
+            return
+
+        # If user turns ON continuous, force CSV mode OFF.
+        if hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked():
+            self.use_csv_chk.blockSignals(True)
+            self.use_csv_chk.setChecked(False)
+            self.use_csv_chk.blockSignals(False)
+
+        self._on_profile_mode_changed()
+    
     def _on_profile_mode_changed(self) -> None:
         use_csv = self.use_csv_chk.isChecked()
 
         # If using CSV, disable manual sliders (CSV drives the environment).
         self.g_slider.setEnabled(not use_csv)
         self.t_slider.setEnabled(not use_csv)
-
-        # Built-in profile name is only relevant when NOT using CSV.
-        self.profile_edit.setEnabled(not use_csv)
 
         # CSV widgets are only relevant when using CSV.
         self.csv_path_edit.setEnabled(use_csv)
@@ -710,6 +774,30 @@ class LabDashboard(QWidget):
         if use_csv and self.overrides is not None:
             self.overrides.irradiance = None
             self.overrides.temperature_c = None
+
+        # CSV/profile runs are analysis-oriented: default to printing every step.
+        # Do this when CSV mode is enabled so the UI reflects it immediately.
+        if use_csv and getattr(self, "_term_stream_samples", True):
+            self.term_period_edit.setText("0")
+            self._on_terminal_settings_changed()
+
+        # Continuous and CSV modes are mutually exclusive.
+        # When CSV is enabled, continuous must be OFF (and disabled).
+        # When CSV is disabled, continuous must be ON.
+        if hasattr(self, "cont_chk"):
+            if use_csv:
+                self.cont_chk.blockSignals(True)
+                self.cont_chk.setChecked(False)
+                self.cont_chk.setEnabled(False)
+                self.cont_chk.blockSignals(False)
+            else:
+                self.cont_chk.setEnabled(True)
+                self.cont_chk.blockSignals(True)
+                self.cont_chk.setChecked(True)
+                self.cont_chk.blockSignals(False)
+
+        if hasattr(self, "cont_tick_edit"):
+            self.cont_tick_edit.setEnabled((not use_csv) and bool(getattr(self, "cont_chk", None) and self.cont_chk.isChecked()))
 
         # Saving a profile only makes sense in manual mode (sliders drive the environment).
         if hasattr(self, "btn_save_profile"):
@@ -850,17 +938,66 @@ class LabDashboard(QWidget):
         except Exception:
             self.csv_path_edit.setText(str(out_path))
 
+    def _on_plot_debounce(self) -> None:
+        if self._rd is not None:
+            self._plot(self._rd)
+
     # ---------------------------
     # Helpers
     # ---------------------------
     def _log(self, msg: str) -> None:
         if self.terminal is not None:
             self.terminal.append_line(msg)
+
+    def _flush_terminal_buffer(self) -> None:
+        """Flush buffered terminal lines in small batches to keep UI responsive."""
+        if self.terminal is None:
+            self._term_buf.clear()
+            return
+        if not self._term_buf:
+            return
+
+        # Flush up to N lines per tick to avoid long UI stalls.
+        n = 200
+        for _ in range(min(n, len(self._term_buf))):
+            try:
+                self.terminal.append_line(self._term_buf.popleft())
+            except Exception:
+                # If terminal fails, drop the rest to prevent infinite loops.
+                self._term_buf.clear()
+                break
+
+        # Stop the flush timer when there's nothing left.
+        if not self._term_buf and hasattr(self, "_term_flush_timer") and self._term_flush_timer.isActive():
+            try:
+                self._term_flush_timer.stop()
+            except Exception:
+                pass
+    
+    def _drain_terminal_buffer(self) -> None:
+        """Flush ALL buffered terminal lines (used on Stop / end-of-run)."""
+        if self.terminal is None:
+            self._term_buf.clear()
+            return
+        while self._term_buf:
+            try:
+                self.terminal.append_line(self._term_buf.popleft())
+            except Exception:
+                self._term_buf.clear()
+                break
+
+        # Stop the flush timer when drained.
+        if hasattr(self, "_term_flush_timer") and self._term_flush_timer.isActive():
+            try:
+                self._term_flush_timer.stop()
+            except Exception:
+                pass
     
     def _on_terminal_settings_changed(self) -> None:
         self._term_stream_samples = bool(self.term_stream_chk.isChecked())
         try:
-            self._term_period_s = max(0.0, float(self.term_period_edit.text().strip()))
+            val = float(self.term_period_edit.text().strip())
+            self._term_period_s = 0.0 if val <= 0 else val
         except Exception:
             self._term_period_s = 0.05
             self.term_period_edit.setText("0.05")
@@ -881,6 +1018,8 @@ class LabDashboard(QWidget):
             return
 
         now = time.monotonic()
+
+        # If period > 0, rate-limit by wall time.
         if self._term_period_s > 0 and (now - self._last_term_wall) < self._term_period_s:
             return
         self._last_term_wall = now
@@ -919,7 +1058,14 @@ class LabDashboard(QWidget):
         if isinstance(gs, str) and gs.strip():
             msg += f" | g_strings={gs}"
 
-        self._log(msg)
+        # If period==0, we still print EVERY step, but buffer terminal updates and flush on a timer
+        # to avoid starving the Qt event loop (which would prevent live plotting).
+        if self._term_period_s == 0.0:
+            self._term_buf.append(msg)
+            if not self._term_flush_timer.isActive():
+                self._term_flush_timer.start()
+        else:
+            self._log(msg)
 
     def refresh_runs(self) -> None:
         self.run_list.clear()
@@ -979,11 +1125,228 @@ class LabDashboard(QWidget):
             self.overrides.temperature_c = float(t)
 
         if self._rd is not None and hasattr(self, "_plot_debounce"):
-            self._plot_debounce.start()
+            if not self._plot_debounce.isActive():
+                self._plot_debounce.start()
 
     # ---------------------------
     # Run/Stop
     # ---------------------------
+
+    def _continuous_enabled(self) -> bool:
+        # By default, continuous is for interactive/manual mode. CSV profiles run in batch mode.
+        use_csv = bool(getattr(self, "use_csv_chk", None) and self.use_csv_chk.isChecked())
+        if use_csv:
+            return False
+        return bool(getattr(self, "cont_chk", None) and self.cont_chk.isChecked())
+
+    def _continuous_tick_ms(self) -> int:
+        try:
+            ms = int(float(self.cont_tick_edit.text().strip()))
+        except Exception:
+            ms = 33
+        return max(5, ms)
+
+    def _stop_continuous(self) -> None:
+        if self._cont_timer is not None:
+            try:
+                self._cont_timer.stop()
+            except Exception:
+                pass
+            self._cont_timer = None
+
+        self._cont_eng = None
+
+        if self._cont_f is not None:
+            try:
+                self._cont_f.flush()
+            except Exception:
+                pass
+            try:
+                self._cont_f.close()
+            except Exception:
+                pass
+            self._cont_f = None
+
+        self._cont_writer = None
+        self._cont_rows_since_flush = 0
+        self._cont_last_flush_wall = 0.0
+
+        # Stop terminal flush timer and flush ALL remaining lines
+        try:
+            self._drain_terminal_buffer()
+        except Exception:
+            pass
+        if hasattr(self, "_term_flush_timer") and self._term_flush_timer.isActive():
+            self._term_flush_timer.stop()
+        self._cont_stopping = False
+
+    def _start_continuous(
+        self,
+        *,
+        out_path: Path,
+        selection: str,
+        profile_name: str,
+        use_csv_profile: bool,
+        csv_profile_path: Optional[Path],
+        total_time: float,
+        dt: float,
+        overrides: Optional[LiveOverrides],
+        gmpp_ref: bool,
+    ) -> None:
+        """Run the sim in wall-clock time: one engine step per QTimer tick."""
+        # Resolve environment profile
+        if use_csv_profile:
+            if csv_profile_path is None:
+                raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
+            profile = load_env_profile_csv(csv_profile_path)
+        else:
+            if isinstance(profile_name, str) and profile_name.strip():
+                profile = get_profile(profile_name.strip())
+            else:
+                profile = [(0.0, 1000.0, 25.0)]
+
+        sel = (selection or "hybrid").strip()
+        sel_l = sel.lower()
+
+        if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+            controller_mode = "hybrid"
+            algo_name = None
+            controller_cfg = HybridConfig()
+        else:
+            if not mppt_registry.is_valid(sel):
+                raise SystemExit(
+                    f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
+                )
+            controller_mode = "single"
+            algo_name = mppt_registry.resolve_key(sel)
+            controller_cfg = None
+
+        # Enforce CSV profile mode: LiveOverrides always win over env_profile in the engine.
+        # If CSV is enabled, do NOT allow overrides to mask it.
+        if use_csv_profile:
+            overrides = None
+
+        # Prepare CSV output
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "t",
+            "dt",
+            "k",
+            "v_cmd",
+            "v_true",
+            "i_true",
+            "p_true",
+            "v",
+            "i",
+            "p",
+            "g",
+            "t_mod",
+            "v_ref",
+            "state",
+            "reason",
+            "action_debug",
+            "v_gmp_ref",
+            "p_gmp_ref",
+            "v_best",
+            "p_best",
+            "eff_best",
+            "g_strings",
+        ]
+
+        self._cont_f = out_path.open("w", newline="")
+        self._cont_writer = csv.DictWriter(self._cont_f, fieldnames=fieldnames)
+        self._cont_writer.writeheader()
+        self._cont_rows_since_flush = 0
+        self._cont_last_flush_wall = time.monotonic()
+        flush_every_rows = 200
+        flush_every_s = 0.5
+
+        cfg = SimulationConfig(
+            total_time=total_time,
+            dt=dt,
+            env_profile=profile,
+            controller_mode=controller_mode,
+            algo_name=algo_name,
+            algo_kwargs={},
+            controller_cfg=controller_cfg,
+            overrides=overrides,
+            gmpp_ref=bool(gmpp_ref),
+            gmpp_ref_period_s=0.05,
+            gmpp_ref_points=121,
+            on_sample=None,
+        )
+
+        self._cont_eng = SimulationEngine(cfg)
+
+        # Emit initial record (t=0)
+        rec0 = self._cont_eng.reset()
+        row0 = record_to_row(rec0)
+        if self._cont_writer is not None:
+            self._cont_writer.writerow(row0)
+        self._cont_rows_since_flush += 1
+        self._on_live_sample(row0)
+        if hasattr(self, "_plot_debounce"):
+            if not self._plot_debounce.isActive():
+                self._plot_debounce.start()
+
+        # Start ticking
+        self._cont_timer = QTimer(self)
+        self._cont_timer.setInterval(self._continuous_tick_ms())
+        # Continuous mode: print EVERY step to terminal
+        # (terminal period = 0 disables wall-clock rate limiting)
+        self._term_period_s = 0.0
+        if hasattr(self, "term_period_edit"):
+            self.term_period_edit.setText("0")
+
+        def _tick() -> None:
+            if getattr(self, "_cont_stopping", False):
+                return
+            if self._cont_eng is None or self._cont_writer is None or self._cont_f is None:
+                return
+
+            rec = self._cont_eng.step_once()
+            if rec is None:
+                done_msg = f"[ui] MPPT done -> {out_path}"
+                # Stop stepping first, then flush everything, then print done as the final line.
+                self._cont_stopping = True
+                try:
+                    if self._cont_timer is not None:
+                        self._cont_timer.stop()
+                except Exception:
+                    pass
+
+                self._stop_continuous()
+                self._cont_stopping = False
+                self._finish_run_ui()
+                self.refresh_runs()
+
+                try:
+                    self._drain_terminal_buffer()
+                except Exception:
+                    pass
+                try:
+                    self._log(done_msg)
+                except Exception:
+                    pass
+                return
+
+            row = record_to_row(rec)
+            self._cont_writer.writerow(row)
+            self._on_live_sample(row)
+
+            # Periodic flush
+            self._cont_rows_since_flush += 1
+            now = time.monotonic()
+            if self._cont_rows_since_flush >= flush_every_rows or (now - self._cont_last_flush_wall) >= flush_every_s:
+                try:
+                    self._cont_f.flush()
+                except Exception:
+                    pass
+                self._cont_rows_since_flush = 0
+                self._cont_last_flush_wall = now
+
+        self._cont_timer.timeout.connect(_tick)
+        self._cont_timer.start()
     def run_sim(self) -> None:
         try:
             sim_time = float(self.time_edit.text().strip())
@@ -993,9 +1356,16 @@ class LabDashboard(QWidget):
         except Exception:
             QMessageBox.warning(self, "Invalid settings", "Time and dt must be positive numbers.")
             return
+        # Reset any stale stop state from a prior run so completion messages fire normally.
+        self._pending_stop_msg = None
+        self._batch_stopping = False
+        self._cont_stopping = False
+        # Apply terminal streaming settings at run start so batch/profile runs respect them.
+        # (Continuous mode already forces period=0.)
+        self._on_terminal_settings_changed()
 
         algo = str(getattr(self, "algo_box", None) and self.algo_box.currentData() or "hybrid")
-        profile = self.profile_edit.text().strip()
+        profile = ""
 
         use_csv = bool(self.use_csv_chk.isChecked())
         csv_profile_path: Optional[Path] = None
@@ -1008,6 +1378,25 @@ class LabDashboard(QWidget):
             if not csv_profile_path.exists():
                 QMessageBox.warning(self, "CSV profile", f"CSV profile not found:\n{csv_profile_path}")
                 return
+            # Debug visibility: log profile bounds and warn if it ends before requested Time.
+            try:
+                _prof = load_env_profile_csv(csv_profile_path)
+                if _prof:
+                    self._log(f"[ui] CSV profile rows={len(_prof)} t0={_prof[0][0]:.4f} t_last={_prof[-1][0]:.4f}")
+                    if _prof[-1][0] + 1e-12 < sim_time:
+                        self._log(
+                            f"[ui] WARNING: CSV profile ends at t={_prof[-1][0]:.4f} < Time={sim_time:.4f}. "
+                            "Environment will hold the last values unless you extend the CSV."
+                        )
+            except Exception:
+                pass
+
+        # CSV/profile runs are analysis-oriented; default to printing every step.
+        if use_csv and self._term_stream_samples:
+            self._term_period_s = 0.0
+            self._last_term_wall = 0.0
+            if hasattr(self, "term_period_edit"):
+                self.term_period_edit.setText("0")
 
         out_name = self.out_edit.text().strip() or "mppt_run.csv"
         if not out_name.lower().endswith(".csv"):
@@ -1037,52 +1426,164 @@ class LabDashboard(QWidget):
         if use_csv:
             self._log(f"[ui] selection={algo} profile=csv ({csv_profile_path}) time={sim_time} dt={dt}")
         else:
-            prof_label = profile if profile else "(manual sliders)"
-            self._log(f"[ui] selection={algo} profile={prof_label} time={sim_time} dt={dt}")
+            self._log(f"[ui] selection={algo} profile=(manual sliders) time={sim_time} dt={dt}")
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
         # CSV mode must fully drive the environment; don't let sliders override it.
         overrides_for_run = None if use_csv else self.overrides
 
-        w = _MPPTWorker(
-            out_path=out_path,
-            selection=algo,
-            profile_name=profile,
-            use_csv_profile=use_csv,
-            csv_profile_path=csv_profile_path,
-            total_time=sim_time,
-            dt=dt,
-            overrides=overrides_for_run,
-            gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
-        )
-        w.sample.connect(self._on_live_sample)
-        w.failed.connect(self._on_worker_failed)
-        w.done.connect(self._on_worker_done)
-        self._worker = w
-        w.start()
+        # Continuous mode runs on a QTimer and steps the engine once per tick.
+        # Batch mode keeps the existing worker thread behavior.
+        if self._continuous_enabled():
+            # Ensure any prior continuous run is stopped
+            self._stop_continuous()
 
-        if self._poll is not None:
-            self._poll.stop()
-        self._poll = QTimer(self)
-        self._poll.setInterval(200)
-        self._poll.timeout.connect(self._refresh_live_plot)
-        self._poll.start()
+            self._start_continuous(
+                out_path=out_path,
+                selection=algo,
+                profile_name=profile,
+                use_csv_profile=use_csv,
+                csv_profile_path=csv_profile_path,
+                total_time=1e9,
+                dt=dt,
+                overrides=overrides_for_run,
+                gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
+            )
+        else:
+            w = _MPPTWorker(
+                out_path=out_path,
+                selection=algo,
+                profile_name=profile,
+                use_csv_profile=use_csv,
+                csv_profile_path=csv_profile_path,
+                total_time=sim_time,
+                dt=dt,
+                overrides=overrides_for_run,
+                gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
+            )
+            
+            # If user requested per-step terminal output (period==0), ensure the flush timer is running
+            # so buffered lines appear during the run.
+            if getattr(self, "_term_period_s", 0.05) == 0.0 and hasattr(self, "_term_flush_timer"):
+                if not self._term_flush_timer.isActive():
+                    self._term_flush_timer.start()
+            
+            w.sample.connect(self._on_live_sample)
+            w.failed.connect(self._on_worker_failed)
+            w.done.connect(self._on_worker_done)
+            self._worker = w
+            w.start()
+
+            if self._poll is not None:
+                self._poll.stop()
+            self._poll = QTimer(self)
+            self._poll.setInterval(200)
+            self._poll.timeout.connect(self._refresh_live_plot)
+            self._poll.start()
+
+        return
+
 
     def stop_sim(self) -> None:
+        # Stop continuous timer if active
+        if self._cont_timer is not None:
+            stop_msg = "[ui] MPPT Simulation Stopped (continuous)"
+
+            # Prevent further stepping/logging while we stop.
+            self._cont_stopping = True
+
+            # Stop the timer immediately so `_tick` cannot enqueue more samples.
+            try:
+                self._cont_timer.stop()
+            except Exception:
+                pass
+
+            # Tear down continuous run (this drains any remaining buffered output).
+            self._stop_continuous()
+            self._cont_stopping = False
+            self._finish_run_ui()
+            self.refresh_runs()
+
+            # Ensure absolutely everything is flushed BEFORE printing the stop message.
+            try:
+                self._drain_terminal_buffer()
+            except Exception:
+                pass
+            try:
+                self._log(stop_msg)
+            except Exception:
+                pass
+            return
+
+        # Stop batch worker if active
         if self._worker is None:
             return
-        self._log("[ui] Stopping MPPT…")
+        # Batch stop is asynchronous; remember that Stop was user-initiated.
+        self._pending_stop_msg = "[ui] MPPT Simulation Stopped (batch)"
+        self._batch_stopping = True
         self._worker.request_stop()
 
     def _on_worker_failed(self, msg: str) -> None:
-        self._log(f"[ui] MPPT failed: {msg}")
+        # If Stop was pressed, treat completion as a user stop and print stop message last.
+        if getattr(self, "_pending_stop_msg", None):
+            stop_msg = self._pending_stop_msg or "[ui] MPPT Simulation Stopped (batch)"
+            self._pending_stop_msg = None
+            self._batch_stopping = False
+            self._finish_run_ui()
+            self.refresh_runs()
+            try:
+                self._drain_terminal_buffer()
+            except Exception:
+                pass
+            try:
+                self._log(stop_msg)
+            except Exception:
+                pass
+            return
+
+        self._batch_stopping = False
+        fail_msg = f"[ui] MPPT failed: {msg}"
         self._finish_run_ui()
+        try:
+            self._drain_terminal_buffer()
+        except Exception:
+            pass
+        try:
+            self._log(fail_msg)
+        except Exception:
+            pass
 
     def _on_worker_done(self, out_path_str: str) -> None:
-        self._log(f"[ui] MPPT done -> {out_path_str}")
+        # If Stop was pressed, print the stop message last and suppress the "done" log.
+        if getattr(self, "_pending_stop_msg", None):
+            stop_msg = self._pending_stop_msg or "[ui] MPPT Simulation Stopped (batch)"
+            self._pending_stop_msg = None
+            self._batch_stopping = False
+            self._finish_run_ui()
+            self.refresh_runs()
+            try:
+                self._drain_terminal_buffer()
+            except Exception:
+                pass
+            try:
+                self._log(stop_msg)
+            except Exception:
+                pass
+            return
+
+        self._batch_stopping = False
+        done_msg = f"[ui] MPPT done -> {out_path_str}"
         self._finish_run_ui()
         self.refresh_runs()
+        try:
+            self._drain_terminal_buffer()
+        except Exception:
+            pass
+        try:
+            self._log(done_msg)
+        except Exception:
+            pass
 
     def _finish_run_ui(self) -> None:
         self.btn_run.setEnabled(True)
@@ -1090,7 +1591,23 @@ class LabDashboard(QWidget):
         if self._poll is not None:
             self._poll.stop()
             self._poll = None
+        # Clear any continuous state
+        if self._cont_timer is not None:
+            self._stop_continuous()
         self._worker = None
+
+        # Flush ALL remaining terminal output
+        try:
+            self._drain_terminal_buffer()
+        except Exception:
+            pass
+        if hasattr(self, "_term_flush_timer") and self._term_flush_timer.isActive():
+            self._term_flush_timer.stop()
+
+        # Reset batch-stopping flag. Do NOT clear `_pending_stop_msg` here; it is
+        # consumed and cleared in `_on_worker_done` / `_on_worker_failed` so that
+        # the stop message is reliably printed last.
+        self._batch_stopping = False
 
     def _on_live_sample(self, row: Dict[str, Any]) -> None:
         rd = self._rd
@@ -1137,7 +1654,13 @@ class LabDashboard(QWidget):
             last_state = st
         rd.state.append(last_state)
         rd.reason.append(rsn if isinstance(rsn, str) and rsn else None)
-        self._maybe_log_sample(row, state=last_state, reason=(rsn if isinstance(rsn, str) and rsn else None))
+        if (not getattr(self, "_cont_stopping", False)) and (not getattr(self, "_batch_stopping", False)):
+            self._maybe_log_sample(row, state=last_state, reason=(rsn if isinstance(rsn, str) and rsn else None))
+        # Refresh plots in both batch and continuous modes.
+        # Batch mode also has `_poll`, but continuous mode relies on this debounce.
+        if self._rd is not None and hasattr(self, "_plot_debounce"):
+            if not self._plot_debounce.isActive():
+                self._plot_debounce.start()
 
     def _refresh_live_plot(self) -> None:
         if self._rd is None or len(self._rd.t) < 2:
@@ -1235,10 +1758,26 @@ class LabDashboard(QWidget):
         # Clear + state shading
         # ---------------------------
 
-        segs = build_state_segments(rd.t, rd.state)
-        if segs != self._last_state_segs:
+        # Build state transition list: (state, start_time). This is stable as time advances
+        # and only changes when the controller state changes.
+        transitions: List[Tuple[str, float]] = []
+        if rd.t and rd.state:
+            cur = rd.state[0] if rd.state else "UNKNOWN"
+            t0 = rd.t[0]
+            transitions.append((cur, t0))
+            for idx in range(1, min(len(rd.t), len(rd.state))):
+                st = rd.state[idx]
+                if st != cur:
+                    cur = st
+                    t0 = rd.t[idx]
+                    transitions.append((cur, t0))
+
+        t_end = rd.t[-1] if rd.t else 0.0
+
+        # Only rebuild regions if the transition structure changed.
+        if transitions != getattr(self, "_last_state_transitions", []):
             self._clear_regions()
-            self._last_state_segs = segs
+            self._last_state_transitions = transitions
 
             brushes = {
                 "NORMAL": (0, 160, 80, 40),
@@ -1246,7 +1785,10 @@ class LabDashboard(QWidget):
                 "LOCK_HOLD": (59, 130, 246, 40),
                 "UNKNOWN": (120, 120, 120, 25),
             }
-            for st, t0, t1 in segs:
+
+            # Create one region per transition, ending at the next transition (or current t_end).
+            for i, (st, t0) in enumerate(transitions):
+                t1 = transitions[i + 1][1] if (i + 1) < len(transitions) else t_end
                 rgba = brushes.get(st, brushes["UNKNOWN"])
                 region = pg.LinearRegionItem(values=(t0, t1), brush=pg.mkBrush(*rgba), movable=False)
                 region.setZValue(-10)
@@ -1255,6 +1797,16 @@ class LabDashboard(QWidget):
                 self.v_plot.addItem(region)
                 self.p_plot.addItem(region)
                 self._state_regions.append(region)
+        else:
+            # Fast path: just extend the last region to the new end time.
+            if self._state_regions:
+                try:
+                    last_region = self._state_regions[-1]
+                    # Keep the start as-is, update only the end.
+                    r0, _ = last_region.getRegion()
+                    last_region.setRegion((r0, t_end))
+                except Exception:
+                    pass
 
         # ---------------------------
         # Plot lines

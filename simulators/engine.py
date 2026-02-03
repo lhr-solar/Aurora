@@ -364,6 +364,15 @@ class SimulationEngine:
         eng = SimulationEngine(cfg)
         for sample in eng.run():
             print(sample)
+
+    Continuous / interactive usage:
+        cfg = SimulationConfig(total_time=10.0, dt=1e-3)
+        eng = SimulationEngine(cfg)
+        rec0 = eng.reset()         # initial record at t=0
+        while True:
+            rec = eng.step_once()  # call on a QTimer in the UI
+            if rec is None:
+                break
     """
 
     def __init__(self, cfg: SimulationConfig):
@@ -379,6 +388,31 @@ class SimulationEngine:
         self.plant.set_conditions(cfg.irradiance, cfg.temperature_c)
         # Track last applied environment to avoid redundant set_conditions work
         self._last_env_key: Optional[Tuple[Any, float]] = None
+
+        # --- Continuous / interactive mode state ---
+        self._initialized: bool = False
+        self._steps_total: int = int(self.cfg.total_time / self.cfg.dt)
+
+        self._t: float = 0.0
+        self._k: int = 0
+        self._v: float = float(self.cfg.start_v)
+        self._v_cmd: float = float(self.cfg.start_v)
+        self._a: Optional[Action] = None
+        self._last_record: Optional[Dict[str, Any]] = None
+
+        # Best-so-far tracking (true plant values and measured values)
+        self._p_best_true: float = -1e18
+        self._v_best_true: float = float(self.cfg.start_v)
+        self._p_best_meas: float = -1e18
+        self._v_best_meas: float = float(self.cfg.start_v)
+
+        # GMPP reference caching
+        self._last_ref: Optional[Dict[str, Any]] = None
+        self._next_ref_t: float = 0.0
+        self._last_ref_us: Optional[float] = None
+
+        # Cached plant current function (resolved once)
+        self._i_fn = self.plant._i_fn
     
     def _get_v_bounds(self) -> Tuple[float, float]:
         # Prefer controller cfg bounds if present
@@ -473,223 +507,226 @@ class SimulationEngine:
                 best_v = v
         return float(best_v), float(best_p)
 
-    def run(self) -> Generator[Dict[str, Any], None, None]:
-        """
-        Run the simulation and yield JSON-friendly dicts per timestep.
-        """
-        t = 0.0
-        v = self.cfg.start_v
-        k = 0  # step index (0 = initial sample)
+    def reset(self) -> Dict[str, Any]:
+        """Reset engine state for a new run and return the initial record at t=0.
 
-        # Best-so-far should be tracked on TRUE plant power (pre noise/quantization)
-        p_best_true = -1e18
-        v_best_true = v
-        
-        p_best_meas = -1e18
-        v_best_meas = v
-        last_ref = None
-        next_ref_t = 0.0
-        last_ref_us = None
+        Continuous/interactive UIs should call this once and then call `step_once()`
+        on a wall-clock timer.
+        """
+        # Rebuild controller to ensure a clean internal state
+        self.ctrl = self.cfg.build_controller()
 
-        # resolve environment at t=0
-        g0, t0 = self.cfg.env_at(t)
+        # Reset compiled env cursor (important for repeated runs)
+        self.cfg._env_idx = 0
+        self.cfg._env_last_t = -1e18
+
+        # Reset deterministic RNG
+        self._rng = random.Random(self.cfg.rng_seed) if self.cfg.rng_seed is not None else random.Random()
+
+        # Reset counters/state
+        self._steps_total = int(self.cfg.total_time / self.cfg.dt)
+        self._t = 0.0
+        self._k = 0
+        self._v = float(self.cfg.start_v)
+        self._v_cmd = float(self.cfg.start_v)
+        self._a = None
+        self._last_record = None
+
+        # Reset best trackers
+        self._p_best_true = -1e18
+        self._v_best_true = float(self.cfg.start_v)
+        self._p_best_meas = -1e18
+        self._v_best_meas = float(self.cfg.start_v)
+
+        # Reset GMPP cache
+        self._last_ref = None
+        self._next_ref_t = 0.0
+        self._last_ref_us = None
+
+        # Apply environment at t=0
+        g0, t0 = self.cfg.env_at(self._t)
         env_key0 = (tuple(g0) if isinstance(g0, (list, tuple)) else float(g0), float(t0))
         self._last_env_key = env_key0
         self.plant.set_conditions(g0, t0)
-        g0_vec = list(g0) if isinstance(g0, (list, tuple)) else None
 
-        # Prime the controller with an INIT measurement
-        # Use PVPlant's resolved current-at-voltage function
-        i_fn = self.plant._i_fn
-        v_cmd = float(v)  # initial command equals start_v
-        i = float(i_fn(v))
-        g_meas = float(sum(g0) / len(g0)) if isinstance(g0, (list, tuple)) else float(g0)
-        p_true = float(v * i)
-        v_true = float(v)
-        i_true = float(i)
-        # p_true already computed above
-        if p_true > p_best_true:
-            p_best_true = p_true
-            v_best_true = float(v)
-        # apply optional sensor effects
-        v_m, i_m, g_m = self._apply_measurement_effects(v, i, g_meas)
-        m = Measurement(t=t, v=v_m, i=i_m, g=g_m, t_mod=t0, dt=self.cfg.dt)
+        # Build and return the initial sample (also primes the controller)
+        rec0 = self._step_build_record(
+            t_override=self._t,
+            g_override=g0,
+            tmod_override=t0,
+            is_initial=True,
+        )
 
-        # time controller step
-        ctrl_us = None
-        over_budget = None
-        if self.cfg.perf_enabled:
-            t0_ns = self._now_ns()
-            a = self.ctrl.step(m)
-            t1_ns = self._now_ns()
-            ctrl_us = (t1_ns - t0_ns) / 1000.0
-            if self.cfg.perf_budget_us is not None:
-                over_budget = bool(ctrl_us > float(self.cfg.perf_budget_us))
+        self._initialized = True
+        return rec0
+
+    def step_once(self) -> Optional[Dict[str, Any]]:
+        """Advance the simulation by exactly one control period and return the next record.
+
+        Returns None when the configured `total_time` horizon has been reached.
+
+        Notes:
+          - If the engine has not been initialized yet, this calls `reset()` and
+            returns the initial record at t=0.
+          - After initialization, each call advances time by `dt` and returns
+            one record per call.
+        """
+        if not self._initialized:
+            return self.reset()
+
+        # Stop after emitting k=0..steps_total (steps_total+1 total records)
+        if self._k >= self._steps_total:
+            return None
+
+        # Advance time
+        self._t += float(self.cfg.dt)
+        self._k += 1
+
+        # Update environment if needed
+        g_now, t_now = self.cfg.env_at(self._t)
+        env_key = (tuple(g_now) if isinstance(g_now, (list, tuple)) else float(g_now), float(t_now))
+        if env_key != self._last_env_key:
+            self.plant.set_conditions(g_now, t_now)
+            self._last_env_key = env_key
+
+        return self._step_build_record(
+            t_override=self._t,
+            g_override=g_now,
+            tmod_override=t_now,
+            is_initial=False,
+        )
+
+    def _step_build_record(
+        self,
+        *,
+        t_override: float,
+        g_override: Union[float, Sequence[float]],
+        tmod_override: float,
+        is_initial: bool,
+    ) -> Dict[str, Any]:
+        """Core step logic shared by batch and continuous modes."""
+        # Decide voltage command based on previous action
+        if (not is_initial) and self._a is not None and self._a.v_ref is not None:
+            self._v_cmd = float(self._a.v_ref)
         else:
-            a = self.ctrl.step(m)
-        if m.p > p_best_meas:
-            p_best_meas = float(m.p)
-            v_best_meas = float(m.v)
+            # For the first record, v_cmd == start_v.
+            self._v_cmd = float(self._v_cmd if not is_initial else self._v)
 
+        # Measure plant at commanded voltage (TRUE values)
+        v_true, i_true = self.plant.step(self._v_cmd)
+        self._v = float(v_true)
+        p_true = float(v_true * i_true)
+
+        if p_true > self._p_best_true:
+            self._p_best_true = p_true
+            self._v_best_true = float(v_true)
+
+        g_meas = float(sum(g_override) / len(g_override)) if isinstance(g_override, (list, tuple)) else float(g_override)
+
+        # Apply sensor effects to what controller sees
+        v_m, i_m, g_m = self._apply_measurement_effects(v_true, i_true, g_meas)
+        m = Measurement(
+            t=float(t_override),
+            v=float(v_m),
+            i=float(i_m),
+            g=float(g_m),
+            t_mod=float(tmod_override),
+            dt=float(self.cfg.dt),
+        )
+
+        if m.p > self._p_best_meas:
+            self._p_best_meas = float(m.p)
+            self._v_best_meas = float(m.v)
+
+        # Optional GMPP reference computation and caching
         gmpp = None
         ref_us = None
         if self.cfg.gmpp_ref:
-            if self.cfg.perf_enabled:
-                r0 = self._now_ns()
-                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-                r1 = self._now_ns()
-                ref_us = (r1 - r0) / 1000.0
-            else:
-                v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-            
-            eff = float(p_best_true / max(p_gmp, 1e-12))
-            gmpp = {
-                "v_gmp_ref": float(v_gmp),
-                "p_gmp_ref": float(p_gmp),
-                "v_best": float(v_best_true),
-                "p_best": float(p_best_true),
-                "eff_best": float(eff),
+            if float(t_override) >= float(self._next_ref_t):
+                if self.cfg.perf_enabled:
+                    r0 = self._now_ns()
+                    v_gmp, p_gmp = self._gmpp_reference(self._i_fn, self.cfg.gmpp_ref_points)
+                    r1 = self._now_ns()
+                    ref_us = (r1 - r0) / 1000.0
+                else:
+                    v_gmp, p_gmp = self._gmpp_reference(self._i_fn, self.cfg.gmpp_ref_points)
 
-                "v_best_meas": float(v_best_meas),
-                "p_best_meas": float(p_best_meas),
-                "eff_best_meas": float(p_best_meas / max(p_gmp, 1e-12)),
-            }
-            last_ref = gmpp
-            last_ref_us = ref_us
-            next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
-        extra0 = {"gmpp": gmpp} if gmpp else {}
-        extra0["k"] = int(k)
-        extra0["v_cmd"] = float(v_cmd)
-        extra0["v_true"] = float(v_true)
-        extra0["i_true"] = float(i_true)
-        extra0["p_true"] = float(p_true)
+                gmpp = {
+                    "v_gmp_ref": float(v_gmp),
+                    "p_gmp_ref": float(p_gmp),
+                    "v_best": float(self._v_best_true),
+                    "p_best": float(self._p_best_true),
+                    "eff_best": float(self._p_best_true / max(p_gmp, 1e-12)),
+                    "v_best_meas": float(self._v_best_meas),
+                    "p_best_meas": float(self._p_best_meas),
+                    "eff_best_meas": float(self._p_best_meas / max(p_gmp, 1e-12)),
+                }
+                self._last_ref = gmpp
+                self._last_ref_us = ref_us
+                self._next_ref_t = float(t_override) + float(self.cfg.gmpp_ref_period_s)
+            elif self._last_ref is not None:
+                gmpp = dict(self._last_ref)
+                p_gmp_ref = float(gmpp.get("p_gmp_ref", float("nan")))
+                if p_gmp_ref == p_gmp_ref:  # not NaN
+                    gmpp["v_best"] = float(self._v_best_true)
+                    gmpp["p_best"] = float(self._p_best_true)
+                    gmpp["eff_best"] = float(self._p_best_true / max(p_gmp_ref, 1e-12))
+                    gmpp["v_best_meas"] = float(self._v_best_meas)
+                    gmpp["p_best_meas"] = float(self._p_best_meas)
+                    gmpp["eff_best_meas"] = float(self._p_best_meas / max(p_gmp_ref, 1e-12))
+                self._last_ref = gmpp
+                ref_us = self._last_ref_us
+
+        # Controller step (timed optionally)
+        ctrl_us = None
+        over_budget = None
         if self.cfg.perf_enabled:
-            extra0["perf"] = {
+            c0 = self._now_ns()
+            self._a = self.ctrl.step(m)
+            c1 = self._now_ns()
+            ctrl_us = (c1 - c0) / 1000.0
+            if self.cfg.perf_budget_us is not None:
+                over_budget = bool(ctrl_us > float(self.cfg.perf_budget_us))
+        else:
+            self._a = self.ctrl.step(m)
+
+        extra: Dict[str, Any] = {}
+        if gmpp is not None:
+            extra["gmpp"] = gmpp
+        extra["k"] = int(self._k)
+        extra["v_cmd"] = float(self._v_cmd)
+        extra["v_true"] = float(v_true)
+        extra["i_true"] = float(i_true)
+        extra["p_true"] = float(p_true)
+        if self.cfg.perf_enabled:
+            extra["perf"] = {
                 "ctrl_us": ctrl_us,
                 "ref_us": ref_us,
                 "budget_us": self.cfg.perf_budget_us,
                 "over_budget": over_budget,
             }
-        if g0_vec is not None:
-            extra0["g_strings"] = g0_vec
-        rec = self._to_record(m, a, extra=extra0 if extra0 else None)
+        if isinstance(g_override, (list, tuple)):
+            extra["g_strings"] = list(g_override)
+
+        rec = self._to_record(m, self._a, extra=extra if extra else None)
+        self._last_record = rec
         if self.on_sample is not None:
             self.on_sample(rec)
-        yield rec
+        return rec
 
-        steps = int(self.cfg.total_time / self.cfg.dt)
-        for _ in range(steps):
-            t += self.cfg.dt
-            k += 1
+    def run(self) -> Generator[Dict[str, Any], None, None]:
+        """Run the simulation in batch mode (as fast as possible).
 
-            # apply controller action (voltage-mode)
-            if a.v_ref is not None:
-                v_cmd = float(a.v_ref)
-            else:
-                v_cmd = v
-
-            # measure plant at that voltage
-            g_now, t_now = self.cfg.env_at(t)
-            g_vec = list(g_now) if isinstance(g_now, (list, tuple)) else None
-
-            env_key = (tuple(g_now) if isinstance(g_now, (list, tuple)) else float(g_now), float(t_now))
-            if env_key != self._last_env_key:
-                self.plant.set_conditions(g_now, t_now)
-                self._last_env_key = env_key
-            v, i = self.plant.step(v_cmd)
-            p_true = float(v * i)
-            v_true = float(v)
-            i_true = float(i)
-            # p_true already computed above
-            if p_true > p_best_true:
-                p_best_true = p_true
-                v_best_true = float(v)
-
-            g_meas = float(sum(g_now) / len(g_now)) if isinstance(g_now, (list, tuple)) else float(g_now)
-
-            # apply optional sensor effects
-            v_m, i_m, g_m = self._apply_measurement_effects(v, i, g_meas)
-            m = Measurement(
-                t=t,
-                v=v_m,
-                i=i_m,
-                g=g_m,
-                t_mod=t_now,
-                dt=self.cfg.dt,
-            )
-            if m.p > p_best_meas:
-                p_best_meas = float(m.p)
-                v_best_meas = float(m.v)
-            gmpp = None
-            ref_us = None
-            if self.cfg.gmpp_ref and t >= next_ref_t:
-                if self.cfg.perf_enabled:
-                    r0 = self._now_ns()
-                    v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-                    r1 = self._now_ns()
-                    ref_us = (r1 - r0) / 1000.0
-                else:
-                    v_gmp, p_gmp = self._gmpp_reference(i_fn, self.cfg.gmpp_ref_points)
-                eff = float(p_best_true / max(p_gmp, 1e-12))
-                gmpp = {
-                    "v_gmp_ref": float(v_gmp),
-                    "p_gmp_ref": float(p_gmp),
-                    "v_best": float(v_best_true),
-                    "p_best": float(p_best_true),
-                    "eff_best": float(eff),
-                    
-                    "v_best_meas": float(v_best_meas),
-                    "p_best_meas": float(p_best_meas),
-                    "eff_best_meas": float(p_best_meas / max(p_gmp, 1e-12)),
-                }
-                last_ref = gmpp
-                last_ref_us = ref_us
-                next_ref_t = t + float(self.cfg.gmpp_ref_period_s)
-            elif last_ref is not None:
-                # Reuse last reference volt/power, but keep best-so-far and efficiency up to date
-                gmpp = dict(last_ref)
-                p_gmp_ref = float(gmpp.get("p_gmp_ref", float("nan")))
-                if p_gmp_ref == p_gmp_ref:  # not NaN
-                    gmpp["v_best"] = float(v_best_true)
-                    gmpp["p_best"] = float(p_best_true)
-                    gmpp["eff_best"] = float(p_best_true / max(p_gmp_ref, 1e-12))
-                    gmpp["v_best_meas"] = float(v_best_meas)
-                    gmpp["p_best_meas"] = float(p_best_meas)
-                    gmpp["eff_best_meas"] = float(p_best_meas / max(p_gmp_ref, 1e-12))
-                last_ref = gmpp
-                ref_us = last_ref_us
-            # controller next step
-            ctrl_us = None
-            over_budget = None
-            if self.cfg.perf_enabled:
-                c0 = self._now_ns()
-                a = self.ctrl.step(m)
-                c1 = self._now_ns()
-                ctrl_us = (c1 - c0) / 1000.0
-                if self.cfg.perf_budget_us is not None:
-                    over_budget = bool(ctrl_us > float(self.cfg.perf_budget_us))
-            else:
-                a = self.ctrl.step(m)
-
-            # emit a JSON-friendly record
-            extra = {"gmpp": gmpp} if gmpp else {}
-            extra["k"] = int(k)
-            extra["v_cmd"] = float(v_cmd)
-            extra["v_true"] = float(v_true)
-            extra["i_true"] = float(i_true)
-            extra["p_true"] = float(p_true)
-            if self.cfg.perf_enabled:
-                extra["perf"] = {
-                    "ctrl_us": ctrl_us,
-                    "ref_us": ref_us,
-                    "budget_us": self.cfg.perf_budget_us,
-                    "over_budget": over_budget,
-                }
-            if g_vec is not None:
-                extra["g_strings"] = g_vec
-            rec = self._to_record(m, a, extra=extra if extra else None)
-            if self.on_sample is not None:
-                self.on_sample(rec)
+        This remains the default API for benchmarks/CLI.
+        Continuous/interactive UIs should call `reset()` once and then `step_once()`
+        on a wall-clock timer.
+        """
+        first = self.reset()
+        yield first
+        while True:
+            rec = self.step_once()
+            if rec is None:
+                break
             yield rec
 
     @staticmethod

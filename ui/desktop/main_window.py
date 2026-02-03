@@ -142,6 +142,9 @@ class MainWindow(QMainWindow):
         act_show_term.triggered.connect(self._show_terminal)
         act_new_term = view_menu.addAction("New Terminal")
         act_new_term.triggered.connect(self._new_terminal)
+        view_menu.addSeparator()
+        act_stop_sim = view_menu.addAction("Stop Simulation")
+        act_stop_sim.triggered.connect(self._stop_sim)
 
     def _load_dashboard(
         self,
@@ -242,6 +245,22 @@ class MainWindow(QMainWindow):
             self._terminal_docks.append(dock)
         except Exception:
             self._terminal_docks = [dock]
+
+    def _stop_sim(self) -> None:
+        """Stop a running simulation in the Live Bench tab, if present."""
+        try:
+            if hasattr(self, "_lab_tab") and hasattr(self._lab_tab, "stop_sim"):
+                self._lab_tab.stop_sim()
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:
+        """Ensure background timers/threads are stopped before exit."""
+        try:
+            self._stop_sim()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def run(argv: Optional[list[str]] = None) -> int:
