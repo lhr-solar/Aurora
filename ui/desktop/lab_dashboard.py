@@ -454,7 +454,8 @@ class LabDashboard(QWidget):
         # dt can be tiny (e.g. 0.001) so logging EVERY sample can freeze the UI.
         # We default to streaming at a sane rate, but still show the latest state continuously.
         self._term_stream_samples = True
-        self._term_period_s = 0.05  # log at most every 50ms of wall time
+        self._term_period_default_s = 0.05
+        self._term_period_s = self._term_period_default_s  # log at most every 50ms of wall time
         self._last_term_wall = 0.0
 
         # Terminal buffering: when printing every step (period=0), we batch UI updates
@@ -482,6 +483,7 @@ class LabDashboard(QWidget):
         self._cont_stopping = False
         self._pending_stop_msg: Optional[str] = None
         self._batch_stopping = False
+        self._accept_live_samples = True
         self._rd: Optional[RunData] = None
         self._state_regions: List[Any] = []
 
@@ -737,6 +739,8 @@ class LabDashboard(QWidget):
         self._on_terminal_settings_changed()
         # Ensure tick edit reflects initial continuous/csv state
         self.cont_tick_edit.setEnabled(self._continuous_enabled())
+        # Apply continuous-mode mutual exclusivity + restore terminal period default if Continuous is on.
+        self._on_continuous_mode_changed()
         
     def _on_continuous_mode_changed(self) -> None:
         """Keep Continuous and CSV modes mutually exclusive."""
@@ -757,6 +761,20 @@ class LabDashboard(QWidget):
             self.use_csv_chk.setChecked(False)
             self.use_csv_chk.blockSignals(False)
 
+        # Continuous is interactive: restore terminal period to the default (rate-limited)
+        # so the terminal doesn’t spam unless explicitly set to 0.
+        try:
+            self.term_period_edit.setText(f"{getattr(self, '_term_period_default_s', 0.05):g}")
+        except Exception:
+            try:
+                self.term_period_edit.setText("0.05")
+            except Exception:
+                pass
+        try:
+            self._on_terminal_settings_changed()
+        except Exception:
+            pass
+
         self._on_profile_mode_changed()
     
     def _on_profile_mode_changed(self) -> None:
@@ -774,12 +792,6 @@ class LabDashboard(QWidget):
         if use_csv and self.overrides is not None:
             self.overrides.irradiance = None
             self.overrides.temperature_c = None
-
-        # CSV/profile runs are analysis-oriented: default to printing every step.
-        # Do this when CSV mode is enabled so the UI reflects it immediately.
-        if use_csv and getattr(self, "_term_stream_samples", True):
-            self.term_period_edit.setText("0")
-            self._on_terminal_settings_changed()
 
         # Continuous and CSV modes are mutually exclusive.
         # When CSV is enabled, continuous must be OFF (and disabled).
@@ -948,6 +960,25 @@ class LabDashboard(QWidget):
     def _log(self, msg: str) -> None:
         if self.terminal is not None:
             self.terminal.append_line(msg)
+    
+    def _log_run_complete(self, kind: str = "complete") -> None:
+        """Print a final sentinel line indicating the run is finished.
+
+        Call this only after all buffered terminal output has been drained.
+        """
+        try:
+            k = (kind or "complete").strip().lower()
+        except Exception:
+            k = "complete"
+
+        if k in ("stop", "stopped"):
+            msg = "[ui] Run complete (stopped)"
+        elif k in ("fail", "failed", "error"):
+            msg = "[ui] Run complete (failed)"
+        else:
+            msg = "[ui] Run complete"
+
+        self._log(msg)
 
     def _flush_terminal_buffer(self) -> None:
         """Flush buffered terminal lines in small batches to keep UI responsive."""
@@ -1292,11 +1323,12 @@ class LabDashboard(QWidget):
         # Start ticking
         self._cont_timer = QTimer(self)
         self._cont_timer.setInterval(self._continuous_tick_ms())
-        # Continuous mode: print EVERY step to terminal
-        # (terminal period = 0 disables wall-clock rate limiting)
-        self._term_period_s = 0.0
-        if hasattr(self, "term_period_edit"):
-            self.term_period_edit.setText("0")
+        # Continuous mode uses the current terminal streaming settings (rate-limited by default).
+        # Do NOT force period=0 here; Continuous should remain usable without spamming the UI.
+        try:
+            self._on_terminal_settings_changed()
+        except Exception:
+            pass
 
         def _tick() -> None:
             if getattr(self, "_cont_stopping", False):
@@ -1306,9 +1338,12 @@ class LabDashboard(QWidget):
 
             rec = self._cont_eng.step_once()
             if rec is None:
-                done_msg = f"[ui] MPPT done -> {out_path}"
-                # Stop stepping first, then flush everything, then print done as the final line.
+                path_msg = f"[ui] MPPT output -> {out_path}"
+                done_msg = "[ui] MPPT Simulation Complete"
+
+                # Stop stepping first, then clean up, then print completion on next event loop turn.
                 self._cont_stopping = True
+                self._accept_live_samples = False
                 try:
                     if self._cont_timer is not None:
                         self._cont_timer.stop()
@@ -1320,14 +1355,25 @@ class LabDashboard(QWidget):
                 self._finish_run_ui()
                 self.refresh_runs()
 
-                try:
-                    self._drain_terminal_buffer()
-                except Exception:
-                    pass
-                try:
-                    self._log(done_msg)
-                except Exception:
-                    pass
+                def _final_log() -> None:
+                    try:
+                        self._drain_terminal_buffer()
+                    except Exception:
+                        pass
+                    try:
+                        self._log(path_msg)
+                    except Exception:
+                        pass
+                    try:
+                        self._log(done_msg)
+                    except Exception:
+                        pass
+                    try:
+                        self._log_run_complete("complete")
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(0, _final_log)
                 return
 
             row = record_to_row(rec)
@@ -1356,10 +1402,13 @@ class LabDashboard(QWidget):
         except Exception:
             QMessageBox.warning(self, "Invalid settings", "Time and dt must be positive numbers.")
             return
+
         # Reset any stale stop state from a prior run so completion messages fire normally.
         self._pending_stop_msg = None
         self._batch_stopping = False
         self._cont_stopping = False
+        self._accept_live_samples = True
+
         # Apply terminal streaming settings at run start so batch/profile runs respect them.
         # (Continuous mode already forces period=0.)
         self._on_terminal_settings_changed()
@@ -1378,16 +1427,19 @@ class LabDashboard(QWidget):
             if not csv_profile_path.exists():
                 QMessageBox.warning(self, "CSV profile", f"CSV profile not found:\n{csv_profile_path}")
                 return
-            # Debug visibility: log profile bounds and warn if it ends before requested Time.
+            # Debug visibility: log profile bounds and clamp Time to the profile end.
             try:
                 _prof = load_env_profile_csv(csv_profile_path)
                 if _prof:
-                    self._log(f"[ui] CSV profile rows={len(_prof)} t0={_prof[0][0]:.4f} t_last={_prof[-1][0]:.4f}")
-                    if _prof[-1][0] + 1e-12 < sim_time:
-                        self._log(
-                            f"[ui] WARNING: CSV profile ends at t={_prof[-1][0]:.4f} < Time={sim_time:.4f}. "
-                            "Environment will hold the last values unless you extend the CSV."
-                        )
+                    t_last = float(_prof[-1][0])
+                    self._log(f"[ui] CSV profile rows={len(_prof)} t0={_prof[0][0]:.4f} t_last={t_last:.4f}")
+                    if t_last + 1e-12 < sim_time:
+                        self._log(f"[ui] CSV profile ends at t={t_last:.4f}; clamping Time from {sim_time:.4f} -> {t_last:.4f}")
+                        sim_time = t_last
+                        try:
+                            self.time_edit.setText(f"{sim_time:g}")
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -1485,6 +1537,59 @@ class LabDashboard(QWidget):
         return
 
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Ensure background simulation threads/timers are stopped before the widget is destroyed.
+
+        Prevents: QThread: Destroyed while thread is still running.
+        """
+        # Stop continuous mode if active.
+        try:
+            if self._cont_timer is not None:
+                try:
+                    self._cont_timer.stop()
+                except Exception:
+                    pass
+                self._stop_continuous()
+        except Exception:
+            pass
+
+        # Stop worker thread if active.
+        w = getattr(self, "_worker", None)
+        if w is not None:
+            try:
+                w.request_stop()
+            except Exception:
+                pass
+            try:
+                w.wait(3000)
+            except Exception:
+                pass
+            try:
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(1000)
+            except Exception:
+                pass
+            try:
+                self._worker = None
+            except Exception:
+                pass
+
+        # Drain any pending terminal output.
+        try:
+            self._drain_terminal_buffer()
+        except Exception:
+            pass
+
+        try:
+            super().closeEvent(event)
+        except Exception:
+            try:
+                event.accept()
+            except Exception:
+                pass
+
+
     def stop_sim(self) -> None:
         # Stop continuous timer if active
         if self._cont_timer is not None:
@@ -1492,6 +1597,7 @@ class LabDashboard(QWidget):
 
             # Prevent further stepping/logging while we stop.
             self._cont_stopping = True
+            self._accept_live_samples = False
 
             # Stop the timer immediately so `_tick` cannot enqueue more samples.
             try:
@@ -1510,8 +1616,13 @@ class LabDashboard(QWidget):
                 self._drain_terminal_buffer()
             except Exception:
                 pass
+            
             try:
                 self._log(stop_msg)
+            except Exception:
+                pass
+            try:
+                self._log_run_complete("stopped")
             except Exception:
                 pass
             return
@@ -1519,71 +1630,118 @@ class LabDashboard(QWidget):
         # Stop batch worker if active
         if self._worker is None:
             return
+        
         # Batch stop is asynchronous; remember that Stop was user-initiated.
         self._pending_stop_msg = "[ui] MPPT Simulation Stopped (batch)"
         self._batch_stopping = True
+        self._accept_live_samples = False
         self._worker.request_stop()
 
     def _on_worker_failed(self, msg: str) -> None:
         # If Stop was pressed, treat completion as a user stop and print stop message last.
         if getattr(self, "_pending_stop_msg", None):
-            stop_msg = self._pending_stop_msg or "[ui] MPPT Simulation Stopped (batch)"
+            stop_msg = self._pending_stop_msg
             self._pending_stop_msg = None
             self._batch_stopping = False
+            self._accept_live_samples = False
             self._finish_run_ui()
             self.refresh_runs()
+
+            def _final_log() -> None:
+                try:
+                    self._drain_terminal_buffer()
+                except Exception:
+                    pass
+                
+                try:
+                    self._log(stop_msg)
+                except Exception:
+                    pass
+                
+                try:
+                    self._log_run_complete("stopped")
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _final_log)
+            return
+
+        self._batch_stopping = False
+        self._accept_live_samples = False
+        fail_msg = f"[ui] MPPT failed: {msg}"
+
+        self._finish_run_ui()
+
+        def _final_log() -> None:
             try:
                 self._drain_terminal_buffer()
             except Exception:
                 pass
             try:
-                self._log(stop_msg)
+                self._log(fail_msg)
             except Exception:
                 pass
-            return
+            try:
+                self._log_run_complete("failed")
+            except Exception:
+                pass
 
-        self._batch_stopping = False
-        fail_msg = f"[ui] MPPT failed: {msg}"
-        self._finish_run_ui()
-        try:
-            self._drain_terminal_buffer()
-        except Exception:
-            pass
-        try:
-            self._log(fail_msg)
-        except Exception:
-            pass
+        QTimer.singleShot(0, _final_log)
 
     def _on_worker_done(self, out_path_str: str) -> None:
         # If Stop was pressed, print the stop message last and suppress the "done" log.
         if getattr(self, "_pending_stop_msg", None):
-            stop_msg = self._pending_stop_msg or "[ui] MPPT Simulation Stopped (batch)"
+            stop_msg = self._pending_stop_msg
             self._pending_stop_msg = None
             self._batch_stopping = False
+            self._accept_live_samples = False
             self._finish_run_ui()
             self.refresh_runs()
+
+            def _final_log() -> None:
+                try:
+                    self._drain_terminal_buffer()
+                except Exception:
+                    pass
+                try:
+                    self._log(stop_msg)
+                except Exception:
+                    pass
+                try:
+                    self._log_run_complete("stopped")
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _final_log)
+            return
+
+        self._batch_stopping = False
+        self._accept_live_samples = False
+        path_msg = f"[ui] MPPT output -> {out_path_str}"
+        done_msg = "[ui] MPPT Simulation Complete"
+
+        self._finish_run_ui()
+        self.refresh_runs()
+
+        def _final_log() -> None:
             try:
                 self._drain_terminal_buffer()
             except Exception:
                 pass
             try:
-                self._log(stop_msg)
+                self._log(path_msg)
             except Exception:
                 pass
-            return
+            try:
+                self._log(done_msg)
+            except Exception:
+                pass
+            try:
+                self._log_run_complete("complete")
+            except Exception:
+                pass
 
-        self._batch_stopping = False
-        done_msg = f"[ui] MPPT done -> {out_path_str}"
-        self._finish_run_ui()
-        self.refresh_runs()
-        try:
-            self._drain_terminal_buffer()
-        except Exception:
-            pass
-        try:
-            self._log(done_msg)
-        except Exception:
-            pass
+        QTimer.singleShot(0, _final_log)
 
     def _finish_run_ui(self) -> None:
         self.btn_run.setEnabled(True)
@@ -1610,6 +1768,8 @@ class LabDashboard(QWidget):
         self._batch_stopping = False
 
     def _on_live_sample(self, row: Dict[str, Any]) -> None:
+        if not getattr(self, "_accept_live_samples", True):
+            return
         rd = self._rd
         if rd is None:
             return
