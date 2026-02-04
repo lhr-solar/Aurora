@@ -46,7 +46,7 @@ All three modes share the same engine, physics model, and controller code.
 From the repository root:
 
 ```bash
-python -m ui.desktop.main_window
+python3 Aurora.py
 ```
 
 This opens the main window with three tabs:

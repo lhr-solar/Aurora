@@ -77,20 +77,21 @@ Aurora includes multiple MPPT implementations and is designed to make adding new
 
 ```text
 Aurora/
+├── Aurora.py              # Primary application entry point
 ├── core/
-│   ├── src/                 # PV physics + array hierarchy
-│   ├── controller/          # Controller interfaces / glue
-│   └── mppt_algorithms/     # MPPT implementations
-├── simulators/              # CLI simulators (engine, mppt_sim, source_sim)
-├── benchmarks/              # Scenarios, metrics, benchmark runner
+│   ├── src/               # PV physics + array hierarchy
+│   ├── controller/        # Controller interfaces / glue
+│   └── mppt_algorithms/   # MPPT implementations
+├── simulators/            # CLI simulators (engine, mppt_sim, source_sim)
+├── benchmarks/            # Scenarios, metrics, benchmark runner
 ├── ui/
-│   └── desktop/             # PyQt dashboards (Live Bench, Benchmarks, Docs)
-├── profiles/                # CSV environment profiles
-├── configs/                 # Saved UI/simulation configs (if enabled)
-├── docs/                    # Markdown documentation rendered in the UI
+│   └── desktop/           # PyQt dashboards (Live Bench, Benchmarks, Docs)
+├── profiles/              # CSV environment profiles
+├── configs/               # Saved UI/simulation configs (if enabled)
+├── docs/                  # Markdown documentation rendered in the UI
 ├── data/
-│   ├── runs/                # Logged simulation runs
-│   └── benchmarks/          # Benchmark outputs
+│   ├── runs/              # Logged simulation runs
+│   └── benchmarks/        # Benchmark outputs
 └── requirements.txt
 ```
 
@@ -121,7 +122,7 @@ pip install -r requirements.txt
 ### Desktop UI (Recommended)
 
 ```bash
-python -m ui.desktop.main_window
+python3 Aurora.py
 ```
 
 This launches the main window with tabs:
