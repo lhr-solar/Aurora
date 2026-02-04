@@ -233,6 +233,206 @@ Tabs include:
 
 ---
 
+## Live Bench UI Control Reference
+
+This section defines every user-facing control in the Live Bench panel.
+Each control maps directly to simulation state, engine behavior, or logging configuration.
+
+---
+
+### Source Controls
+
+#### Irradiance (W/m²)
+Controls the incident solar irradiance applied to the PV array.
+
+- Represents plane-of-array irradiance
+- Directly affects:
+  - Photocurrent generation
+  - Available electrical power
+- Higher values increase current and power
+- Lower values reduce current and can expose local maxima under partial shading
+
+When a CSV profile is active, this value is ignored and slider input is disabled.
+
+---
+
+#### Temperature (°C)
+Controls the PV cell temperature used in the electrical model.
+
+- Affects semiconductor behavior
+- Higher temperatures:
+  - Reduce open-circuit voltage
+  - Shift the MPP to lower voltages
+- Lower temperatures increase voltage and efficiency
+
+Applied uniformly across the array unless overridden by a CSV profile.
+
+---
+
+### MPPT Controls
+
+#### Algorithm Selector
+Dropdown used to select the active MPPT controller.
+
+- Determines the control law used to adjust operating voltage
+- Switching algorithms:
+  - Resets internal controller state
+  - Restarts tracking from initial conditions
+
+Only registered algorithms appear in this list.
+
+---
+
+#### Continuous Mode
+Enables continuous controller updates during simulation runtime.
+
+- When enabled:
+  - The controller updates every simulation timestep
+- When disabled:
+  - The controller may operate in stepped or episodic modes
+  - Used primarily for debugging or algorithm development
+
+Most algorithms are designed to run in continuous mode.
+
+---
+
+### CSV Profile Controls
+
+#### Use CSV Profile
+Toggles deterministic environment playback using a CSV file.
+
+- When enabled:
+  - Irradiance and temperature sliders are disabled
+  - Environment inputs are sourced exclusively from the CSV
+  - Simulation becomes reproducible
+- When disabled:
+  - Environment inputs are controlled by UI sliders
+
+This option is required for benchmarking and fair comparison.
+
+---
+
+#### CSV Path
+File path pointing to the active CSV profile.
+
+- CSV must define time-indexed irradiance and temperature values
+- Path is relative to the project root by default
+- Invalid or malformed CSVs will prevent simulation start
+
+---
+
+#### Browse…
+Opens a file picker to select a CSV profile from disk.
+
+---
+
+#### Profile Editor…
+Launches the CSV Profile Editor.
+
+- Used to:
+  - Create new environment profiles
+  - Edit existing profiles
+  - Visualize irradiance and temperature timelines
+
+Changes made here do not affect the simulation until the profile is saved and selected.
+
+---
+
+#### Save as Profile…
+Saves the current environment configuration as a new CSV profile.
+
+- Useful for capturing exploratory scenarios
+- Generated profiles can be reused for benchmarking
+
+---
+
+### Simulation Timing Controls
+
+#### Time (s)
+Total simulated time horizon.
+
+- Defines how long the simulation runs in simulated seconds
+- Does not represent wall-clock time
+- Used for:
+  - Benchmark normalization
+  - Transient response analysis
+
+---
+
+#### Timestep (`dt`, seconds)
+Simulation resolution.
+
+- Smaller `dt`:
+  - Higher numerical fidelity
+  - Increased computational cost
+- Larger `dt`:
+  - Faster execution
+  - Risk of instability or missed dynamics
+
+`dt` directly influences MPPT behavior and must be identical across benchmark runs.
+
+---
+
+### Output and Logging Controls
+
+#### CSV Output Filename
+Specifies the filename used to save simulation results.
+
+- Output is written to the data directory
+- Contains:
+  - Time
+  - Voltage
+  - Current
+  - Power
+  - Environment variables
+  - Optional reference data
+
+Used for post-processing and analysis.
+
+---
+
+#### Compute GMPP Reference
+Enables computation of the Global Maximum Power Point reference.
+
+- Performs a full PV curve evaluation at each timestep
+- Used to:
+  - Quantify MPPT tracking error
+  - Measure convergence quality
+- Increases computational cost
+
+Required for benchmarking accuracy metrics.
+
+---
+
+#### Terminal: Stream Samples
+Streams simulation samples to the terminal during runtime.
+
+- Intended for debugging
+- Can be disabled to reduce console noise
+
+---
+
+#### Terminal Period (s)
+Controls how frequently samples are printed to the terminal.
+
+- Smaller values:
+  - Higher verbosity
+  - Greater overhead
+- Larger values:
+  - Reduced output
+  - Cleaner logs
+
+---
+
+#### Tick (ms)
+UI refresh interval.
+
+- Controls how often plots and indicators update
+- Does not affect simulation physics or controller logic
+- Larger values improve performance on slower machines
+
+Purely a visualization parameter.
+
 ## Practical Usage Notes
 
 ### Sliders vs CSV Profiles

@@ -58,25 +58,176 @@ This opens the main window with three tabs:
 
 ### Live Bench Tab
 
-The Live Bench is intended for **intuition building and debugging**, not formal evaluation.
+The Live Bench is the primary **interactive experimentation surface** in Aurora.
+It is designed to help users understand MPPT behavior, debug controller logic,
+and observe real‑time system response under changing conditions.
 
-#### Controls
-- **Irradiance slider** (W/m²)
-- **Temperature slider** (°C)
-- **MPPT algorithm selector**
-- **Simulation timestep and run controls**
-- **CSV profile toggle (optional)**
-
-#### Behavior
-- Slider changes immediately affect the environment
-- IV and PV curves update continuously
-- MPPT operating point and power output are visualized in real time
-
-⚠️ **Important:**  
-Live Bench runs are *not deterministic* due to UI event timing and manual interaction.  
-Do not use Live Bench results for benchmarking or algorithm comparison.
+This section explains **every control, slider, and option**, and how they affect the simulation.
 
 ---
+
+#### Environment Controls
+
+These controls define the **external operating conditions** applied to the PV array.
+
+##### Irradiance Slider (W/m²)
+- Controls incident solar irradiance on the PV array
+- Typical range: 0–1000+ W/m²
+- Higher irradiance:
+  - Increases short‑circuit current
+  - Increases available power
+- Lower irradiance:
+  - Reduces current and power
+  - May cause MPPT algorithms to lose tracking if poorly tuned
+
+**Behavior**
+- Changes take effect immediately
+- The irradiance graph updates in real time
+- IV and PV curves shift accordingly
+
+When a CSV profile is active, this slider is disabled.
+
+---
+
+##### Temperature Slider (°C)
+- Controls PV cell temperature
+- Typical range: 0–75 °C
+- Higher temperature:
+  - Reduces open‑circuit voltage
+  - Lowers maximum power point voltage
+- Lower temperature:
+  - Increases voltage and efficiency
+
+**Behavior**
+- Applied instantly to the array model
+- Temperature graph updates continuously
+- MPPT operating voltage shifts in response
+
+When a CSV profile is active, this slider is disabled.
+
+---
+
+#### MPPT Algorithm Controls
+
+##### Algorithm Selector
+- Dropdown menu selecting the active MPPT controller
+- Options include:
+  - P&O
+  - PSO
+  - RUCA
+  - NL‑ESC
+  - MEPO
+  - Hybrid (baseline / diagnostic)
+
+**Behavior**
+- Switching algorithms:
+  - Resets controller internal state
+  - Restarts tracking from initial conditions
+- Algorithm choice directly affects:
+  - Convergence speed
+  - Oscillation amplitude
+  - Stability under noise or shading
+
+Algorithms must be registered to appear here.
+
+---
+
+#### Simulation Timing Controls
+
+##### Timestep (`dt`)
+- Controls simulation resolution (seconds per step)
+- Smaller `dt`:
+  - Higher fidelity
+  - Slower execution
+- Larger `dt`:
+  - Faster simulation
+  - Risk of numerical instability or missed dynamics
+
+**Important**
+- `dt` affects algorithm behavior
+- Benchmarks require identical `dt` across runs
+
+---
+
+##### Run / Pause / Reset Controls
+- **Run**: starts or resumes simulation
+- **Pause**: freezes time advancement while preserving state
+
+---
+
+#### CSV Profile Controls
+
+##### Use CSV Profile Checkbox
+- Enables deterministic environment playback
+- When enabled:
+  - Irradiance and temperature sliders are disabled
+  - Environment values are sourced exclusively from the CSV file
+  - Simulation becomes reproducible
+
+---
+
+##### Profile Selector
+- Dropdown listing available CSV profiles
+- Profiles must exist in:
+  ```
+  profiles/
+  ```
+
+**Behavior**
+- Selecting a profile loads its time series
+- Environment graphs reflect profile data
+- MPPT input conditions are locked to the profile
+
+---
+
+#### Visualization Panels
+
+##### IV Curve Plot
+- Shows current–voltage relationship at the current timestep
+- Reflects:
+  - Irradiance
+  - Temperature
+  - Array configuration
+
+The MPPT operating point is highlighted.
+
+---
+
+##### PV Curve Plot
+- Shows power–voltage relationship
+- Used to visualize:
+  - Global maximum power point
+  - Local maxima under partial shading
+
+Poor MPPT behavior is immediately visible here.
+
+---
+
+##### Time‑Series Graphs
+- Irradiance vs time
+- Temperature vs time
+- Voltage, current, and power vs time
+
+These graphs allow users to:
+- Observe transient response
+- Detect oscillations
+- Identify convergence issues
+
+---
+
+#### Intended Usage Pattern
+
+Live Bench should be used to:
+- Build intuition
+- Debug controllers
+- Stress test under dynamic conditions
+
+Live Bench should NOT be used to:
+- Compare algorithms quantitatively
+- Report performance metrics
+- Draw statistical conclusions
+
+For those tasks, use Benchmarking.
 
 ### CSV Profiles (Deterministic Environment Playback)
 
