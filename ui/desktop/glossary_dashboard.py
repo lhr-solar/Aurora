@@ -26,6 +26,7 @@ DOC_SOURCES = [
     ("How to Run", REPO_ROOT / "docs" / "usage.md"),
     ("Architecture", REPO_ROOT / "docs" / "architecture.md"),
     ("MPPT Algorithms", REPO_ROOT / "docs" / "api.md"),
+    ("Output Interpretations", REPO_ROOT / "docs" / "outputs.md"),
     ("Glossary", REPO_ROOT / "docs" / "glossary.md"),
 ]
 

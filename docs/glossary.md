@@ -62,6 +62,116 @@ Aurora exists to make these behaviors **explicit, observable, and measurable**.
 
 ## Fundamental Concepts
 
+---
+
+## Voltage Definitions (Critical for Interpreting Results)
+
+Aurora uses multiple distinct voltage concepts. These voltages serve different roles and **must not be conflated** when interpreting plots, logs, or algorithm behavior.
+
+---
+
+### Applied PV Voltage (`V_pv`)
+The **actual terminal voltage** of the PV array at a given timestep.
+
+- Computed by the engine after applying controller commands
+- Fully constrained by:
+  - PV physics (I–V curve)
+  - Irradiance and temperature
+  - Voltage bounds (`V_min`, `V_max`)
+  - Any smoothing or slew‑rate limits
+- Used directly to compute power:
+  \[
+  P = V_{pv} \times I_{pv}
+  \]
+
+**This is the voltage plotted on the Voltage graph in the UI.**
+
+Think of this as:
+> “What voltage the panel is actually operating at.”
+
+---
+
+### Reference / Command Voltage (`V_ref`, `V_cmd`)
+The voltage **requested** by the MPPT controller.
+
+- Produced by the MPPT algorithm each timestep
+- May be physically unattainable
+- Passed to the engine as a control input
+- Subject to clamping and dynamics before application
+
+This voltage is **not plotted by default**.
+
+Think of this as:
+> “What the algorithm wants the voltage to be.”
+
+---
+
+### Open‑Circuit Voltage (`V_oc`)
+The maximum possible PV voltage at **zero current**.
+
+- Determined by the PV model
+- Strongly temperature dependent
+- Used as:
+  - A physical upper bound
+  - A normalization reference in some algorithms
+
+The array voltage can never exceed `V_oc`.
+
+Think of this as:
+> “The absolute ceiling for PV voltage.”
+
+---
+
+### Maximum Power Point Voltage (`V_mpp`)
+The voltage at which the PV array produces **maximum power** under fixed conditions.
+
+- Corresponds to a local or global maximum of the PV curve
+- Changes with irradiance and temperature
+- Typically unknown to MPPT algorithms
+
+When **GMPP reference computation** is enabled, this value is computed via full curve evaluation and used for benchmarking and error metrics.
+
+Think of this as:
+> “The correct answer MPPT is trying to discover.”
+
+---
+
+### UI / Debug Voltage
+A voltage value originating from **manual user input**.
+
+- Set via:
+  - Debug controls
+  - Sliders or text inputs (when overrides are enabled)
+- Can bypass MPPT logic entirely
+- Intended for testing dynamics and validation
+
+This voltage ultimately drives `V_ref` or directly sets `V_pv`, depending on mode.
+
+Think of this as:
+> “Human‑in‑the‑loop voltage control.”
+
+---
+
+### Summary Table
+
+| Voltage | Role | Plotted | Who Sets It |
+|-------|----|-------|-----------|
+| `V_pv` | Actual operating voltage | Yes | Engine / Physics |
+| `V_ref` | Desired voltage | No | MPPT algorithm |
+| `V_oc` | Physical maximum | No | PV model |
+| `V_mpp` | Optimal voltage | Optional | Oracle / Benchmark |
+| UI voltage | Manual override | Indirect | User |
+
+---
+
+### Common Mistakes
+- Plotting `V_ref` and assuming physical realism
+- Comparing algorithm output directly to `V_mpp`
+- Forgetting `V_oc` shifts with temperature
+- Letting UI voltage override MPPT unintentionally
+
+If results look “too perfect” or “physically impossible,” verify which voltage is being observed.
+
 ### PV Cell
 The smallest modeled electrical unit.
 Aurora uses a **single‑diode equivalent circuit model** with explicit irradiance and temperature dependence.
