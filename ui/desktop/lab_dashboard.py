@@ -16,8 +16,39 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import sys
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+class _TerminalStream(QObject):
+    """File-like stream that forwards writes into the UI via a Qt signal."""
+
+    text_written = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        try:
+            if not s:
+                return 0
+            self._buf += str(s)
+            # Emit full lines; keep partials buffered.
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line != "":
+                    self.text_written.emit(line)
+            return len(s)
+        except Exception:
+            return 0
+
+    def flush(self) -> None:
+        try:
+            if self._buf:
+                self.text_written.emit(self._buf)
+                self._buf = ""
+        except Exception:
+            pass
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -249,6 +280,72 @@ def resolve_repo_path(repo_root: Path, p: str) -> Path:
     pp = Path(p)
     return pp if pp.is_absolute() else (repo_root / pp)
 
+# ---------------------------
+# Shared config helpers
+# ---------------------------
+
+RUN_CSV_FIELDNAMES: List[str] = [
+    "t",
+    "dt",
+    "k",
+    "v_cmd",
+    "v_true",
+    "i_true",
+    "p_true",
+    "v",
+    "i",
+    "p",
+    "g",
+    "t_mod",
+    "v_ref",
+    "state",
+    "reason",
+    "action_debug",
+    "v_gmp_ref",
+    "p_gmp_ref",
+    "v_best",
+    "p_best",
+    "eff_best",
+    "g_strings",
+]
+
+
+def resolve_env_profile(
+    *,
+    use_csv_profile: bool,
+    csv_profile_path: Optional[Path],
+    profile_name: str,
+) -> List[Tuple[float, float, float]]:
+    """Return the env profile in the engine's expected iterable format."""
+    if use_csv_profile:
+        if csv_profile_path is None:
+            raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
+        return load_env_profile_csv(csv_profile_path)
+
+    if isinstance(profile_name, str) and profile_name.strip():
+        return get_profile(profile_name.strip())
+
+    # Default baseline (sliders / LiveOverrides typically override this in manual mode).
+    return [(0.0, 1000.0, 25.0)]
+
+
+def resolve_controller_selection(
+    selection: str,
+) -> Tuple[str, Optional[str], Optional[HybridConfig]]:
+    """Return (controller_mode, algo_name, controller_cfg)."""
+    sel = (selection or "hybrid").strip()
+    sel_l = sel.lower()
+
+    if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
+        return ("hybrid", None, HybridConfig())
+
+    if not mppt_registry.is_valid(sel):
+        raise SystemExit(
+            f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
+        )
+
+    return ("single", mppt_registry.resolve_key(sel), None)
+
 
 # ---------------------------
 # Record -> CSV-row shaping
@@ -335,59 +432,16 @@ class _MPPTWorker(QThread):
 
     def run(self) -> None:
         try:
-            if self.use_csv_profile:
-                if self.csv_profile_path is None:
-                    raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
-                profile = load_env_profile_csv(self.csv_profile_path)
-            else:
-                # If no built-in profile name was provided, fall back to a flat baseline.
-                # LiveOverrides (sliders) will typically override these values.
-                if isinstance(self.profile_name, str) and self.profile_name.strip():
-                    profile = get_profile(self.profile_name.strip())
-                else:
-                    profile = [(0.0, 1000.0, 25.0)]
+            profile = resolve_env_profile(
+                use_csv_profile=self.use_csv_profile,
+                csv_profile_path=self.csv_profile_path,
+                profile_name=self.profile_name,
+            )
 
-            sel = (self.selection or "hybrid").strip()
-            sel_l = sel.lower()
-
-            if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
-                controller_mode = "hybrid"
-                algo_name = None
-                controller_cfg = HybridConfig()
-            else:
-                if not mppt_registry.is_valid(sel):
-                    raise SystemExit(
-                        f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
-                    )
-                controller_mode = "single"
-                algo_name = mppt_registry.resolve_key(sel)
-                controller_cfg = None
+            controller_mode, algo_name, controller_cfg = resolve_controller_selection(self.selection)
 
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
-            fieldnames = [
-                "t",
-                "dt",
-                "k",
-                "v_cmd",
-                "v_true",
-                "i_true",
-                "p_true",
-                "v",
-                "i",
-                "p",
-                "g",
-                "t_mod",
-                "v_ref",
-                "state",
-                "reason",
-                "action_debug",
-                "v_gmp_ref",
-                "p_gmp_ref",
-                "v_best",
-                "p_best",
-                "eff_best",
-                "g_strings"
-            ]
+            fieldnames = RUN_CSV_FIELDNAMES
 
             with self.out_path.open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -449,6 +503,35 @@ class LabDashboard(QWidget):
 
         self.terminal = terminal
         self.overrides = overrides
+        
+        # Capture stdout/stderr during runs so engine/worker `print()` output
+        # (including end-of-run stats) appears in the in-app terminal.
+        self._capturing_stdio = False
+        self._stdout_orig = None
+        self._stderr_orig = None
+        self._stream_out = _TerminalStream()
+        self._stream_err = _TerminalStream()
+
+        def _emit_line(line: str) -> None:
+            try:
+                if line is None:
+                    return
+                s = str(line)
+                if s == "":
+                    return
+                self._log(s)
+            except Exception:
+                pass
+
+        # Queue into the GUI thread even if writes occur from a worker thread.
+        try:
+            self._stream_out.text_written.connect(_emit_line, type=Qt.ConnectionType.QueuedConnection)
+        except Exception:
+            self._stream_out.text_written.connect(_emit_line)
+        try:
+            self._stream_err.text_written.connect(_emit_line, type=Qt.ConnectionType.QueuedConnection)
+        except Exception:
+            self._stream_err.text_written.connect(_emit_line)
         
         # Terminal streaming (per-sample) config.
         # dt can be tiny (e.g. 0.001) so logging EVERY sample can freeze the UI.
@@ -726,12 +809,15 @@ class LabDashboard(QWidget):
         self.t_slider.valueChanged.connect(self._on_override_changed)
         self.use_csv_chk.stateChanged.connect(self._on_profile_mode_changed)
         self.btn_browse_profile.clicked.connect(self.browse_profile_csv)
+        self.csv_path_edit.editingFinished.connect(self._sync_time_to_csv_profile)
         self.btn_profile_editor.clicked.connect(self.open_profile_editor)
         self.btn_save_profile.clicked.connect(self.save_current_as_profile)
         self.term_stream_chk.stateChanged.connect(self._on_terminal_settings_changed)
         self.term_period_edit.editingFinished.connect(self._on_terminal_settings_changed)
         self.cont_chk.stateChanged.connect(lambda _=None: self._on_continuous_mode_changed())
         self.cont_chk.stateChanged.connect(lambda _=None: self.cont_tick_edit.setEnabled(self._continuous_enabled()))
+        # If a profile is saved/selected programmatically, also resync Time.
+        self.use_csv_chk.stateChanged.connect(lambda _=None: self._sync_time_to_csv_profile())
 
         self.refresh_runs()
         self._on_override_changed()
@@ -776,6 +862,7 @@ class LabDashboard(QWidget):
             pass
 
         self._on_profile_mode_changed()
+
     
     def _on_profile_mode_changed(self) -> None:
         use_csv = self.use_csv_chk.isChecked()
@@ -807,6 +894,26 @@ class LabDashboard(QWidget):
                 self.cont_chk.blockSignals(True)
                 self.cont_chk.setChecked(True)
                 self.cont_chk.blockSignals(False)
+                # Leaving CSV mode auto-enables Continuous, but we block signals above,
+                # so `_on_continuous_mode_changed()` won't run. Restore the default
+                # terminal period here so the terminal doesn't stay in "period=0" spam mode.
+                try:
+                    default_p = float(getattr(self, "_term_period_default_s", 0.05))
+                except Exception:
+                    default_p = 0.05
+                try:
+                    self.term_period_edit.setText(f"{default_p:g}")
+                except Exception:
+                    pass
+                try:
+                    self._term_period_s = default_p
+                    self._last_term_wall = 0.0
+                except Exception:
+                    pass
+                try:
+                    self._on_terminal_settings_changed()
+                except Exception:
+                    pass
 
         if hasattr(self, "cont_tick_edit"):
             self.cont_tick_edit.setEnabled((not use_csv) and bool(getattr(self, "cont_chk", None) and self.cont_chk.isChecked()))
@@ -818,6 +925,9 @@ class LabDashboard(QWidget):
         # When exiting CSV mode, re-apply the current slider values as overrides.
         if not use_csv:
             self._on_override_changed()
+        # When CSV mode is enabled, keep Time in sync with the selected profile.
+        if use_csv:
+            self._sync_time_to_csv_profile()
             
     def browse_profile_csv(self) -> None:
         start_dir = str(self._repo_root / "profiles")
@@ -837,6 +947,10 @@ class LabDashboard(QWidget):
             self.csv_path_edit.setText(str(rel))
         except Exception:
             self.csv_path_edit.setText(str(p))
+        try:
+            self._sync_time_to_csv_profile()
+        except Exception:
+            pass
 
     def open_profile_editor(self) -> None:
         dlg = ProfileEditorDialog(parent=self)
@@ -851,6 +965,10 @@ class LabDashboard(QWidget):
                 self.csv_path_edit.setText(str(rel))
             except Exception:
                 self.csv_path_edit.setText(p)
+            try:
+                self._sync_time_to_csv_profile()
+            except Exception:
+                pass
 
         dlg.editor.profile_saved.connect(_on_saved)
         dlg.exec()
@@ -957,28 +1075,94 @@ class LabDashboard(QWidget):
     # ---------------------------
     # Helpers
     # ---------------------------
-    def _log(self, msg: str) -> None:
-        if self.terminal is not None:
-            self.terminal.append_line(msg)
-    
-    def _log_run_complete(self, kind: str = "complete") -> None:
-        """Print a final sentinel line indicating the run is finished.
-
-        Call this only after all buffered terminal output has been drained.
-        """
+    def _sync_time_to_csv_profile(self) -> None:
+        """If CSV profile mode is active and a valid CSV is selected, set Time to the profile end time."""
         try:
-            k = (kind or "complete").strip().lower()
+            if not (hasattr(self, "use_csv_chk") and self.use_csv_chk.isChecked()):
+                return
         except Exception:
-            k = "complete"
+            return
 
-        if k in ("stop", "stopped"):
-            msg = "[ui] Run complete (stopped)"
-        elif k in ("fail", "failed", "error"):
-            msg = "[ui] Run complete (failed)"
-        else:
-            msg = "[ui] Run complete"
+        try:
+            raw = self.csv_path_edit.text().strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return
 
-        self._log(msg)
+        try:
+            p = resolve_repo_path(self._repo_root, raw)
+        except Exception:
+            p = Path(raw)
+
+        if not p.exists():
+            return
+
+        try:
+            prof = load_env_profile_csv(p)
+            if not prof:
+                return
+            t_last = float(prof[-1][0])
+        except Exception:
+            return
+
+        # Update the Time UI field to match the profile duration.
+        try:
+            cur = float(self.time_edit.text().strip())
+        except Exception:
+            cur = None
+
+        # Only touch the UI if it actually needs updating (avoids annoying cursor jumps).
+        if cur is None or abs(cur - t_last) > 1e-9:
+            try:
+                self.time_edit.setText(f"{t_last:g}")
+            except Exception:
+                pass
+            try:
+                self._log(f"[ui] Time set from CSV profile: {t_last:g}s")
+            except Exception:
+                pass
+    def _log(self, msg: str) -> None:
+        """Append a line to the in-app terminal panel (if present)."""
+        if self.terminal is not None:
+            try:
+                self.terminal.append_line(msg)
+            except Exception:
+                pass
+
+    def _install_stdio_capture(self) -> None:
+        if getattr(self, "_capturing_stdio", False):
+            return
+        try:
+            self._stdout_orig = sys.stdout
+            self._stderr_orig = sys.stderr
+            sys.stdout = self._stream_out  # type: ignore[assignment]
+            sys.stderr = self._stream_err  # type: ignore[assignment]
+            self._capturing_stdio = True
+        except Exception:
+            pass
+
+    def _restore_stdio_capture(self) -> None:
+        if not getattr(self, "_capturing_stdio", False):
+            return
+        try:
+            try:
+                self._stream_out.flush()
+            except Exception:
+                pass
+            try:
+                self._stream_err.flush()
+            except Exception:
+                pass
+            if self._stdout_orig is not None:
+                sys.stdout = self._stdout_orig
+            if self._stderr_orig is not None:
+                sys.stderr = self._stderr_orig
+        except Exception:
+            pass
+        finally:
+            self._capturing_stdio = False
+    
 
     def _flush_terminal_buffer(self) -> None:
         """Flush buffered terminal lines in small batches to keep UI responsive."""
@@ -1225,32 +1409,13 @@ class LabDashboard(QWidget):
         gmpp_ref: bool,
     ) -> None:
         """Run the sim in wall-clock time: one engine step per QTimer tick."""
-        # Resolve environment profile
-        if use_csv_profile:
-            if csv_profile_path is None:
-                raise ValueError("CSV profile mode enabled but no csv_profile_path provided")
-            profile = load_env_profile_csv(csv_profile_path)
-        else:
-            if isinstance(profile_name, str) and profile_name.strip():
-                profile = get_profile(profile_name.strip())
-            else:
-                profile = [(0.0, 1000.0, 25.0)]
+        profile = resolve_env_profile(
+            use_csv_profile=use_csv_profile,
+            csv_profile_path=csv_profile_path,
+            profile_name=profile_name,
+        )
 
-        sel = (selection or "hybrid").strip()
-        sel_l = sel.lower()
-
-        if sel_l in ("hybrid", "hybrid_mppt", "hybridmppt"):
-            controller_mode = "hybrid"
-            algo_name = None
-            controller_cfg = HybridConfig()
-        else:
-            if not mppt_registry.is_valid(sel):
-                raise SystemExit(
-                    f"[ui] Unknown algorithm '{sel}'. Available: {', '.join(mppt_registry.ALGORITHMS)}"
-                )
-            controller_mode = "single"
-            algo_name = mppt_registry.resolve_key(sel)
-            controller_cfg = None
+        controller_mode, algo_name, controller_cfg = resolve_controller_selection(selection)
 
         # Enforce CSV profile mode: LiveOverrides always win over env_profile in the engine.
         # If CSV is enabled, do NOT allow overrides to mask it.
@@ -1259,30 +1424,7 @@ class LabDashboard(QWidget):
 
         # Prepare CSV output
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = [
-            "t",
-            "dt",
-            "k",
-            "v_cmd",
-            "v_true",
-            "i_true",
-            "p_true",
-            "v",
-            "i",
-            "p",
-            "g",
-            "t_mod",
-            "v_ref",
-            "state",
-            "reason",
-            "action_debug",
-            "v_gmp_ref",
-            "p_gmp_ref",
-            "v_best",
-            "p_best",
-            "eff_best",
-            "g_strings",
-        ]
+        fieldnames = RUN_CSV_FIELDNAMES
 
         self._cont_f = out_path.open("w", newline="")
         self._cont_writer = csv.DictWriter(self._cont_f, fieldnames=fieldnames)
@@ -1369,7 +1511,12 @@ class LabDashboard(QWidget):
                     except Exception:
                         pass
                     try:
-                        self._log_run_complete("complete")
+                        if self.terminal is not None:
+                            self.terminal.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._restore_stdio_capture()
                     except Exception:
                         pass
 
@@ -1487,6 +1634,8 @@ class LabDashboard(QWidget):
 
         # Continuous mode runs on a QTimer and steps the engine once per tick.
         # Batch mode keeps the existing worker thread behavior.
+        # Route any engine/worker prints into the in-app terminal while the run is active.
+        self._install_stdio_capture()
         if self._continuous_enabled():
             # Ensure any prior continuous run is stopped
             self._stop_continuous()
@@ -1582,6 +1731,11 @@ class LabDashboard(QWidget):
             pass
 
         try:
+            self._restore_stdio_capture()
+        except Exception:
+            pass
+
+        try:
             super().closeEvent(event)
         except Exception:
             try:
@@ -1622,7 +1776,12 @@ class LabDashboard(QWidget):
             except Exception:
                 pass
             try:
-                self._log_run_complete("stopped")
+                if self.terminal is not None:
+                    self.terminal.flush()
+            except Exception:
+                pass
+            try:
+                self._restore_stdio_capture()
             except Exception:
                 pass
             return
@@ -1652,14 +1811,17 @@ class LabDashboard(QWidget):
                     self._drain_terminal_buffer()
                 except Exception:
                     pass
-                
                 try:
                     self._log(stop_msg)
                 except Exception:
                     pass
-                
                 try:
-                    self._log_run_complete("stopped")
+                    if self.terminal is not None:
+                        self.terminal.flush()
+                except Exception:
+                    pass
+                try:
+                    self._restore_stdio_capture()
                 except Exception:
                     pass
 
@@ -1682,7 +1844,12 @@ class LabDashboard(QWidget):
             except Exception:
                 pass
             try:
-                self._log_run_complete("failed")
+                if self.terminal is not None:
+                    self.terminal.flush()
+            except Exception:
+                pass
+            try:
+                self._restore_stdio_capture()
             except Exception:
                 pass
 
@@ -1708,7 +1875,12 @@ class LabDashboard(QWidget):
                 except Exception:
                     pass
                 try:
-                    self._log_run_complete("stopped")
+                    if self.terminal is not None:
+                        self.terminal.flush()
+                except Exception:
+                    pass
+                try:
+                    self._restore_stdio_capture()
                 except Exception:
                     pass
 
@@ -1737,7 +1909,12 @@ class LabDashboard(QWidget):
             except Exception:
                 pass
             try:
-                self._log_run_complete("complete")
+                if self.terminal is not None:
+                    self.terminal.flush()
+            except Exception:
+                pass
+            try:
+                self._restore_stdio_capture()
             except Exception:
                 pass
 
@@ -1761,6 +1938,11 @@ class LabDashboard(QWidget):
             pass
         if hasattr(self, "_term_flush_timer") and self._term_flush_timer.isActive():
             self._term_flush_timer.stop()
+        try:
+            if self.terminal is not None:
+                self.terminal.flush()
+        except Exception:
+            pass
 
         # Reset batch-stopping flag. Do NOT clear `_pending_stop_msg` here; it is
         # consumed and cleared in `_on_worker_done` / `_on_worker_failed` so that

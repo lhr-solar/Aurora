@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QProcess, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QProcess, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -39,6 +39,11 @@ class TerminalPanel(QWidget):
 
     # Emitted when the user presses Send (input is enabled)
     send_text = pyqtSignal(str)
+
+    # Internal: thread-safe append path (always executed on the GUI thread)
+    _append_text_req = pyqtSignal(str)
+    # Internal: force-flush request (executed on GUI thread)
+    _flush_req = pyqtSignal()
 
     def __init__(
         self,
@@ -123,6 +128,18 @@ class TerminalPanel(QWidget):
         self.btn_pause.toggled.connect(self._on_pause_toggled)
         self.btn_autoscroll.toggled.connect(self._on_autoscroll_toggled)
 
+        # Ensure append operations are executed on the GUI thread (safe from workers).
+        try:
+            self._append_text_req.connect(self._append_text_ui, type=Qt.ConnectionType.QueuedConnection)
+        except Exception:
+            self._append_text_req.connect(self._append_text_ui)
+
+        # Ensure flush operations are executed on the GUI thread.
+        try:
+            self._flush_req.connect(self._flush_pending, type=Qt.ConnectionType.QueuedConnection)
+        except Exception:
+            self._flush_req.connect(self._flush_pending)
+
     # ---------------------------
     # Public API
     # ---------------------------
@@ -130,10 +147,28 @@ class TerminalPanel(QWidget):
         self._paused = checked
         self.btn_pause.setText("Resume" if checked else "Pause")
         if not checked:
-            self._flush_pending()
+            self.flush()
 
     def _on_autoscroll_toggled(self, checked: bool) -> None:
         self._autoscroll = checked
+
+    def flush(self) -> None:
+        """Force-flush any buffered text to the widget immediately.
+
+        The terminal rate-limits updates by buffering into `_pending_text`. At end-of-run,
+        callers should invoke `flush()` so the final stats and completion line appear
+        without needing another append to trigger a UI update.
+
+        This method is thread-safe.
+        """
+        try:
+            self._flush_req.emit()
+        except Exception:
+            # Fallback: try to flush directly.
+            try:
+                self._flush_pending()
+            except Exception:
+                pass
 
     def _flush_pending(self) -> None:
         """Flush any buffered text to the widget immediately (ignores rate limit)."""
@@ -149,7 +184,23 @@ class TerminalPanel(QWidget):
             self.out.ensureCursorVisible()
 
     def append_text(self, text: str) -> None:
-        """Append raw text (no newline normalization)."""
+        """Thread-safe append of raw text.
+
+        This can be called from any thread; the actual widget update happens on the GUI thread.
+        """
+        if not text:
+            return
+        try:
+            self._append_text_req.emit(str(text))
+        except Exception:
+            # As a fallback (should be rare), try to append directly.
+            try:
+                self._append_text_ui(str(text))
+            except Exception:
+                pass
+
+    def _append_text_ui(self, text: str) -> None:
+        """Append raw text on the GUI thread (no newline normalization)."""
         if not text:
             return
         # While paused, buffer incoming text but do not flush to the widget.
@@ -168,7 +219,6 @@ class TerminalPanel(QWidget):
         if not text_to_add:
             return
 
-        # Preserve existing newlines; QPlainTextEdit appends at the end
         cursor = self.out.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(text_to_add)
@@ -229,7 +279,7 @@ class TerminalPanel(QWidget):
 
     def save(self) -> None:
         """Save the current terminal buffer to a text file."""
-        self._flush_pending()
+        self.flush()
         start_dir = str(self._save_opts.default_dir)
         default_name = self._save_opts.default_name
         path_str, _ = QFileDialog.getSaveFileName(
