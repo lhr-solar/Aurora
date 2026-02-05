@@ -467,7 +467,7 @@ class Cell:
         Works for forward-bias region (0..Isc).
         """
         # Bracket around Voc range
-        v_lo = -0.05
+        v_lo = -1.0
         v_hi_guess = self.voc_lin if self.voc_lin is not None else self.voc_ref
         v_hi = max(0.1, float(v_hi_guess)) * 1.10  # pad above Voc
 

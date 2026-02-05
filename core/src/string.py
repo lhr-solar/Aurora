@@ -102,7 +102,7 @@ class PVString:
         if not isc_list:
             return 1.0  # fallback
         # Median is robust to outliers (e.g., heavy shading in only one substring)
-        imax = float(np.median(isc_list))
+        imax = float(np.max(isc_list))
         return max(0.1, imax)
 
     # -------- Curve builders --------

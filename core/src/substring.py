@@ -61,8 +61,17 @@ class Substring:
         We sweep current from 0..Isc and compute V(I), then sort/interpolate
         so the returned V array is ascending and I matches.
         """
-        isc_val = float(self.isc())
-        i_values = np.linspace(0.0, isc_val, int(points))
+        # Allow current above the weakest cell Isc so bypass behavior is representable
+        isc_cells = []
+        for cell in self.cell_list:
+            try:
+                isc_cells.append(float(cell.solve_i_at_v(0.0)))
+            except Exception:
+                isc_cells.append(float(getattr(cell, "isc_ref", 0.0)))
+
+        i_max = max(isc_cells) if isc_cells else float(self.isc())
+        i_max = max(i_max, float(self.isc()))
+        i_values = np.linspace(0.0, 1.2 * i_max, int(points))
         # compute voltages for the requested currents using vectorized path
         v_values = self.v_at_i_vector(i_values, cache_points=max(128, int(points)))
         I = np.asarray(i_values, dtype=float)
@@ -94,7 +103,8 @@ class Substring:
             per_cell_v = []
             i_grid = None
             for cell in self.cell_list:
-                pts = cell.get_iv_curve(key)
+                # include reverse-bias region so shaded cells can be forced above Isc
+                pts = cell.get_iv_curve(key, vmin=-0.8, vmax=None)
                 v_arr = np.array([p[0] for p in pts], dtype=float)
                 i_arr = np.array([p[1] for p in pts], dtype=float)
                 # Ensure i_arr is ascending for interpolation
@@ -133,16 +143,16 @@ class Substring:
 
         return out
 
-    def mpp(self) -> Tuple[float, float, float, float, float]:
-        # Use per-cell vmpp/impp attributes when available (Cell stores vmpp, impp)
-        v_mpp_total = 0.0
-        impp_vals = []
-        for cell in self.cell_list:
-            v_mpp_total += float(getattr(cell, "vmpp", getattr(cell, "v_mpp", 0.0)))
-            impp_vals.append(float(getattr(cell, "impp", getattr(cell, "i_mpp", 0.0))))
-        i_mpp = min(impp_vals) if impp_vals else 0.0
-        p_mpp = v_mpp_total * i_mpp
-        return v_mpp_total, i_mpp, p_mpp, self.voc(), self.voc()
+    def mpp(self, points: int = 600) -> Tuple[float, float, float, float, float]:
+        V, I = self.iv_curve(points=points)
+        P = V * I
+        idx = int(np.nanargmax(P)) if P.size else 0
+        Vmpp = float(V[idx]) if V.size else 0.0
+        Impp = float(I[idx]) if I.size else 0.0
+        Pmpp = float(P[idx]) if P.size else 0.0
+        Voc = float(self.voc())
+        Isc = float(self.isc())
+        return Vmpp, Impp, Pmpp, Voc, Isc
 
     # pre: current > 0
     def v_at_i(self, current: float) -> float:
