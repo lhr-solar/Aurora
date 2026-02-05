@@ -7,7 +7,22 @@ EG_EV = 1.12 # silicon bandgap
 
 class Cell:
 
-    def __init__(self, isc_ref, voc_ref, diode_ideality, r_s=0, r_sh=np.inf, voc_temp_coeff=-0.00174, isc_temp_coeff=0.0029, irradiance=1000.0, temperature_c=25.0, vmpp=0.621, impp=5.84, autofit=False):
+    def __init__(
+        self,
+        isc_ref,
+        voc_ref,
+        diode_ideality,
+        r_s=0,
+        r_sh=np.inf,
+        # Maxeon Gen 7 (typical) defaults (STC)
+        voc_temp_coeff=-0.00175,     # V/°C  (≈ -0.236%/°C of ~0.741 V)
+        isc_temp_coeff=0.00374,      # A/°C  (≈ +0.058%/°C of ~6.44 A)
+        irradiance=1000.0,
+        temperature_c=25.0,
+        vmpp=0.647,                  # V (cell Vmpp)
+        impp=6.114,                  # A (cell Impp)
+        autofit=False
+    ):
         self.isc_ref = float(isc_ref)       # A (STC)
         self.voc_ref = float(voc_ref)       # V (STC)
         self.diode_ideality = float(diode_ideality)  # n
