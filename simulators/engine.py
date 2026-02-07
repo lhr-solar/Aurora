@@ -656,10 +656,10 @@ class SimulationEngine:
                     "p_gmp_ref": float(p_gmp),
                     "v_best": float(self._v_best_true),
                     "p_best": float(self._p_best_true),
-                    "eff_best": float(self._p_best_true / max(p_gmp, 1e-12)),
+                    "eff_step": float(p_true / max(p_gmp, 1e-12)),
                     "v_best_meas": float(self._v_best_meas),
                     "p_best_meas": float(self._p_best_meas),
-                    "eff_best_meas": float(self._p_best_meas / max(p_gmp, 1e-12)),
+                    "eff_step_meas": float(m.p / max(p_gmp, 1e-12)),
                 }
                 self._last_ref = gmpp
                 self._last_ref_us = ref_us
@@ -670,10 +670,10 @@ class SimulationEngine:
                 if p_gmp_ref == p_gmp_ref:  # not NaN
                     gmpp["v_best"] = float(self._v_best_true)
                     gmpp["p_best"] = float(self._p_best_true)
-                    gmpp["eff_best"] = float(self._p_best_true / max(p_gmp_ref, 1e-12))
+                    gmpp["eff_step"] = float(p_true / max(p_gmp_ref, 1e-12))
                     gmpp["v_best_meas"] = float(self._v_best_meas)
                     gmpp["p_best_meas"] = float(self._p_best_meas)
-                    gmpp["eff_best_meas"] = float(self._p_best_meas / max(p_gmp_ref, 1e-12))
+                    gmpp["eff_step_meas"] = float(m.p / max(p_gmp_ref, 1e-12))
                 self._last_ref = gmpp
                 ref_us = self._last_ref_us
 
@@ -705,8 +705,16 @@ class SimulationEngine:
                 "budget_us": self.cfg.perf_budget_us,
                 "over_budget": over_budget,
             }
+        # Always populate g_strings for observability.
+        # - If env provides per-string values, log them as-is.
+        # - If env provides scalar g, broadcast across strings.
+        strings = getattr(self.array, "string_list", None)
+        n_strings = len(strings) if isinstance(strings, (list, tuple)) else 0
+
         if isinstance(g_override, (list, tuple)):
-            extra["g_strings"] = list(g_override)
+            extra["g_strings"] = [float(x) for x in g_override]
+        elif n_strings > 0:
+            extra["g_strings"] = [float(g_override)] * n_strings
 
         rec = self._to_record(m, self._a, extra=extra if extra else None)
         self._last_record = rec

@@ -58,30 +58,37 @@ class Substring:
     def iv_curve(self, points: int) -> Tuple[np.ndarray, np.ndarray]:
         """Return (V, I) arrays for this substring with V ascending.
 
-        We sweep current from 0..Isc and compute V(I), then sort/interpolate
-        so the returned V array is ascending and I matches.
+        Under partial shading (and with bypass diodes), the substring operating
+        current can exceed the weakest cell's Isc (because shaded cells can be
+        driven into reverse bias and bypass can conduct). So we sweep up to ~1.2x
+        the *maximum* cell Isc (under current conditions).
         """
-        # Allow current above the weakest cell Isc so bypass behavior is representable
-        isc_cells = []
+        # Compute per-cell Isc under current conditions
+        isc_cells: List[float] = []
         for cell in self.cell_list:
             try:
                 isc_cells.append(float(cell.solve_i_at_v(0.0)))
             except Exception:
                 isc_cells.append(float(getattr(cell, "isc_ref", 0.0)))
 
+        # Use max cell Isc and also ensure we at least cover substring Isc()
         i_max = max(isc_cells) if isc_cells else float(self.isc())
         i_max = max(i_max, float(self.isc()))
+        if i_max <= 0.0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
         i_values = np.linspace(0.0, 1.2 * i_max, int(points))
-        # compute voltages for the requested currents using vectorized path
+
+        # Vectorized voltage calculation (uses cached per-cell IV curves)
         v_values = self.v_at_i_vector(i_values, cache_points=max(128, int(points)))
+
         I = np.asarray(i_values, dtype=float)
         V = np.asarray(v_values, dtype=float)
-        # Ensure V is sorted ascending for callers: sort by V and reorder I accordingly
+
+        # Sort so V is ascending (many callers assume this)
         if V.size >= 2:
             order = np.argsort(V)
-            Vs = V[order]
-            Is = I[order]
-            return Vs, Is
+            return V[order], I[order]
         return V, I
 
     def v_at_i_vector(self, i_values, cache_points: int = 256):
@@ -100,26 +107,36 @@ class Substring:
         cache = self.cached_iv.get(key)
         if cache is None:
             # build per-cell interpolants at this resolution
-            per_cell_v = []
-            i_grid = None
+            cell_curves = []   # list of (i_sorted, v_sorted)
+            max_i = 0.0
+
             for cell in self.cell_list:
                 # include reverse-bias region so shaded cells can be forced above Isc
                 pts = cell.get_iv_curve(key, vmin=-0.8, vmax=None)
                 v_arr = np.array([p[0] for p in pts], dtype=float)
                 i_arr = np.array([p[1] for p in pts], dtype=float)
+
                 # Ensure i_arr is ascending for interpolation
                 order = np.argsort(i_arr)
                 i_sorted = i_arr[order]
                 v_sorted = v_arr[order]
-                if i_grid is None:
-                    i_grid = i_sorted
-                # interpolate cell V at i_grid (clamped)
-                v_at_i = np.interp(i_grid, i_sorted, v_sorted)
-                per_cell_v.append(v_at_i)
 
-            if i_grid is None:
-                # no cells
+                # Remove duplicate current samples (np.interp expects increasing x)
+                i_unique, idx = np.unique(i_sorted, return_index=True)
+                v_unique = v_sorted[idx]
+
+                if i_unique.size:
+                    max_i = max(max_i, float(i_unique[-1]))
+
+                cell_curves.append((i_unique, v_unique))
+
+            # Define a shared current grid that spans the *largest* cell current range
+            if max_i <= 0.0:
                 i_grid = np.array([], dtype=float)
+                per_cell_v = []
+            else:
+                i_grid = np.linspace(0.0, 1.2 * max_i, key)  # key = cache_points
+                per_cell_v = [np.interp(i_grid, i_c, v_c) for (i_c, v_c) in cell_curves]
 
             cache = {"i_values": i_grid, "per_cell_v": per_cell_v}
             self.cached_iv[key] = cache
@@ -144,12 +161,21 @@ class Substring:
         return out
 
     def mpp(self, points: int = 600) -> Tuple[float, float, float, float, float]:
+        """Return (Vmpp, Impp, Pmpp, Voc, Isc) for this substring.
+
+        Uses the substring IV curve to locate the true MPP, which is required
+        under partial shading (per-cell Vmpp sums are not valid).
+        """
         V, I = self.iv_curve(points=points)
+        if V.size == 0 or I.size == 0:
+            return 0.0, 0.0, 0.0, float(self.voc()), float(self.isc())
+
         P = V * I
-        idx = int(np.nanargmax(P)) if P.size else 0
-        Vmpp = float(V[idx]) if V.size else 0.0
-        Impp = float(I[idx]) if I.size else 0.0
-        Pmpp = float(P[idx]) if P.size else 0.0
+        idx = int(np.nanargmax(P))
+
+        Vmpp = float(V[idx])
+        Impp = float(I[idx])
+        Pmpp = float(P[idx])
         Voc = float(self.voc())
         Isc = float(self.isc())
         return Vmpp, Impp, Pmpp, Voc, Isc

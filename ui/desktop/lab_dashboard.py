@@ -100,7 +100,7 @@ class RunData:
     p_gmp_ref: List[float]
     v_best: List[float]
     p_best: List[float]
-    eff_best: List[float]
+    eff_step: List[float]
     g_strings: List[Optional[str]]
     
     k: List[float]
@@ -158,7 +158,7 @@ def load_run_csv(path: Path) -> RunData:
     p_gmp_ref: List[float] = []
     v_best: List[float] = []
     p_best: List[float] = []
-    eff_best: List[float] = []
+    eff_step: List[float] = []
     g_strings: List[Optional[str]] = []
     k: List[float] = []
     v_cmd: List[float] = []
@@ -191,7 +191,7 @@ def load_run_csv(path: Path) -> RunData:
             p_gmp_ref.append(float(_safe_float(row.get("p_gmp_ref")) or float("nan")))
             v_best.append(float(_safe_float(row.get("v_best")) or float("nan")))
             p_best.append(float(_safe_float(row.get("p_best")) or float("nan")))
-            eff_best.append(float(_safe_float(row.get("eff_best")) or float("nan")))
+            eff_step.append(float(_safe_float(row.get("eff_step")) or float("nan")))
             gs = row.get("g_strings")
             g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
 
@@ -236,7 +236,7 @@ def load_run_csv(path: Path) -> RunData:
         p_gmp_ref=p_gmp_ref,
         v_best=v_best,
         p_best=p_best,
-        eff_best=eff_best,
+        eff_step=eff_step,
         g_strings=g_strings,
         k=k,
         v_cmd=v_cmd,
@@ -305,7 +305,7 @@ RUN_CSV_FIELDNAMES: List[str] = [
     "p_gmp_ref",
     "v_best",
     "p_best",
-    "eff_best",
+    "eff_step",
     "g_strings",
 ]
 
@@ -383,7 +383,7 @@ def record_to_row(rec: Dict[str, Any]) -> Dict[str, Any]:
         "p_gmp_ref": gmpp.get("p_gmp_ref"),
         "v_best": gmpp.get("v_best"),
         "p_best": gmpp.get("p_best"),
-        "eff_best": gmpp.get("eff_best"),
+        "eff_step": gmpp.get("eff_step"),
         "g_strings": repr(g_strings) if g_strings is not None else "",
     }
     return row
@@ -1266,7 +1266,7 @@ class LabDashboard(QWidget):
                 f" p_gmp_ref={self._fmt(row.get('p_gmp_ref'), 4)}"
                 f" v_best={self._fmt(row.get('v_best'), 4)}"
                 f" p_best={self._fmt(row.get('p_best'), 4)}"
-                f" eff_best={self._fmt(row.get('eff_best'), 4)}"
+                f" eff_step={self._fmt(row.get('eff_step'), 4)}"
             )
 
         gs = row.get("g_strings")
@@ -1613,7 +1613,7 @@ class LabDashboard(QWidget):
             path=out_path,
             t=[], v=[], i=[], p=[], g=[], t_mod=[],
             state=[], reason=[],
-            v_gmp_ref=[], p_gmp_ref=[], v_best=[], p_best=[], eff_best=[], g_strings=[],
+            v_gmp_ref=[], p_gmp_ref=[], v_best=[], p_best=[], eff_step=[], g_strings=[],
             k=[],
             v_cmd=[],
             v_true=[],
@@ -1976,7 +1976,7 @@ class LabDashboard(QWidget):
         rd.p_gmp_ref.append(float(_safe_float(row.get("p_gmp_ref")) or float("nan")))
         rd.v_best.append(float(_safe_float(row.get("v_best")) or float("nan")))
         rd.p_best.append(float(_safe_float(row.get("p_best")) or float("nan")))
-        rd.eff_best.append(float(_safe_float(row.get("eff_best")) or float("nan")))
+        rd.eff_step.append(float(_safe_float(row.get("eff_step")) or float("nan")))
         gs = row.get("g_strings")
         rd.g_strings.append(gs if isinstance(gs, str) and gs.strip() else None)
 
