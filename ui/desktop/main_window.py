@@ -120,6 +120,14 @@ class MainWindow(QMainWindow):
         )
         self._tabs.addTab(self._bench_tab, "Benchmarks")
         
+        # Device Model tab (cell/device characteristics)
+        self._device_model_tab = self._load_dashboard(
+            module_path="ui.desktop.device_model_dashboard",
+            class_name="DeviceModelDashboard",
+            fallback_title="Device Model",
+        )
+        self._tabs.addTab(self._device_model_tab, "Device Model")
+        
         # Docs / Glossary tab
         self._docs_tab = self._load_dashboard(
             module_path="ui.desktop.glossary_dashboard",
@@ -135,6 +143,7 @@ class MainWindow(QMainWindow):
         self.terminal.append_line("[ui] LiveOverrides ready")
         self.terminal.append_line("[ui] Benchmarks tab ready")
         self.terminal.append_line("[ui] Glossary/Docs tab ready")
+        self.terminal.append_line("[ui] Device Model tab ready")
 
         # View menu actions for terminal management
         view_menu = self.menuBar().addMenu("View")
@@ -261,7 +270,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-
 
 def run(argv: Optional[list[str]] = None) -> int:
     """Entry point for launching the desktop app."""

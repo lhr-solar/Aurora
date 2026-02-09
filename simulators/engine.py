@@ -33,31 +33,45 @@ from core.controller.single_controller import SingleMPPT, SingleConfig
 from core.mppt_algorithms.types import Measurement, Action
 
 # Plant construction helpers
-def _make_default_cell() -> Cell:
-    """
-    Create a single PV cell with reasonable STC-like defaults.
+def _make_default_cell(
+    cell_params: Optional[Dict[str, Any]] = None,
+    *,
+    irradiance: float = 1000.0,
+    temperature_c: float = 25.0,
+) -> Cell:
+    """Create a single PV cell using STC-like defaults, with optional user overrides.
 
-    NOTE: tweak these to match LR Solar actual module characterization if available.
+    `cell_params` should capture *device* characteristics (Isc/Voc, diode params, Rs/Rsh,
+    temp coefficients, Vmpp/Impp, etc.). Environment values (irradiance/temperature_c)
+    are passed explicitly so the sim can still drive conditions over time.
     """
-    return Cell(
-        isc_ref=5.84,
-        voc_ref=0.621,
-        diode_ideality=1.30,
-        r_s=0.02,
-        r_sh=200.0,
-        voc_temp_coeff=-0.0023,
-        isc_temp_coeff=0.00035,
-        irradiance=1000.0,
-        temperature_c=25.0,
-        vmpp=0.5,
-        impp=5.5,
-        autofit=False,
-    )
+    base: Dict[str, Any] = {
+        "isc_ref": 5.84,
+        "voc_ref": 0.621,
+        "diode_ideality": 1.30,
+        "r_s": 0.02,
+        "r_sh": 200.0,
+        "voc_temp_coeff": -0.0023,
+        "isc_temp_coeff": 0.00035,
+        "vmpp": 0.5,
+        "impp": 5.5,
+        "autofit": False,
+    }
+
+    overrides = dict(cell_params) if isinstance(cell_params, dict) else {}
+
+    # Environment is controlled by the simulation; don't let device overrides pin it.
+    overrides.pop("irradiance", None)
+    overrides.pop("temperature_c", None)
+
+    params = {**base, **overrides, "irradiance": float(irradiance), "temperature_c": float(temperature_c)}
+    return Cell(**params)
 
 def build_default_array(
     n_strings: int = 2,
     substrings_per_string: int = 3,
     cells_per_substring: int = 18,
+    cell_params: Optional[Dict[str, Any]] = None,
 ) -> Array:
     """
     Build a small but hierarchical PV array that exercises the whole stack.
@@ -75,7 +89,7 @@ def build_default_array(
     for _ in range(n_strings):
         substrings: List[Substring] = []
         for _ in range(substrings_per_string):
-            cells = [_make_default_cell() for __ in range(cells_per_substring)]
+            cells = [_make_default_cell(cell_params=cell_params) for __ in range(cells_per_substring)]
             substrings.append(Substring(cell_list=cells, bypass=None))
         strings.append(PVString(substrings=substrings))
     return Array(strings)
@@ -228,7 +242,10 @@ class SimulationConfig:
     start_v: float = 20.0          # initial array voltage guess
     irradiance: Union[float, Sequence[float]] = 1000.0     # W/m^2
     temperature_c: float = 25.0    # deg C
-    array_kwargs: Dict[str, Any] = None
+    # Optional: PV cell/device model parameters (Isc/Voc, diode params, Rs/Rsh, temp coeffs, Vmpp/Impp, etc.).
+    # These are applied when constructing the PV plant (cells) and persist for the run.
+    cell_params: Optional[Dict[str, Any]] = None
+    array_kwargs: Optional[Dict[str, Any]] = None
     controller_cfg: Optional[HybridConfig] = None
 
     # Controller selection
@@ -236,7 +253,7 @@ class SimulationConfig:
     #   - controller_mode = "single" runs one registry algorithm for the full run
     controller_mode: str = "hybrid"
     algo_name: Optional[str] = None
-    algo_kwargs: Dict[str, Any] = None
+    algo_kwargs: Optional[Dict[str, Any]] = None
 
     # GMPP reference (ground truth) computation
     gmpp_ref: bool = False
@@ -274,8 +291,8 @@ class SimulationConfig:
     overrides: Optional[LiveOverrides] = None
 
     def build_array(self) -> Array:
-        kwargs = self.array_kwargs or {}
-        return build_default_array(**kwargs)
+        kwargs = dict(self.array_kwargs or {})
+        return build_default_array(cell_params=self.cell_params, **kwargs)
 
     def build_controller(self):
         """Build the MPPT controller.
@@ -705,6 +722,9 @@ class SimulationEngine:
                 "budget_us": self.cfg.perf_budget_us,
                 "over_budget": over_budget,
             }
+        # Snapshot cell/device params once at the start so logs/runs are reproducible.
+        if is_initial and self.cfg.cell_params is not None:
+            extra["cell_params"] = dict(self.cfg.cell_params)
         # Always populate g_strings for observability.
         # - If env provides per-string values, log them as-is.
         # - If env provides scalar g, broadcast across strings.

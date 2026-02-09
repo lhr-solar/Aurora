@@ -11,6 +11,7 @@ Saved runs are written to Aurora/data/runs and can be reopened.
 
 import ast
 import csv
+import json
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -301,6 +302,7 @@ RUN_CSV_FIELDNAMES: List[str] = [
     "state",
     "reason",
     "action_debug",
+    "cell_params",
     "v_gmp_ref",
     "p_gmp_ref",
     "v_best",
@@ -356,6 +358,7 @@ def record_to_row(rec: Dict[str, Any]) -> Dict[str, Any]:
     action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
     debug = action.get("debug") if isinstance(action.get("debug"), dict) else {}
     gmpp = rec.get("gmpp") if isinstance(rec.get("gmpp"), dict) else {}
+    cell_params = rec.get("cell_params") if isinstance(rec.get("cell_params"), dict) else None
 
     v_ref = action.get("v_ref")
     g_strings = rec.get("g_strings")
@@ -379,6 +382,7 @@ def record_to_row(rec: Dict[str, Any]) -> Dict[str, Any]:
         "state": st if isinstance(st, str) else "",
         "reason": rsn if isinstance(rsn, str) else "",
         "action_debug": repr(debug),
+        "cell_params": json.dumps(cell_params, sort_keys=True) if cell_params is not None else "",
         "v_gmp_ref": gmpp.get("v_gmp_ref"),
         "p_gmp_ref": gmpp.get("p_gmp_ref"),
         "v_best": gmpp.get("v_best"),
@@ -408,6 +412,7 @@ class _MPPTWorker(QThread):
         dt: float,
         overrides: Optional[LiveOverrides],
         gmpp_ref: bool,
+        cell_params: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__()
         self.out_path = out_path
@@ -425,6 +430,7 @@ class _MPPTWorker(QThread):
             self.overrides = None
 
         self.gmpp_ref = bool(gmpp_ref)
+        self.cell_params = dict(cell_params) if isinstance(cell_params, dict) else None
         self._stop = False
 
     def request_stop(self) -> None:
@@ -478,6 +484,7 @@ class _MPPTWorker(QThread):
                     gmpp_ref=self.gmpp_ref,
                     gmpp_ref_period_s=0.05,
                     gmpp_ref_points=121,
+                    cell_params=self.cell_params,
                     on_sample=_on_sample,
                 )
 
@@ -550,6 +557,9 @@ class LabDashboard(QWidget):
 
         # Repo root (Aurora/ui/desktop/lab_dashboard.py)
         self._repo_root = Path(__file__).resolve().parents[2]
+        # Device model / cell params (persisted by DeviceModelDashboard)
+        self._cell_conf_path = self._repo_root / "configs" / "cell_conf.json"
+        self.cell_params: Optional[Dict[str, Any]] = self._load_cell_params()
         self._runs_root = self._repo_root / "data" / "runs"
         self._runs_root.mkdir(parents=True, exist_ok=True)
 
@@ -1075,6 +1085,28 @@ class LabDashboard(QWidget):
     # ---------------------------
     # Helpers
     # ---------------------------
+    def _load_cell_params(self) -> Optional[Dict[str, Any]]:
+        """Load persisted cell/device params from configs/cell_conf.json."""
+        try:
+            p = getattr(self, "_cell_conf_path", None)
+            if p is None or not Path(p).exists():
+                return None
+            obj = json.loads(Path(p).read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def set_cell_params(self, params: Dict[str, Any]) -> None:
+        """Called by MainWindow when DeviceModelDashboard applies new params."""
+        self.cell_params = dict(params) if isinstance(params, dict) else None
+        try:
+            if self.cell_params is None:
+                self._log("[ui] Device Model cleared (cell_params=None)")
+            else:
+                self._log(f"[ui] Device Model applied (keys={sorted(self.cell_params.keys())})")
+        except Exception:
+            pass
+    
     def _sync_time_to_csv_profile(self) -> None:
         """If CSV profile mode is active and a valid CSV is selected, set Time to the profile end time."""
         try:
@@ -1407,6 +1439,7 @@ class LabDashboard(QWidget):
         dt: float,
         overrides: Optional[LiveOverrides],
         gmpp_ref: bool,
+        cell_params: Optional[Dict[str, Any]],
     ) -> None:
         """Run the sim in wall-clock time: one engine step per QTimer tick."""
         profile = resolve_env_profile(
@@ -1446,6 +1479,7 @@ class LabDashboard(QWidget):
             gmpp_ref=bool(gmpp_ref),
             gmpp_ref_period_s=0.05,
             gmpp_ref_points=121,
+            cell_params=cell_params,
             on_sample=None,
         )
 
@@ -1650,6 +1684,7 @@ class LabDashboard(QWidget):
                 dt=dt,
                 overrides=overrides_for_run,
                 gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
+                cell_params=self.cell_params,
             )
         else:
             w = _MPPTWorker(
@@ -1662,6 +1697,7 @@ class LabDashboard(QWidget):
                 dt=dt,
                 overrides=overrides_for_run,
                 gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
+                cell_params=self.cell_params,
             )
             
             # If user requested per-step terminal output (period==0), ensure the flush timer is running
