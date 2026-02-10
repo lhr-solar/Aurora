@@ -15,6 +15,7 @@ Plots/state shading will be added next.
 
 import ast
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -279,6 +280,7 @@ class _MPPTWorker(QThread):
         total_time: float,
         dt: float,
         overrides: Optional[LiveOverrides],
+        cell_params: Optional[Dict[str, Any]],
     ) -> None:
         super().__init__()
         self.out_path = out_path
@@ -287,6 +289,7 @@ class _MPPTWorker(QThread):
         self.total_time = total_time
         self.dt = dt
         self.overrides = overrides
+        self.cell_params = dict(cell_params) if isinstance(cell_params, dict) else None
         self._stop = False
 
     def request_stop(self) -> None:
@@ -328,13 +331,16 @@ class _MPPTWorker(QThread):
                 "t_mod",
                 "v_ref",
                 "action_debug",
+                "cell_params",
             ]
 
             with self.out_path.open("w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
+                wrote_cell_params = False
 
                 def _on_sample(rec: Dict[str, Any]) -> None:
+                    nonlocal wrote_cell_params
                     # `rec` is JSON-friendly from SimulationEngine: includes `action` dict.
                     action = rec.get("action") if isinstance(rec.get("action"), dict) else {}
                     debug = action.get("debug") if isinstance(action.get("debug"), dict) else {}
@@ -351,8 +357,15 @@ class _MPPTWorker(QThread):
                         "v_ref": v_ref,
                         # store as a Python-literal string so the UI can parse with ast.literal_eval
                         "action_debug": repr(debug),
+                        "cell_params": (
+                            json.dumps(self.cell_params, sort_keys=True)
+                            if (not wrote_cell_params and self.cell_params is not None)
+                            else ""
+                        ),
                     }
                     writer.writerow(row)
+                    if not wrote_cell_params and self.cell_params is not None:
+                        wrote_cell_params = True
                     # Flush frequently so the run appears on disk and can be reloaded
                     f.flush()
 
@@ -369,6 +382,7 @@ class _MPPTWorker(QThread):
                     algo_kwargs={},
                     controller_cfg=controller_cfg,
                     overrides=self.overrides,
+                    cell_params=self.cell_params,
                     on_sample=_on_sample,
                 )
 
@@ -395,6 +409,9 @@ class MPPTDashboard(QWidget):
         # Resolve Aurora repo root regardless of where the UI is launched from.
         # This file lives at: Aurora/ui/desktop/mppt_dashboard.py
         self._repo_root = Path(__file__).resolve().parents[2]
+        # Device model / cell params (persisted by DeviceModelDashboard)
+        self._cell_conf_path = self._repo_root / "configs" / "cell_conf.json"
+        self.cell_params: Optional[Dict[str, Any]] = self._load_cell_params()
 
         root = QVBoxLayout(self)
 
@@ -732,6 +749,28 @@ class MPPTDashboard(QWidget):
     # ---------------------------
     # Run / Stop (live)
     # ---------------------------
+    def _load_cell_params(self) -> Optional[Dict[str, Any]]:
+        try:
+            if not self._cell_conf_path.exists():
+                return None
+            obj = json.loads(self._cell_conf_path.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def set_cell_params(self, params: Dict[str, Any]) -> None:
+        self.cell_params = dict(params) if isinstance(params, dict) else None
+        try:
+            if self.terminal is not None:
+                if self.cell_params is None:
+                    self.terminal.append_text("[ui] Device Model cleared (MPPT cell_params=None)\n")
+                else:
+                    self.terminal.append_text(
+                        f"[ui] Device Model applied to MPPT (keys={sorted(self.cell_params.keys())})\n"
+                    )
+        except Exception:
+            pass
+
     def _append_log(self, text: str) -> None:
         if self.terminal is not None:
             self.terminal.append_text(text)
@@ -794,6 +833,7 @@ class MPPTDashboard(QWidget):
             total_time=sim_time,
             dt=dt,
             overrides=self.overrides,
+            cell_params=self.cell_params,
         )
         w.sample.connect(self._on_live_sample)
         w.failed.connect(self._on_worker_failed)
@@ -902,6 +942,7 @@ class MPPTDashboard(QWidget):
         # Update plots (throttle by only plotting if we have enough points)
         if self._live_rd and len(self._live_rd.t) >= 2:
             self._plot_run(self._live_rd)
+
     def _on_live_sample(self, row: Dict[str, Any]) -> None:
         """Receive a streamed CSV-row-shaped sample from the worker."""
         rd = self._live_rd

@@ -128,6 +128,14 @@ class MainWindow(QMainWindow):
         )
         self._tabs.addTab(self._device_model_tab, "Device Model")
         
+        # Wire Device Model -> Lab (so Apply immediately affects new runs)
+        try:
+            if hasattr(self, "_device_model_tab") and hasattr(self, "_lab_tab"):
+                if hasattr(self._device_model_tab, "cell_params_applied") and hasattr(self._lab_tab, "set_cell_params"):
+                    self._device_model_tab.cell_params_applied.connect(self._lab_tab.set_cell_params)
+        except Exception:
+            pass
+        
         # Docs / Glossary tab
         self._docs_tab = self._load_dashboard(
             module_path="ui.desktop.glossary_dashboard",
@@ -142,8 +150,8 @@ class MainWindow(QMainWindow):
         self.terminal.append_line("[ui] Aurora UI started")
         self.terminal.append_line("[ui] LiveOverrides ready")
         self.terminal.append_line("[ui] Benchmarks tab ready")
-        self.terminal.append_line("[ui] Glossary/Docs tab ready")
         self.terminal.append_line("[ui] Device Model tab ready")
+        self.terminal.append_line("[ui] Glossary/Docs tab ready")
 
         # View menu actions for terminal management
         view_menu = self.menuBar().addMenu("View")
