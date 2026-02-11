@@ -34,7 +34,10 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QMessageBox,
+    QInputDialog,
     QGroupBox,
+    QSizePolicy,
+    QMenu,
 )
 
 # Root of the Aurora repo (…/Aurora)
@@ -82,6 +85,8 @@ class DeviceModelDashboard(QWidget):
 
         self._conf_path = Path(conf_path) if conf_path is not None else DEFAULT_CONF_PATH
         self._dirty = False
+        self._presets: Dict[str, Dict[str, Any]] = {"Default": _default_cell_params()}
+        self._active_preset: str = "Default"
 
         self._build_ui()
         self._load_from_disk_or_defaults()
@@ -106,7 +111,7 @@ class DeviceModelDashboard(QWidget):
         subtitle.setStyleSheet("color: #666;")
         root.addWidget(subtitle)
 
-        # ---- Presets row (v1: only Default, but keeps UI extensible) ----
+        # ---- Presets row (top bar) ----
         preset_row = QHBoxLayout()
         preset_row.setSpacing(6)
 
@@ -115,7 +120,6 @@ class DeviceModelDashboard(QWidget):
         preset_row.addWidget(preset_label)
 
         self.preset_combo = QComboBox()
-        self.preset_combo.addItem("Default")
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         preset_row.addWidget(self.preset_combo, 1)
 
@@ -123,26 +127,106 @@ class DeviceModelDashboard(QWidget):
         self.btn_reset.clicked.connect(self._on_reset_clicked)
         preset_row.addWidget(self.btn_reset)
 
-        self.btn_load = QPushButton("Load")
-        self.btn_load.clicked.connect(self._on_load_clicked)
-        preset_row.addWidget(self.btn_load)
+        self.btn_new = QPushButton("New")
+        self.btn_new.setToolTip("Create a new preset initialized to defaults")
+        self.btn_new.clicked.connect(self._on_new_clicked)
+        preset_row.addWidget(self.btn_new)
 
-        self.btn_save = QPushButton("Save")
-        self.btn_save.clicked.connect(self._on_save_clicked)
-        preset_row.addWidget(self.btn_save)
+        self.btn_save_as = QPushButton("Duplicate")
+        self.btn_save_as.setToolTip("Duplicate the current field values into a new preset")
+        self.btn_save_as.clicked.connect(self._on_save_as_clicked)
+        preset_row.addWidget(self.btn_save_as)
+
+        # Less-frequent actions go into a dropdown to keep the top bar clean.
+        self.btn_manage = QPushButton("Manage")
+        self.btn_manage.setToolTip("Preset management actions")
+
+        manage_menu = QMenu(self)
+        act_rename = manage_menu.addAction("Rename…")
+        act_delete = manage_menu.addAction("Delete…")
+        manage_menu.addSeparator()
+        act_reload = manage_menu.addAction("Reload from disk")
+
+        act_rename.triggered.connect(self._on_rename_clicked)
+        act_delete.triggered.connect(self._on_delete_clicked)
+        act_reload.triggered.connect(self._on_load_clicked)
+
+        self.btn_manage.setMenu(manage_menu)
+        preset_row.addWidget(self.btn_manage)
 
         root.addLayout(preset_row)
 
         # ---- Parameters form ----
         group = QGroupBox("Cell parameters")
-        g_layout = QVBoxLayout(group)
+        g_layout = QHBoxLayout(group)
         g_layout.setContentsMargins(8, 8, 8, 8)
         g_layout.setSpacing(6)
 
+        # Left: parameter form
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+
         form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
-        g_layout.addLayout(form)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        left_layout.addLayout(form)
+
+        # Right: info / preview panel
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        info_title = QLabel("Preset summary")
+        info_title.setStyleSheet("font-weight: 600;")
+        right_layout.addWidget(info_title)
+
+        self.preview = QLabel("")
+        self.preview.setWordWrap(True)
+        self.preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.preview.setStyleSheet("color: #E6E6E6; font-weight: 500;")
+        right_layout.addWidget(self.preview)
+
+        hint = QLabel(
+            "Tip: ‘Apply’ affects new runs. Use ‘Save’ to persist presets to disk. "
+            "Use ‘Reload’ to re-read configs/cell_conf.json."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #A8A8A8;")
+        right_layout.addWidget(hint)
+
+        # Apply lives in the summary panel to reduce top-bar clutter.
+        self.btn_apply_right = QPushButton("Apply")
+        self.btn_apply_right.setToolTip("Apply this preset to new runs (also saves)")
+        self.btn_apply_right.clicked.connect(self._on_apply_clicked)
+        self.btn_apply_right.setMinimumHeight(34)
+        self.btn_apply_right.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        right_layout.addWidget(self.btn_apply_right)
+
+        # Save/Reload buttons styled like Apply (full width)
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setToolTip("Save presets to disk (no apply)")
+        self.btn_save.clicked.connect(self._on_save_clicked)
+        self.btn_save.setMinimumHeight(34)
+        self.btn_save.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        right_layout.addWidget(self.btn_save)
+
+        self.btn_reload = QPushButton("Reload")
+        self.btn_reload.setToolTip("Reload presets from disk")
+        self.btn_reload.clicked.connect(self._on_load_clicked)
+        self.btn_reload.setMinimumHeight(34)
+        self.btn_reload.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        right_layout.addWidget(self.btn_reload)
+
+        right_layout.addStretch(1)
+
+        g_layout.addWidget(left, 3)
+        g_layout.addWidget(right, 2)
 
         self._fields: Dict[str, Any] = {}
 
@@ -162,6 +246,8 @@ class DeviceModelDashboard(QWidget):
             w.setSingleStep(step)
             if suffix:
                 w.setSuffix(suffix)
+            w.setMinimumWidth(180)
+            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             w.valueChanged.connect(self._mark_dirty)
             return w
 
@@ -203,42 +289,89 @@ class DeviceModelDashboard(QWidget):
 
         root.addWidget(group, 1)
 
-        # ---- Preview + apply ----
-        footer = QHBoxLayout()
-        footer.setSpacing(8)
-
-        self.preview = QLabel("")
-        self.preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.preview.setStyleSheet("color: #444;")
-        footer.addWidget(self.preview, 1)
-
-        self.btn_apply = QPushButton("Apply")
-        self.btn_apply.clicked.connect(self._on_apply_clicked)
-        footer.addWidget(self.btn_apply)
-
-        root.addLayout(footer)
-
     # ---------------- Data I/O ---------------- #
 
     def _load_from_disk_or_defaults(self) -> None:
-        params = None
+        """Load presets + active preset from disk (or fallback to defaults).
+
+        Supports:
+        - Legacy format: a flat dict of params
+        - New format: {"active_preset": str, "presets": {name: params_dict}}
+        """
+        cfg: Optional[Dict[str, Any]] = None
         try:
             if self._conf_path.exists():
-                params = json.loads(self._conf_path.read_text(encoding="utf-8"))
+                cfg = json.loads(self._conf_path.read_text(encoding="utf-8"))
         except Exception:
-            params = None
+            cfg = None
 
-        if not isinstance(params, dict):
-            params = _default_cell_params()
+        presets: Dict[str, Dict[str, Any]] = {"Default": _default_cell_params()}
+        active = "Default"
 
-        self.set_params(params)
+        if isinstance(cfg, dict) and "presets" in cfg:
+            raw_presets = cfg.get("presets")
+            raw_active = cfg.get("active_preset")
+            if isinstance(raw_presets, dict):
+                for name, params in raw_presets.items():
+                    if isinstance(name, str) and isinstance(params, dict):
+                        presets[name] = params
+            if isinstance(raw_active, str) and raw_active in presets:
+                active = raw_active
+        elif isinstance(cfg, dict):
+            # Legacy schema: treat as Default preset
+            presets["Default"] = cfg
+            active = "Default"
+
+        self._presets = presets
+        self._active_preset = active
+
+        self._rebuild_preset_combo(select_name=self._active_preset)
+
+        # Load active preset into fields
+        self.set_params(self._presets.get(self._active_preset, _default_cell_params()))
         self._dirty = False
 
     def _save_to_disk(self, params: Dict[str, Any]) -> None:
+        """Persist current params into the active preset and write preset schema."""
         self._conf_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conf_path.write_text(json.dumps(params, indent=2, sort_keys=True), encoding="utf-8")
+
+        # Ensure in-memory structures
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+        if not isinstance(getattr(self, "_active_preset", None), str) or not self._active_preset:
+            self._active_preset = "Default"
+
+        self._presets[self._active_preset] = dict(params)
+
+        payload = {
+            "active_preset": self._active_preset,
+            "presets": self._presets,
+        }
+        self._conf_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
     # ---------------- Public helpers ---------------- #
+    def _rebuild_preset_combo(self, select_name: Optional[str] = None) -> None:
+        """Rebuild the preset dropdown from current presets and select `select_name` if present."""
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+
+        names = sorted([n for n in self._presets.keys() if isinstance(n, str)])
+        # Ensure Default exists and is visible
+        if "Default" in self._presets and "Default" not in names:
+            names.insert(0, "Default")
+
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for n in names:
+            self.preset_combo.addItem(n)
+
+        target = (select_name or self._active_preset or "Default").strip() or "Default"
+        idx = self.preset_combo.findText(target)
+        if idx < 0:
+            idx = self.preset_combo.findText("Default")
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
 
     def get_params(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -295,20 +428,141 @@ class DeviceModelDashboard(QWidget):
             self.preview.setText("(preview unavailable)")
 
     def _on_preset_changed(self, _idx: int) -> None:
-        # v1 only: Default preset resets to default params.
-        if self.preset_combo.currentText() == "Default":
-            self.set_params(_default_cell_params())
-            self._dirty = True
+        name = self.preset_combo.currentText().strip() or "Default"
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+        if name not in self._presets:
+            self._presets[name] = _default_cell_params()
+        self._active_preset = name
+        self.set_params(self._presets[name])
+        self._dirty = False
+        self._refresh_preview()
 
     def _on_reset_clicked(self) -> None:
         self.set_params(_default_cell_params())
         self._dirty = True
+
+    def _on_new_clicked(self) -> None:
+        """Create a new preset from the default field values."""
+        name, ok = QInputDialog.getText(self, "New preset", "Preset name:")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+
+        if name in self._presets:
+            QMessageBox.warning(self, "Preset exists", f"A preset named '{name}' already exists.")
+            return
+
+        # Use default cell params for new preset
+        self._presets[name] = _default_cell_params()
+        self._active_preset = name
+
+        self._rebuild_preset_combo(select_name=name)
+        self.set_params(self._presets[name])
+
+        self._dirty = True
+        self._refresh_preview()
+
+    def _on_save_as_clicked(self) -> None:
+        """Create a new preset from current field values (does not overwrite existing presets)."""
+        name, ok = QInputDialog.getText(self, "Save As…", "New preset name:")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+
+        if name in self._presets:
+            QMessageBox.warning(self, "Preset exists", f"A preset named '{name}' already exists.")
+            return
+
+        self._presets[name] = self.get_params()
+        self._active_preset = name
+        self._rebuild_preset_combo(select_name=name)
+        self._dirty = True
+        self._refresh_preview()
+
+    def _on_rename_clicked(self) -> None:
+        """Rename the currently selected preset."""
+        old = (self.preset_combo.currentText() or "").strip() or "Default"
+        if old == "Default":
+            QMessageBox.warning(self, "Not allowed", "The 'Default' preset cannot be renamed.")
+            return
+
+        name, ok = QInputDialog.getText(self, "Rename preset", "New name:", text=old)
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+
+        if name == old:
+            return
+        if name in self._presets:
+            QMessageBox.warning(self, "Preset exists", f"A preset named '{name}' already exists.")
+            return
+
+        # Move preset under new key
+        self._presets[name] = self._presets.pop(old)
+        if self._active_preset == old:
+            self._active_preset = name
+
+        self._rebuild_preset_combo(select_name=name)
+        self._dirty = True
+        self._refresh_preview()
+
+    def _on_delete_clicked(self) -> None:
+        """Delete the currently selected preset."""
+        name = (self.preset_combo.currentText() or "").strip() or "Default"
+        if name == "Default":
+            QMessageBox.warning(self, "Not allowed", "The 'Default' preset cannot be deleted.")
+            return
+
+        if not isinstance(getattr(self, "_presets", None), dict):
+            self._presets = {"Default": _default_cell_params()}
+
+        if name not in self._presets:
+            return
+
+        resp = QMessageBox.question(
+            self,
+            "Delete preset",
+            f"Delete preset '{name}'? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        self._presets.pop(name, None)
+
+        # Select a safe active preset after deletion
+        self._active_preset = "Default" if "Default" in self._presets else next(iter(self._presets.keys()), "Default")
+        self._rebuild_preset_combo(select_name=self._active_preset)
+        self.set_params(self._presets.get(self._active_preset, _default_cell_params()))
+        self._dirty = True
+        self._refresh_preview()
 
     def _on_load_clicked(self) -> None:
         self._load_from_disk_or_defaults()
 
     def _on_save_clicked(self) -> None:
         params = self.get_params()
+        self._active_preset = self.preset_combo.currentText().strip() or "Default"
         try:
             self._save_to_disk(params)
             self._dirty = False
@@ -349,6 +603,7 @@ class DeviceModelDashboard(QWidget):
 
     def _on_apply_clicked(self) -> None:
         params = self.get_params()
+        self._active_preset = self.preset_combo.currentText().strip() or "Default"
         err = self._validate(params)
         if err is not None:
             QMessageBox.warning(self, "Invalid parameters", err)

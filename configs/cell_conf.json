@@ -1,16 +1,17 @@
 {
-  "isc_ref": 5.84,
-  "voc_ref": 0.621,
-
-  "diode_ideality": 1.30,
-  "r_s": 0.02,
-  "r_sh": 200.0,
-
-  "voc_temp_coeff": -0.0023,
-  "isc_temp_coeff": 0.00035,
-
-  "vmpp": 0.50,
-  "impp": 5.50,
-
-  "autofit": false
+  "active_preset": "Default",
+  "presets": {
+    "Default": {
+      "autofit": true,
+      "diode_ideality": 1.3,
+      "impp": 5.5,
+      "isc_ref": 5.84,
+      "isc_temp_coeff": 0.00035,
+      "r_s": 0.02,
+      "r_sh": 200.0,
+      "vmpp": 0.5,
+      "voc_ref": 0.621,
+      "voc_temp_coeff": -0.0023
+    }
+  }
 }
