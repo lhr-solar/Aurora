@@ -1,5 +1,3 @@
-
-
 """Metric extraction for Aurora MPPT benchmarking.
 
 This module converts per-tick simulation records (emitted by `SimulationEngine.run()`)
@@ -10,13 +8,16 @@ It is deliberately standalone:
 - no runner imports
 - no controller imports
 
-Expected record schema (from your engine benchmarking upgrade):
+Expected record schema:
   rec["t"]: float seconds
   rec["v"], rec["i"], rec["p"]: measured values (post-noise/quant if enabled)
+  rec["p_true"]: optional float (true power)
+  rec["g_strings"]: optional list[float] (per-string irradiance)
   rec["gmpp"]: optional dict
       - "p_gmp_ref": float (true reference power)
-      - "eff_best": float (true best-so-far / ref)
-      - "eff_best_meas": float (measured best-so-far / ref)
+      - "eff_step": float (true per-step efficiency, p_true / p_gmp_ref)
+      - "eff_step_meas": float (measured per-step efficiency, p / p_gmp_ref)
+      - legacy "eff_best" and "eff_best_meas" may also exist
   rec["perf"]: optional dict
       - "ctrl_us": float
       - "ref_us": float
@@ -28,13 +29,8 @@ If some fields are missing (e.g. gmpp_ref disabled), metrics degrade gracefully.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from statistics import mean, median
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-
-# -----------------------------------------------------------------------------
-# Types
-# -----------------------------------------------------------------------------
+from statistics import mean
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 Record = Dict[str, Any]
@@ -48,13 +44,27 @@ class MetricSummary:
     energy_true_ratio: Optional[float] = None
     energy_meas_ratio: Optional[float] = None
 
-    # Convergence
+    # Convergence (absolute time in seconds)
     settle_time_s_true: Optional[float] = None
     settle_time_s_meas: Optional[float] = None
+
+    # Disturbance detection + disturbance-relative convergence
+    t_disturb: Optional[float] = None
+    settle_time_s_true_post: Optional[float] = None
+    settle_time_s_meas_post: Optional[float] = None
+    recovery_settle_s_true: Optional[float] = None
+    recovery_settle_s_meas: Optional[float] = None
 
     # Stability (lower is better)
     ripple_rms_true: Optional[float] = None
     ripple_rms_meas: Optional[float] = None
+
+    # Tracking quality (lower is better)
+    tracking_error_area_true: Optional[float] = None
+    tracking_error_area_meas: Optional[float] = None
+
+    # Composite score (higher is better)
+    score: Optional[float] = None
 
     # Performance / compute
     ctrl_us_p50: Optional[float] = None
@@ -70,11 +80,6 @@ class MetricSummary:
     t_end: Optional[float] = None
 
     extra: Dict[str, Any] = field(default_factory=dict)
-
-
-# -----------------------------------------------------------------------------
-# Small utilities
-# -----------------------------------------------------------------------------
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -108,18 +113,26 @@ def _rms(xs: Sequence[float]) -> Optional[float]:
     return float(m2 ** 0.5)
 
 
-# -----------------------------------------------------------------------------
-# Record extraction
-# -----------------------------------------------------------------------------
-
-
 def extract_time(rec: Record) -> Optional[float]:
     return _safe_float(rec.get("t"))
 
 
 def extract_measured_power(rec: Record) -> Optional[float]:
-    # engine record contains rec["p"] as measured (post-noise/quant)
     return _safe_float(rec.get("p"))
+
+
+def extract_true_power(rec: Record) -> Optional[float]:
+    return _safe_float(rec.get("p_true"))
+
+
+def extract_g_strings(rec: Record) -> Optional[List[float]]:
+    gs = rec.get("g_strings")
+    if isinstance(gs, list):
+        try:
+            return [float(x) for x in gs]
+        except Exception:
+            return None
+    return None
 
 
 def extract_gmpp_ref_power(rec: Record) -> Optional[float]:
@@ -129,7 +142,17 @@ def extract_gmpp_ref_power(rec: Record) -> Optional[float]:
 
 def extract_eff(rec: Record) -> Tuple[Optional[float], Optional[float]]:
     gmpp = rec.get("gmpp") or {}
-    return _safe_float(gmpp.get("eff_best")), _safe_float(gmpp.get("eff_best_meas"))
+
+    # Prefer legacy keys if present; fall back to per-step keys
+    eff_true = _safe_float(gmpp.get("eff_best"))
+    if eff_true is None:
+        eff_true = _safe_float(gmpp.get("eff_step"))
+
+    eff_meas = _safe_float(gmpp.get("eff_best_meas"))
+    if eff_meas is None:
+        eff_meas = _safe_float(gmpp.get("eff_step_meas"))
+
+    return eff_true, eff_meas
 
 
 def extract_perf(rec: Record) -> Tuple[Optional[float], Optional[float], bool]:
@@ -140,38 +163,136 @@ def extract_perf(rec: Record) -> Tuple[Optional[float], Optional[float], bool]:
     return ctrl, ref, over
 
 
-# -----------------------------------------------------------------------------
-# Core metrics
-# -----------------------------------------------------------------------------
+def detect_disturb_time(records: Sequence[Record]) -> Optional[float]:
+    """Detect the first 'disturbance' time.
 
-
-def energy_ratio(
-    records: Sequence[Record],
-    *,
-    use_true: bool,
-    dt_fallback: Optional[float] = None,
-) -> Optional[float]:
-    """Estimate captured energy / reference energy.
-
-    - Captured energy is integrated from a power series.
-      - For `use_true=True`, this uses the reference power times `eff_best`.
-        (Because true power is not directly emitted in rec["p"] when measurement
-         effects are enabled.)
-      - For `use_true=False`, this uses rec["p"] (measured) directly.
-
-    - Reference energy integrates `p_gmp_ref`.
-
-    Requires gmpp_ref enabled to be meaningful.
+    Primary signal: first change in g_strings.
+    Fallback: first change in p_gmp_ref.
     """
-
     if not records:
         return None
 
-    # Build time grid
+    t0 = extract_time(records[0])
+    if t0 is None:
+        t0 = 0.0
+
+    gs0 = extract_g_strings(records[0])
+    if gs0 is not None:
+        for rec in records[1:]:
+            gs = extract_g_strings(rec)
+            if gs is not None and gs != gs0:
+                tt = extract_time(rec)
+                return float(tt) if tt is not None else float(t0)
+
+    pref0 = extract_gmpp_ref_power(records[0])
+    if pref0 is not None:
+        for rec in records[1:]:
+            pref = extract_gmpp_ref_power(rec)
+            if pref is None:
+                continue
+            if abs(float(pref) - float(pref0)) > 1e-9:
+                tt = extract_time(rec)
+                return float(tt) if tt is not None else float(t0)
+
+    return None
+
+
+def tracking_error_area(
+    records: Sequence[Record],
+    *,
+    use_true: bool,
+    t_start: Optional[float] = None,
+    clamp_below_zero: bool = True,
+) -> Optional[float]:
+    """Integrate efficiency deficit area: ∫ (1 - eff(t)) dt.
+
+    - If clamp_below_zero, integrate max(0, 1-eff).
+    - If t_start is provided, integrate only for t >= t_start.
+
+    Lower is better.
+    """
+    if not records:
+        return None
+
+    pts: List[Tuple[float, float]] = []
+    for rec in records:
+        t = extract_time(rec)
+        if t is None:
+            continue
+        if t_start is not None and float(t) < float(t_start):
+            continue
+        et, em = extract_eff(rec)
+        eff = et if use_true else em
+        if eff is None:
+            continue
+        pts.append((float(t), float(eff)))
+
+    if len(pts) < 2:
+        return None
+
+    area = 0.0
+    for k in range(1, len(pts)):
+        t1, e1 = pts[k - 1]
+        t2, e2 = pts[k]
+        dt = t2 - t1
+        if dt <= 0:
+            continue
+        d1 = 1.0 - e1
+        d2 = 1.0 - e2
+        if clamp_below_zero:
+            d1 = max(0.0, d1)
+            d2 = max(0.0, d2)
+        area += 0.5 * (d1 + d2) * dt
+
+    return float(area)
+
+
+def composite_score(m: MetricSummary, *, prefer_measured: bool = True) -> Tuple[Optional[float], Dict[str, float]]:
+    """Compute a composite score (higher is better)."""
+    energy = m.energy_meas_ratio if prefer_measured else m.energy_true_ratio
+    rec_settle = m.recovery_settle_s_meas if prefer_measured else m.recovery_settle_s_true
+    ripple = m.ripple_rms_meas if prefer_measured else m.ripple_rms_true
+    area = m.tracking_error_area_meas if prefer_measured else m.tracking_error_area_true
+
+    energy = float(energy) if energy is not None else 0.0
+    rec_settle = float(rec_settle) if rec_settle is not None else 10.0
+    ripple = float(ripple) if ripple is not None else 0.0
+    area = float(area) if area is not None else 0.0
+    ctrl_p95 = float(m.ctrl_us_p95) if m.ctrl_us_p95 is not None else 0.0
+
+    # Weights (tweak as needed)
+    w_energy = 100.0
+    w_settle = 2.0
+    w_ripple = 5.0
+    w_area = 10.0
+    w_ctrl = 0.001
+
+    score = (
+        w_energy * energy
+        - w_settle * rec_settle
+        - w_ripple * ripple
+        - w_area * area
+        - w_ctrl * ctrl_p95
+    )
+
+    comps = {
+        "energy": w_energy * energy,
+        "recovery_settle": -w_settle * rec_settle,
+        "ripple": -w_ripple * ripple,
+        "tracking_area": -w_area * area,
+        "ctrl_p95": -w_ctrl * ctrl_p95,
+    }
+
+    return float(score), comps
+
+
+def energy_ratio(records: Sequence[Record], *, use_true: bool) -> Optional[float]:
+    """Estimate captured energy / reference energy (trapezoid integration)."""
+    if not records:
+        return None
+
     ts: List[float] = []
     p_ref: List[float] = []
-
-    # For numerator
     p_num: List[float] = []
 
     for rec in records:
@@ -182,16 +303,19 @@ def energy_ratio(
         if pref is None:
             continue
 
-        ts.append(t)
-        p_ref.append(pref)
+        ts.append(float(t))
+        p_ref.append(float(pref))
 
         if use_true:
-            eff_true, _ = extract_eff(rec)
-            if eff_true is None:
-                # if eff absent, fall back to 0 contribution
-                p_num.append(0.0)
+            ptrue = extract_true_power(rec)
+            if ptrue is not None:
+                p_num.append(float(ptrue))
             else:
-                p_num.append(float(pref) * float(eff_true))
+                eff_true, _ = extract_eff(rec)
+                if eff_true is None:
+                    p_num.append(0.0)
+                else:
+                    p_num.append(float(pref) * float(eff_true))
         else:
             pm = extract_measured_power(rec)
             p_num.append(float(pm) if pm is not None else 0.0)
@@ -199,7 +323,6 @@ def energy_ratio(
     if len(ts) < 2:
         return None
 
-    # integrate via trapezoid
     e_ref = 0.0
     e_num = 0.0
     for k in range(1, len(ts)):
@@ -221,17 +344,10 @@ def settle_time(
     threshold: float = 0.98,
     hold_time_s: float = 0.05,
 ) -> Optional[float]:
-    """Return first time the efficiency stays >= threshold for hold_time_s.
-
-    This is a robust convergence metric:
-    - uses eff_best (true) or eff_best_meas (measured)
-    - requires gmpp_ref enabled
-    """
-
+    """Return first time the efficiency stays >= threshold for hold_time_s."""
     if not records:
         return None
 
-    # Collect (t, eff)
     pts: List[Tuple[float, float]] = []
     for rec in records:
         t = extract_time(rec)
@@ -246,7 +362,6 @@ def settle_time(
     if len(pts) < 2:
         return None
 
-    # Walk and find earliest window that stays above threshold
     start_idx = 0
     while start_idx < len(pts):
         t0, e0 = pts[start_idx]
@@ -254,7 +369,6 @@ def settle_time(
             start_idx += 1
             continue
 
-        # Extend until time window is satisfied or a drop occurs
         t_end = t0
         ok = True
         j = start_idx
@@ -273,18 +387,11 @@ def settle_time(
     return None
 
 
-def ripple_rms(
-    records: Sequence[Record],
-    *,
-    use_true: bool,
-    window_s: float = 0.20,
-) -> Optional[float]:
-    """Compute RMS ripple of efficiency over the last `window_s` seconds."""
-
+def ripple_rms(records: Sequence[Record], *, use_true: bool, window_s: float = 0.20) -> Optional[float]:
+    """Compute RMS ripple of power over the last window."""
     if not records:
         return None
 
-    # Determine end time
     t_end = extract_time(records[-1])
     if t_end is None:
         return None
@@ -293,18 +400,28 @@ def ripple_rms(
     xs: List[float] = []
     for rec in records:
         t = extract_time(rec)
-        if t is None or t < t0:
+        if t is None or float(t) < t0:
             continue
-        et, em = extract_eff(rec)
-        eff = et if use_true else em
-        if eff is None:
-            continue
-        xs.append(float(eff))
+
+        if use_true:
+            ptrue = extract_true_power(rec)
+            if ptrue is not None:
+                xs.append(float(ptrue))
+                continue
+            pref = extract_gmpp_ref_power(rec)
+            et, _ = extract_eff(rec)
+            if pref is None or et is None:
+                continue
+            xs.append(float(pref) * float(et))
+        else:
+            pm = extract_measured_power(rec)
+            if pm is None:
+                continue
+            xs.append(float(pm))
 
     if len(xs) < 3:
         return None
 
-    # Detrend by mean and compute RMS
     mu = mean(xs)
     return _rms([x - mu for x in xs])
 
@@ -333,11 +450,6 @@ def perf_summary(records: Sequence[Record]) -> Dict[str, Any]:
     }
 
 
-# -----------------------------------------------------------------------------
-# Top-level API
-# -----------------------------------------------------------------------------
-
-
 def compute_metrics(
     records: Sequence[Record],
     *,
@@ -352,12 +464,13 @@ def compute_metrics(
     if records:
         out.t_start = extract_time(records[0])
         out.t_end = extract_time(records[-1])
+        out.t_disturb = detect_disturb_time(records)
 
-    # Energy ratios (require gmpp_ref)
+    # Energy
     out.energy_true_ratio = energy_ratio(records, use_true=True)
     out.energy_meas_ratio = energy_ratio(records, use_true=False)
 
-    # Convergence
+    # Global settle time
     out.settle_time_s_true = settle_time(
         records,
         use_true=True,
@@ -371,9 +484,46 @@ def compute_metrics(
         hold_time_s=settle_hold_s,
     )
 
-    # Stability
+    # Post-disturb settle + recovery settle (relative to first post-disturb timestamp)
+    if out.t_disturb is not None:
+        t_dist = float(out.t_disturb)
+        records_post: List[Record] = []
+        for rec in records:
+            t = extract_time(rec)
+            if t is None:
+                continue
+            if float(t) >= t_dist:
+                records_post.append(rec)
+
+        t0_post = extract_time(records_post[0]) if records_post else None
+        t_settle_true_post = settle_time(
+            records_post,
+            use_true=True,
+            threshold=settle_threshold,
+            hold_time_s=settle_hold_s,
+        )
+        t_settle_meas_post = settle_time(
+            records_post,
+            use_true=False,
+            threshold=settle_threshold,
+            hold_time_s=settle_hold_s,
+        )
+
+        if t0_post is not None and t_settle_true_post is not None:
+            out.settle_time_s_true_post = float(t_settle_true_post)
+            out.recovery_settle_s_true = max(0.0, float(t_settle_true_post) - float(t0_post))
+        if t0_post is not None and t_settle_meas_post is not None:
+            out.settle_time_s_meas_post = float(t_settle_meas_post)
+            out.recovery_settle_s_meas = max(0.0, float(t_settle_meas_post) - float(t0_post))
+
+    # Ripple
     out.ripple_rms_true = ripple_rms(records, use_true=True, window_s=ripple_window_s)
     out.ripple_rms_meas = ripple_rms(records, use_true=False, window_s=ripple_window_s)
+
+    # Tracking error area (post-disturb preferred)
+    t_area_start = out.t_disturb
+    out.tracking_error_area_true = tracking_error_area(records, use_true=True, t_start=t_area_start)
+    out.tracking_error_area_meas = tracking_error_area(records, use_true=False, t_start=t_area_start)
 
     # Perf
     ps = perf_summary(records)
@@ -383,5 +533,10 @@ def compute_metrics(
     out.ref_us_p50 = ps["ref_us_p50"]
     out.ref_us_p95 = ps["ref_us_p95"]
     out.budget_violations = ps["budget_violations"]
+
+    # Composite score
+    score, comps = composite_score(out, prefer_measured=True)
+    out.score = score
+    out.extra["score_components"] = comps
 
     return out

@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import os
@@ -25,6 +23,7 @@ DOC_SOURCES = [
     ("Overview", REPO_ROOT / "README.md"),
     ("How to Run", REPO_ROOT / "docs" / "usage.md"),
     ("Architecture", REPO_ROOT / "docs" / "architecture.md"),
+    ("Benchmarking", REPO_ROOT / "docs" / "benchmarking.md"),
     ("MPPT Algorithms", REPO_ROOT / "docs" / "api.md"),
     ("Output Interpretations", REPO_ROOT / "docs" / "outputs.md"),
     ("Glossary", REPO_ROOT / "docs" / "glossary.md"),
@@ -129,6 +128,16 @@ class GlossaryDashboard(QWidget):
 
         try:
             content = path.read_text(encoding="utf-8")
+            # Apply replacements to benchmarking.md content
+            if path.name == "benchmarking.md":
+                content = content.replace(r"\[", "```text\n")
+                content = content.replace(r"\]", "\n```")
+                content = content.replace(r"\cdot", "*")
+                content = content.replace(r"T_{rec}", "T_rec")
+                content = content.replace(r"\int", "int")
+                content = content.replace(r"\max", "max")
+                content = content.replace(r"\mathrm{eff}", "eff")
+                content = content.replace(r"\,", "")
         except Exception as e:
             self.viewer.setMarkdown(
                 f"### Error loading document\n\n```\n{e}\n```"

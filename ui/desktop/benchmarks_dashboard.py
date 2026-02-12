@@ -17,8 +17,6 @@ Notes:
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -43,6 +41,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.desktop.terminal_panel import TerminalPanel
+
+# Session path utility for new session-based output
+from benchmarks.session import read_latest_session_path
 
 
 def _repo_root() -> Path:
@@ -87,8 +88,16 @@ def _flatten_metrics(extra: Dict[str, Any]) -> Dict[str, Any]:
         "energy_meas_ratio",
         "settle_time_s_true",
         "settle_time_s_meas",
+        "t_disturb",
+        "settle_time_s_true_post",
+        "settle_time_s_meas_post",
+        "recovery_settle_s_true",
+        "recovery_settle_s_meas",
         "ripple_rms_true",
         "ripple_rms_meas",
+        "tracking_error_area_true",
+        "tracking_error_area_meas",
+        "score",
     ):
         if k in extra and k not in out:
             out[k] = extra[k]
@@ -160,7 +169,7 @@ class _BenchWorker(QThread):
             self.log.emit(f"[bench] out_dir: {self.out_dir}")
             if self.isInterruptionRequested():
                 raise RuntimeError("Cancelled")
-            # Run suite (writes to out_dir/bench_YYYYMMDD_HHMMSS/...)
+            # Run suite (writes into a persistent session folder under out_dir)
             run_suite(
                 algorithms=algos,
                 scenarios=scenarios,
@@ -177,14 +186,13 @@ class _BenchWorker(QThread):
                 cancel=self.isInterruptionRequested,
             )
 
-            # Identify newest run folder
-            runs = sorted(
-                [p for p in self.out_dir.glob("bench_*") if p.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-            )
-            if not runs:
-                raise RuntimeError("Benchmark run completed but no output folder was found")
-            run_dir = runs[-1]
+            # Resolve the active session directory written by the runner
+            run_dir = read_latest_session_path(self.out_dir)
+            if run_dir is None or not run_dir.exists():
+                raise RuntimeError(
+                    "Benchmark run completed but no active session folder was found. "
+                    "Expected latest_session_path.txt to exist under out_dir."
+                )
 
             self.log.emit(f"[bench] complete: {run_dir}")
             self.done.emit(str(run_dir))
@@ -216,6 +224,17 @@ class BenchmarksDashboard(QWidget):
         self.out_path.setPlaceholderText("Output directory (benchmarks)")
         btn_browse = QPushButton("Browse…")
         btn_browse.clicked.connect(self._pick_out_dir)
+
+        # Session folder controls (read-only)
+        self.session_path = QLineEdit("")
+        self.session_path.setReadOnly(True)
+        self.session_path.setPlaceholderText("Session folder (auto-filled after run)")
+
+        btn_session_browse = QPushButton("Browse session…")
+        btn_session_browse.clicked.connect(self._pick_session_dir)
+
+        btn_session_load = QPushButton("Load session")
+        btn_session_load.clicked.connect(self._load_session_from_path)
 
         self.chk_gmpp = QCheckBox("GMPP reference")
         self.chk_gmpp.setChecked(True)
@@ -265,6 +284,7 @@ class BenchmarksDashboard(QWidget):
         top = QVBoxLayout()
         top_row1 = QHBoxLayout()
         top_row2 = QHBoxLayout()
+        top_row3 = QHBoxLayout()
 
         # Row 1: output + run controls
         top_row1.addWidget(QLabel("Out:"))
@@ -290,8 +310,15 @@ class BenchmarksDashboard(QWidget):
         top_row2.addWidget(self.chk_save_records)
         top_row2.addStretch(1)
 
+        # Row 3: session folder (leaderboard source)
+        top_row3.addWidget(QLabel("Session:"))
+        top_row3.addWidget(self.session_path, 1)
+        top_row3.addWidget(btn_session_browse)
+        top_row3.addWidget(btn_session_load)
+
         top.addLayout(top_row1)
         top.addLayout(top_row2)
+        top.addLayout(top_row3)
 
         root.addLayout(top)
 
@@ -363,6 +390,25 @@ class BenchmarksDashboard(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Choose output directory", self.out_path.text())
         if path:
             self.out_path.setText(path)
+
+    def _pick_session_dir(self) -> None:
+        start = self.session_path.text().strip() or str(Path(self.out_path.text()).expanduser())
+        path = QFileDialog.getExistingDirectory(self, "Choose session folder", start)
+        if path:
+            self.session_path.setText(path)
+            # Auto-load on pick
+            self._load_session_from_path()
+
+    def _load_session_from_path(self) -> None:
+        p = Path(self.session_path.text().strip()).expanduser()
+        if not p.exists() or not p.is_dir():
+            QMessageBox.warning(self, "Benchmarks", "Session path is not a valid folder.")
+            return
+        summaries = p / "summaries.jsonl"
+        if not summaries.exists():
+            QMessageBox.warning(self, "Benchmarks", f"No summaries.jsonl found in {p}")
+            return
+        self._load_summaries(summaries)
 
     def _refresh_lists(self, *, select_all: bool = False) -> None:
         # Algorithms
@@ -500,7 +546,11 @@ class BenchmarksDashboard(QWidget):
         self.btn_stop.setEnabled(False)
         self.btn_run.setEnabled(True)
         run_dir = Path(run_dir_str)
-        self.lbl_status.setText(f"Complete: {run_dir}")
+        try:
+            self.session_path.setText(str(run_dir))
+        except Exception:
+            pass
+        self.lbl_status.setText(f"Session: {run_dir}")
         self._log(f"[ui] benchmark complete: {run_dir}")
 
         summaries = run_dir / "summaries.jsonl"
@@ -511,7 +561,7 @@ class BenchmarksDashboard(QWidget):
         self._load_summaries(summaries)
 
     def _open_summaries(self) -> None:
-        start = str(Path(self.out_path.text()).expanduser())
+        start = self.session_path.text().strip() or str(Path(self.out_path.text()).expanduser())
         path_str, _ = QFileDialog.getOpenFileName(
             self,
             "Open summaries.jsonl",
@@ -530,8 +580,8 @@ class BenchmarksDashboard(QWidget):
             return
 
         self._render_table(rows)
-        self.lbl_status.setText(f"Loaded: {path}")
-        self._log(f"[ui] loaded summaries: {path} ({len(rows)} rows)")
+        self.lbl_status.setText(f"Loaded session: {path}")
+        self._log(f"[ui] loaded session summaries: {path} ({len(rows)} rows)")
 
     # --------------------
     # Results table
@@ -539,20 +589,35 @@ class BenchmarksDashboard(QWidget):
 
     def _render_table(self, rows: List[Dict[str, Any]]) -> None:
         # Define columns (base + metrics)
+        def _score_of(row: Dict[str, Any]) -> float:
+            extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+            metrics_flat = _flatten_metrics(extra) if isinstance(extra, dict) else {}
+            v = None
+            if isinstance(extra, dict) and "score" in extra:
+                v = extra.get("score")
+            if v is None and "score" in metrics_flat:
+                v = metrics_flat.get("score")
+            try:
+                return float(v)
+            except Exception:
+                return float("-inf")
+
+        rows = sorted(list(rows), key=_score_of, reverse=True)
+
         cols = [
+            ("rank", "Rank"),
+            ("score", "Score"),
             ("algo", "Algo"),
             ("scenario", "Scenario"),
             ("budget", "Budget"),
-            ("eff_true_final", "Eff True (final)"),
-            ("eff_meas_final", "Eff Meas (final)"),
+            ("energy_meas_ratio", "Energy (meas)"),
+            ("recovery_settle_s_meas", "Recovery (s)"),
+            ("ripple_rms_meas", "Ripple (meas)"),
+            ("tracking_error_area_meas", "Track area (meas)"),
             ("ctrl_us_p95", "Ctrl µs p95"),
             ("budget_violations", "Over budget"),
-            ("energy_true_ratio", "Energy True"),
-            ("energy_meas_ratio", "Energy Meas"),
-            ("settle_time_s_true", "Settle True (s)"),
-            ("settle_time_s_meas", "Settle Meas (s)"),
-            ("ripple_rms_true", "Ripple True"),
-            ("ripple_rms_meas", "Ripple Meas"),
+            ("eff_meas_final", "Eff Meas (final)"),
+            ("eff_true_final", "Eff True (final)"),
         ]
 
         self.table.setSortingEnabled(False)
@@ -564,8 +629,11 @@ class BenchmarksDashboard(QWidget):
         for r_i, row in enumerate(rows):
             extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
             metrics_flat = _flatten_metrics(extra) if isinstance(extra, dict) else {}
+            rank_val = r_i + 1
 
             def get_val(key: str) -> Any:
+                if key == "rank":
+                    return rank_val
                 if key in row:
                     return row.get(key)
                 if key in metrics_flat:
@@ -576,19 +644,35 @@ class BenchmarksDashboard(QWidget):
 
             for c_i, (key, _) in enumerate(cols):
                 v = get_val(key)
-                item = QTableWidgetItem("" if v is None else str(v))
+                item = QTableWidgetItem()
+                if v is None:
+                    item.setText("")
+                else:
+                    # Use EditRole for numeric values so Qt sorts numerically.
+                    try:
+                        fv = float(v)
+                        item.setData(Qt.ItemDataRole.EditRole, fv)
+                    except Exception:
+                        item.setText(str(v))
 
-                # Right-align numbers for readability
+                is_num = False
                 try:
                     float(v)
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    is_num = True
                 except Exception:
+                    is_num = False
+
+                if is_num:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
                 self.table.setItem(r_i, c_i, item)
 
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
+        # Default leaderboard sort: Score descending
+        self.table.sortItems(1, Qt.SortOrder.DescendingOrder)
 
 
 # For MainWindow dynamic loader

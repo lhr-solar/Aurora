@@ -65,6 +65,11 @@ def _make_default_cell(
     overrides.pop("temperature_c", None)
 
     params = {**base, **overrides, "irradiance": float(irradiance), "temperature_c": float(temperature_c)}
+    # UI / config metadata keys that are not part of the Cell constructor
+    params.pop("active_preset", None)
+    params.pop("presets", None)
+    params.pop("preset", None)
+    params.pop("preset_name", None)
     return Cell(**params)
 
 def build_default_array(

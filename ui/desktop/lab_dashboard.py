@@ -13,6 +13,7 @@ import ast
 import csv
 import json
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -1497,8 +1498,14 @@ class LabDashboard(QWidget):
                 self._plot_debounce.start()
 
         # Start ticking
+        tick_ms = max(1, int(self._continuous_tick_ms()))
+        # Advance multiple simulation steps per wall-clock tick so "sim time" tracks real time.
+        # Example: dt=1ms, tick=33ms -> ~33 engine steps per tick.
+        steps_per_tick = max(1, int(round((tick_ms / 1000.0) / float(dt))))
+
         self._cont_timer = QTimer(self)
-        self._cont_timer.setInterval(self._continuous_tick_ms())
+        self._cont_timer.setInterval(tick_ms)
+
         # Continuous mode uses the current terminal streaming settings (rate-limited by default).
         # Do NOT force period=0 here; Continuous should remain usable without spamming the UI.
         try:
@@ -1507,76 +1514,116 @@ class LabDashboard(QWidget):
             pass
 
         def _tick() -> None:
-            if getattr(self, "_cont_stopping", False):
-                return
-            if self._cont_eng is None or self._cont_writer is None or self._cont_f is None:
-                return
+            try:
+                if getattr(self, "_cont_stopping", False):
+                    return
+                if self._cont_eng is None or self._cont_writer is None or self._cont_f is None:
+                    return
 
-            rec = self._cont_eng.step_once()
-            if rec is None:
-                path_msg = f"[ui] MPPT output -> {out_path}"
-                done_msg = "[ui] MPPT Simulation Complete"
+                # Run multiple engine steps per wall-clock tick so time/plots advance visibly.
+                for _ in range(steps_per_tick):
+                    rec = self._cont_eng.step_once()
+                    if rec is None:
+                        path_msg = f"[ui] MPPT output -> {out_path}"
+                        done_msg = "[ui] MPPT Simulation Complete"
 
-                # Stop stepping first, then clean up, then print completion on next event loop turn.
+                        # Stop stepping first, then clean up, then print completion on next event loop turn.
+                        self._cont_stopping = True
+                        self._accept_live_samples = False
+                        try:
+                            if self._cont_timer is not None:
+                                self._cont_timer.stop()
+                        except Exception:
+                            pass
+
+                        self._stop_continuous()
+                        self._cont_stopping = False
+                        self._finish_run_ui()
+                        self.refresh_runs()
+
+                        def _final_log() -> None:
+                            try:
+                                self._drain_terminal_buffer()
+                            except Exception:
+                                pass
+                            try:
+                                self._log(path_msg)
+                            except Exception:
+                                pass
+                            try:
+                                self._log(done_msg)
+                            except Exception:
+                                pass
+                            try:
+                                if self.terminal is not None:
+                                    self.terminal.flush()
+                            except Exception:
+                                pass
+                            try:
+                                self._restore_stdio_capture()
+                            except Exception:
+                                pass
+
+                        QTimer.singleShot(0, _final_log)
+                        return
+
+                    row = record_to_row(rec)
+                    self._cont_writer.writerow(row)
+                    self._on_live_sample(row)
+
+                    # Periodic flush
+                    self._cont_rows_since_flush += 1
+                    now = time.monotonic()
+                    if self._cont_rows_since_flush >= flush_every_rows or (now - self._cont_last_flush_wall) >= flush_every_s:
+                        try:
+                            self._cont_f.flush()
+                        except Exception:
+                            pass
+                        self._cont_rows_since_flush = 0
+                        self._cont_last_flush_wall = now
+
+            except Exception as e:
+                # If anything blows up mid-run, stop cleanly and surface it.
+                try:
+                    self._log("[ui] Continuous tick failed:")
+                    self._log(traceback.format_exc())
+                except Exception:
+                    pass
+
                 self._cont_stopping = True
                 self._accept_live_samples = False
+
                 try:
                     if self._cont_timer is not None:
                         self._cont_timer.stop()
                 except Exception:
                     pass
 
-                self._stop_continuous()
-                self._cont_stopping = False
+                try:
+                    self._stop_continuous()
+                except Exception:
+                    pass
+
                 self._finish_run_ui()
                 self.refresh_runs()
 
-                def _final_log() -> None:
-                    try:
-                        self._drain_terminal_buffer()
-                    except Exception:
-                        pass
-                    try:
-                        self._log(path_msg)
-                    except Exception:
-                        pass
-                    try:
-                        self._log(done_msg)
-                    except Exception:
-                        pass
-                    try:
-                        if self.terminal is not None:
-                            self.terminal.flush()
-                    except Exception:
-                        pass
-                    try:
-                        self._restore_stdio_capture()
-                    except Exception:
-                        pass
-
-                QTimer.singleShot(0, _final_log)
-                return
-
-            row = record_to_row(rec)
-            self._cont_writer.writerow(row)
-            self._on_live_sample(row)
-
-            # Periodic flush
-            self._cont_rows_since_flush += 1
-            now = time.monotonic()
-            if self._cont_rows_since_flush >= flush_every_rows or (now - self._cont_last_flush_wall) >= flush_every_s:
                 try:
-                    self._cont_f.flush()
+                    self._restore_stdio_capture()
                 except Exception:
                     pass
-                self._cont_rows_since_flush = 0
-                self._cont_last_flush_wall = now
 
+                QMessageBox.warning(self, "Simulation error", f"{type(e).__name__}: {e}")
+
+        # Connect/start the timer OUTSIDE the tick function.
         self._cont_timer.timeout.connect(_tick)
         self._cont_timer.start()
+        # Kick one immediate tick so plots get >1 point quickly.
+        QTimer.singleShot(0, _tick)
+    
     def run_sim(self) -> None:
         try:
             sim_time = float(self.time_edit.text().strip())
+            self._log("[ui] Run pressed")
             dt = float(self.dt_edit.text().strip())
             if sim_time <= 0 or dt <= 0:
                 raise ValueError
@@ -1670,22 +1717,48 @@ class LabDashboard(QWidget):
         # Batch mode keeps the existing worker thread behavior.
         # Route any engine/worker prints into the in-app terminal while the run is active.
         self._install_stdio_capture()
+        
         if self._continuous_enabled():
             # Ensure any prior continuous run is stopped
             self._stop_continuous()
 
-            self._start_continuous(
-                out_path=out_path,
-                selection=algo,
-                profile_name=profile,
-                use_csv_profile=use_csv,
-                csv_profile_path=csv_profile_path,
-                total_time=1e9,
-                dt=dt,
-                overrides=overrides_for_run,
-                gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
-                cell_params=self.cell_params,
-            )
+            try:
+                self._log(
+                    f"[ui] Starting CONTINUOUS (until Stop): dt={dt} tick_ms={self._continuous_tick_ms()}"
+                )
+
+                self._start_continuous(
+                    out_path=out_path,
+                    selection=algo,
+                    profile_name=profile,
+                    use_csv_profile=use_csv,
+                    csv_profile_path=csv_profile_path,
+                    # Continuous mode runs until the user presses Stop.
+                    total_time=1e9,
+                    dt=dt,
+                    overrides=overrides_for_run,
+                    gmpp_ref=bool(getattr(self, "gmpp_chk", None) and self.gmpp_chk.isChecked()),
+                    cell_params=self.cell_params,
+                )
+
+                self._log("[ui] Continuous timer started")
+
+            except Exception as e:
+                # Clean UI + restore terminal capture so errors show up in your UI terminal
+                try:
+                    self._log("[ui] Failed to start continuous:")
+                    self._log(traceback.format_exc())
+                except Exception:
+                    pass
+
+                try:
+                    self._restore_stdio_capture()
+                except Exception:
+                    pass
+
+                self._finish_run_ui()
+                QMessageBox.warning(self, "Run failed", f"{type(e).__name__}: {e}")
+                return
         else:
             w = _MPPTWorker(
                 out_path=out_path,

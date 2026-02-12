@@ -8,8 +8,9 @@ It provides:
   - JSONL output suitable for later aggregation/plotting
 
 Expected engine output fields (added in your engine benchmarking upgrade):
-  rec["gmpp"]["eff_best"]          # true best-so-far / true GMPP reference
-  rec["gmpp"]["eff_best_meas"]     # measured best-so-far / true GMPP reference
+  rec["gmpp"]["eff_step"]          # true per-step efficiency (p_true / p_gmp_ref)
+  rec["gmpp"]["eff_step_meas"]     # measured per-step efficiency (p / p_gmp_ref)
+  # legacy keys eff_best/eff_best_meas may also exist
   rec["perf"]["ctrl_us"]           # controller step time (microseconds)
   rec["perf"]["ref_us"]            # GMPP reference sweep time (microseconds)
   rec["perf"]["over_budget"]        # bool
@@ -23,10 +24,14 @@ import argparse
 import importlib
 import json
 import time
+import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Callable
+
+# Session helpers
+from benchmarks.session import ensure_session_dir, make_suite_payload, compute_suite_signature
 
 from core.controller.hybrid_controller import HybridConfig
 from core.mppt_algorithms import registry as mppt_registry
@@ -152,10 +157,22 @@ def percentile(xs: Sequence[float], q: float) -> Optional[float]:
 
 
 def extract_gmpp_eff(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    """Return (eff_true, eff_meas) from a record."""
+    """Return (eff_true, eff_meas) from a record.
+
+    Supports both legacy keys (eff_best/eff_best_meas) and the newer per-step keys
+    (eff_step/eff_step_meas).
+    """
     gmpp = rec.get("gmpp") or {}
+
+    # Prefer legacy names if present, otherwise fall back to per-step names
     eff_true = gmpp.get("eff_best")
+    if eff_true is None:
+        eff_true = gmpp.get("eff_step")
+
     eff_meas = gmpp.get("eff_best_meas")
+    if eff_meas is None:
+        eff_meas = gmpp.get("eff_step_meas")
+
     try:
         eff_true = None if eff_true is None else float(eff_true)
     except Exception:
@@ -164,6 +181,7 @@ def extract_gmpp_eff(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
         eff_meas = None if eff_meas is None else float(eff_meas)
     except Exception:
         eff_meas = None
+
     return eff_true, eff_meas
 
 
@@ -182,6 +200,64 @@ def extract_perf(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[float],
     except Exception:
         ref = None
     return ctrl, ref, over
+
+
+# --- Per-string irradiance normalization -------------------------------------
+
+def _fit_g_strings(g: Sequence[float], n_strings: int) -> List[float]:
+    """Fit a per-string irradiance sequence to exactly n_strings.
+
+    Rules:
+      - if len == n_strings: unchanged
+      - if len == 1: repeat the single value
+      - if len > n_strings: trim
+      - if len < n_strings: pad with last value
+    """
+    g_list = [float(x) for x in g]
+    if n_strings <= 0:
+        return []
+    if len(g_list) == n_strings:
+        return g_list
+    if len(g_list) == 1:
+        return [g_list[0]] * n_strings
+    if len(g_list) > n_strings:
+        return g_list[:n_strings]
+    # len(g_list) < n_strings: pad with last value
+    return g_list + [g_list[-1]] * (n_strings - len(g_list))
+
+
+def normalize_env_profile_for_strings(env_profile: Any, n_strings: int) -> Any:
+    """Normalize any per-string irradiance lists in env_profile to match n_strings.
+
+    Supports:
+      - event dict list: [{"t":..., "g":..., "t_mod":..., "g_strings":[...]}]
+      - legacy tuple list: [(t, irradiance (float or seq), temp)]
+    """
+    if env_profile is None:
+        return None
+
+    # Format B: event dicts
+    if isinstance(env_profile, list) and env_profile and isinstance(env_profile[0], dict):
+        out = []
+        for ev in env_profile:
+            ev2 = dict(ev)
+            gs = ev2.get("g_strings", None)
+            if gs is not None:
+                ev2["g_strings"] = _fit_g_strings(gs, n_strings)
+            out.append(ev2)
+        return out
+
+    # Format A: legacy tuples List[(t, irradiance (float or seq), temp)]
+    if isinstance(env_profile, list) and env_profile and isinstance(env_profile[0], (list, tuple)):
+        out = []
+        for item in env_profile:
+            t, irr, temp = item
+            if isinstance(irr, (list, tuple)):
+                irr = _fit_g_strings(irr, n_strings)
+            out.append((t, irr, temp))
+        return out
+
+    return env_profile
 
 
 # --- Formatting and streaming helpers -----------------------------------------
@@ -209,7 +285,19 @@ def format_bench_line(rec: Dict[str, Any], *, tick: int) -> str:
     reason = None
     if isinstance(dbg, dict):
         state = dbg.get("state")
+        # Some controllers don't emit an explicit "reason"; fall back to other useful debug fields.
         reason = dbg.get("reason")
+        if reason is None:
+            if bool(dbg.get("cold_start", False)):
+                reason = "cold_start"
+            else:
+                branch = dbg.get("branch")
+                if branch not in (None, "", "NA"):
+                    reason = branch
+                else:
+                    algo = dbg.get("algo")
+                    if algo not in (None, ""):
+                        reason = f"algo={algo}"
 
     v_cmd = rec.get("v_cmd")
     if v_cmd is None:
@@ -222,7 +310,7 @@ def format_bench_line(rec: Dict[str, Any], *, tick: int) -> str:
         f"g={_fmt(rec.get('g'), 1)} t_mod={_fmt(rec.get('t_mod'), 2)} | "
         f"v_cmd={_fmt(v_cmd, 4)} | "
         f"meas(v,i,p)=({_fmt(rec.get('v'), 4)},{_fmt(rec.get('i'), 4)},{_fmt(rec.get('p'), 4)}) | "
-        f"eff={_fmt(gmpp.get('eff_best'), 4)} | "
+        f"eff={_fmt(gmpp.get('eff_best', gmpp.get('eff_step')), 4)} | "
         f"ctrl_us={_fmt(perf.get('ctrl_us'), 1)} over={bool(perf.get('over_budget', False))}"
     )
     if state is not None or reason is not None:
@@ -331,6 +419,31 @@ def run_once(
         adc_bits_i=budget.adc_bits_i,
         adc_bits_g=budget.adc_bits_g,
     )
+
+    # Robust fix: adapt any per-string irradiance lists to the configured array's n_strings
+    try:
+        n_strings = None
+
+        # Preferred: SimulationConfig can build an array without running the simulation
+        build_array = getattr(cfg, "build_array", None)
+        if callable(build_array):
+            arr = build_array()
+            n_strings = getattr(arr, "n_strings", None)
+            if n_strings is None:
+                n_strings = len(getattr(arr, "string_list", None) or [])
+
+        # Fallback: some configs expose n_strings directly
+        if n_strings is None:
+            n_strings = getattr(cfg, "n_strings", None)
+
+        if n_strings is not None and cfg.env_profile is not None:
+            cfg.env_profile = normalize_env_profile_for_strings(cfg.env_profile, int(n_strings))
+            # If the config caches a compiled env profile, force a rebuild
+            if hasattr(cfg, "_env_compiled"):
+                setattr(cfg, "_env_compiled", None)
+    except Exception:
+        # Never fail benchmarks due to normalization
+        pass
 
     t0 = time.perf_counter()
     eng = SimulationEngine(cfg)
@@ -469,20 +582,165 @@ def run_once(
             "energy_meas_ratio",
             "settle_time_s_true",
             "settle_time_s_meas",
+            "t_disturb",
+            "settle_time_s_true_post",
+            "settle_time_s_meas_post",
+            "recovery_settle_s_true",
+            "recovery_settle_s_meas",
             "ripple_rms_true",
             "ripple_rms_meas",
+            "tracking_error_area_true",
+            "tracking_error_area_meas",
+            "score",
         ):
             if k in m_dict:
                 summary.extra[k] = m_dict[k]
     except Exception as e:
         summary.extra["metrics_error"] = str(e)
 
+        # Fallback metrics directly from records (robust to naming differences)
+        try:
+            # Acquire records for metrics (same logic as above)
+            recs_for_metrics: Optional[List[Dict[str, Any]]] = None
+            if keep_records:
+                recs_for_metrics = records
+            elif records_path is not None and records_path.exists():
+                recs_for_metrics = []
+                with records_path.open("r", encoding="utf-8") as rf:
+                    for line in rf:
+                        recs_for_metrics.append(json.loads(line))
+
+            if not recs_for_metrics:
+                raise RuntimeError("no records available for fallback metrics")
+
+            # Energy ratios vs GMPP reference power
+            num_true = 0.0
+            num_meas = 0.0
+            den_ref = 0.0
+
+            # Identify a change point for 'settle' measurement (first time g_strings changes)
+            t_start = float(recs_for_metrics[0].get("t", 0.0) or 0.0)
+            first_gs = recs_for_metrics[0].get("g_strings")
+            if isinstance(first_gs, list):
+                for r in recs_for_metrics[1:]:
+                    gs = r.get("g_strings")
+                    if gs is not None and gs != first_gs:
+                        t_start = float(r.get("t", t_start) or t_start)
+                        break
+
+            # Helper to pull eff values with legacy/new naming
+            def _eff_pair(r: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+                g = r.get("gmpp") or {}
+                et = g.get("eff_best")
+                if et is None:
+                    et = g.get("eff_step")
+                em = g.get("eff_best_meas")
+                if em is None:
+                    em = g.get("eff_step_meas")
+                try:
+                    et = None if et is None else float(et)
+                except Exception:
+                    et = None
+                try:
+                    em = None if em is None else float(em)
+                except Exception:
+                    em = None
+                return et, em
+
+            eff_thresh = 0.98
+            settle_true = None
+            settle_meas = None
+
+            # Build power series for ripple calc
+            p_true_series: List[Tuple[float, float]] = []
+            p_meas_series: List[Tuple[float, float]] = []
+
+            for r in recs_for_metrics:
+                dt = float(r.get("dt", 0.0) or 0.0)
+                gmpp = r.get("gmpp") or {}
+                p_ref = gmpp.get("p_gmp_ref")
+                try:
+                    p_ref_f = 0.0 if p_ref is None else float(p_ref)
+                except Exception:
+                    p_ref_f = 0.0
+
+                try:
+                    p_true = float(r.get("p_true"))
+                except Exception:
+                    p_true = None
+                try:
+                    p_meas = float(r.get("p"))
+                except Exception:
+                    p_meas = None
+
+                if dt > 0 and p_ref_f > 0:
+                    den_ref += p_ref_f * dt
+                    if p_true is not None:
+                        num_true += p_true * dt
+                    if p_meas is not None:
+                        num_meas += p_meas * dt
+
+                t = float(r.get("t", 0.0) or 0.0)
+                if p_true is not None:
+                    p_true_series.append((t, p_true))
+                if p_meas is not None:
+                    p_meas_series.append((t, p_meas))
+
+                # Settle times (first time after t_start crossing threshold)
+                et, em = _eff_pair(r)
+                if t >= t_start:
+                    if settle_true is None and et is not None and et >= eff_thresh:
+                        settle_true = t - t_start
+                    if settle_meas is None and em is not None and em >= eff_thresh:
+                        settle_meas = t - t_start
+
+            if den_ref > 0:
+                summary.extra["energy_true_ratio"] = float(num_true / den_ref)
+                summary.extra["energy_meas_ratio"] = float(num_meas / den_ref)
+            else:
+                summary.extra["energy_true_ratio"] = 0.0
+                summary.extra["energy_meas_ratio"] = 0.0
+
+            summary.extra["settle_time_s_true"] = settle_true
+            summary.extra["settle_time_s_meas"] = settle_meas
+
+            # Ripple RMS: compute RMS deviation of power over last window
+            # Window = last min(0.2s, 20% of run time)
+            t_end = float(recs_for_metrics[-1].get("t", 0.0) or 0.0)
+            window_s = min(0.2, 0.2 * t_end) if t_end > 0 else 0.0
+            t0_win = t_end - window_s
+
+            def _ripple_rms(series: List[Tuple[float, float]]) -> Optional[float]:
+                if not series:
+                    return None
+                win = [p for (tt, p) in series if tt >= t0_win]
+                if len(win) < 2:
+                    return None
+                mean_p = sum(win) / float(len(win))
+                var = sum((p - mean_p) ** 2 for p in win) / float(len(win))
+                return float(var ** 0.5)
+
+            summary.extra["ripple_rms_true"] = _ripple_rms(p_true_series)
+            summary.extra["ripple_rms_meas"] = _ripple_rms(p_meas_series)
+
+        except Exception as e2:
+            summary.extra["metrics_fallback_error"] = str(e2)
+
     return records, summary
 
 
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    """Write JSONL, truncating any existing file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def append_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    """Append rows to a JSONL file (create if missing)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -682,6 +940,9 @@ def resolve_algorithms_from_registry(names: Sequence[str]) -> List[AlgorithmSpec
     return resolved
 
 
+
+
+
 # --- Suite runner -------------------------------------------------------------
 
 
@@ -700,11 +961,51 @@ def run_suite(
     log_every_s: float = 0.25,
     keep_records: bool = True,
     cancel: Optional[Callable[[], bool]] = None,
+    use_session: bool = True,
 ) -> List[RunSummary]:
     """Run Algorithm × Scenario × Budget and write JSONL output."""
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    run_id = f"bench_{ts}"
+
+    # Build a canonical payload for scenario/budget comparability.
+    scenarios_payload: List[Dict[str, Any]] = [
+        {
+            "name": s.name,
+            "description": s.description,
+            "env_profile": s.env_profile,
+        }
+        for s in scenarios
+    ]
+    budgets_payload: List[Dict[str, Any]] = [asdict(b) for b in budgets]
+
+    payload = make_suite_payload(
+        scenarios=scenarios_payload,
+        budgets=budgets_payload,
+        total_time=float(total_time),
+        gmpp_ref=bool(gmpp_ref),
+        gmpp_ref_period_s=float(gmpp_ref_period_s),
+        gmpp_ref_points=int(gmpp_ref_points),
+    )
+    signature = compute_suite_signature(payload)
+
+    # Session folder is reused while the suite signature remains unchanged.
+    if use_session:
+        sd = ensure_session_dir(out_dir=out_dir, signature=signature, create_if_missing=True)
+        if sd is None:
+            raise RuntimeError("Failed to create or resolve benchmark session directory")
+        session_dir = sd
+    else:
+        # Legacy behavior: one folder per invocation
+        sig_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:8]
+        session_dir = out_dir / f"bench_{ts}__{sig_hash}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "session_meta.json").write_text(
+            json.dumps({"created_at": ts, "signature": signature}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    # Unique id for THIS invocation (so records don't overwrite)
+    invocation_id = f"run_{ts}"
 
     summaries: List[RunSummary] = []
     summary_rows: List[Dict[str, Any]] = []
@@ -720,7 +1021,7 @@ def run_suite(
                     )
                 rec_path = None
                 if save_records:
-                    rec_path = out_dir / run_id / "records" / f"{algo.name}__{sc.name}__{bd.name}.jsonl"
+                    rec_path = session_dir / "records" / f"{algo.name}__{sc.name}__{bd.name}__{invocation_id}.jsonl"
                 records, summary = run_once(
                     algo,
                     sc,
@@ -738,6 +1039,7 @@ def run_suite(
                 )
 
                 summaries.append(summary)
+                summary.extra["invocation_id"] = invocation_id
                 summary_rows.append(asdict(summary))
 
                 if log is not None:
@@ -750,8 +1052,8 @@ def run_suite(
                         f"viol={summary.budget_violations}"
                     )
 
-    out_path = out_dir / run_id / "summaries.jsonl"
-    write_jsonl(out_path, summary_rows)
+    out_path = session_dir / "summaries.jsonl"
+    append_jsonl(out_path, summary_rows)
 
     return summaries
 
@@ -811,6 +1113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log=None,
         log_every_s=float(args.log_every),
         keep_records=not bool(args.no_keep_records),
+        use_session=True,
     )
 
     return 0
